@@ -171,6 +171,84 @@ jobs:
           print(open(mp, encoding='utf-8').read())
           PY
 
+      - name: App icon (A2R Home dish)
+        continue-on-error: true
+        run: |
+          python3 -m venv /tmp/iv
+          /tmp/iv/bin/pip install --quiet pillow
+          /tmp/iv/bin/python - <<'PYICON'
+          from PIL import Image, ImageDraw
+          import sys
+          GOLD=(232,178,62,255); GOLD_D=(176,126,34,255); GOLD_L=(255,216,122,255); WHITE=(238,241,246,255)
+          def art(S):
+              """رسم الطبق + الإشارة على خلفية شفافة (S×S)"""
+              L = Image.new('RGBA', (S, S), (0,0,0,0))
+              # الطبق: قطع ناقص مايل
+              dish = Image.new('RGBA', (S, S), (0,0,0,0))
+              dd = ImageDraw.Draw(dish)
+              cx, cy, a, b = S*0.5, S*0.5, S*0.30, S*0.16
+              dd.ellipse([cx-a, cy-b, cx+a, cy+b], fill=GOLD)
+              dd.ellipse([cx-a*0.80, cy-b*0.62, cx+a*0.80, cy+b*0.86], fill=GOLD_D)
+              dd.ellipse([cx-a*0.60, cy-b*0.40, cx+a*0.60, cy+b*0.70], fill=GOLD)
+              dish = dish.rotate(38, resample=Image.BICUBIC, center=(cx, cy))
+              L.alpha_composite(dish, (int(-S*0.07), int(S*0.06)))
+              d = ImageDraw.Draw(L)
+              w = max(2, int(S*0.032))
+              # ذراع الـLNB
+              d.line([(S*0.40, S*0.60), (S*0.60, S*0.42)], fill=WHITE, width=w)
+              r = S*0.04
+              d.ellipse([S*0.60-r, S*0.42-r, S*0.60+r, S*0.42+r], fill=WHITE)
+              # الرجل والقاعدة
+              d.line([(S*0.40, S*0.66), (S*0.36, S*0.84)], fill=WHITE, width=w)
+              d.rectangle([int(S*0.24), int(S*0.83), int(S*0.48), int(S*0.83)+int(w*1.2)], fill=WHITE)
+              # موجات الإشارة
+              ax, ay = S*0.62, S*0.40
+              for rr in (0.10, 0.18, 0.26):
+                  R = S*rr
+                  d.arc([ax-R, ay-R, ax+R, ay+R], 280, 350, fill=GOLD_L, width=w)
+              return L
+          def legacy(S):
+              img = Image.new('RGBA', (S, S), (0,0,0,0))
+              bg = Image.new('RGBA', (S, S))
+              bd = ImageDraw.Draw(bg)
+              for y in range(S):
+                  t = y/S
+                  bd.line([(0,y),(S,y)], fill=(int(30-8*t), int(34-8*t), int(44-8*t), 255))
+              m = Image.new('L', (S, S), 0)
+              ImageDraw.Draw(m).rounded_rectangle([0,0,S-1,S-1], radius=int(S*0.23), fill=255)
+              img.paste(bg, (0,0), m)
+              img.alpha_composite(art(S))
+              return img
+          def foreground(S):
+              # الأيقونة التكيفية: الرسم في النص 70% (منطقة الأمان)
+              img = Image.new('RGBA', (S, S), (0,0,0,0))
+              k = int(S*0.70)
+              img.alpha_composite(art(k), ((S-k)//2, (S-k)//2))
+              return img
+
+          import os
+          res = 'android/app/src/main/res'
+          for name, px in {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}.items():
+              d = f'{res}/mipmap-{name}'
+              os.makedirs(d, exist_ok=True)
+              legacy(px * 4).resize((px, px), Image.LANCZOS).save(f'{d}/ic_launcher.png')
+              fp = px * 108 // 48
+              foreground(fp * 2).resize((fp, fp), Image.LANCZOS).save(f'{d}/ic_launcher_foreground.png')
+          os.makedirs(f'{res}/mipmap-anydpi-v26', exist_ok=True)
+          open(f'{res}/mipmap-anydpi-v26/ic_launcher.xml', 'w').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n'
+              '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+              '    <background android:drawable="@color/ic_launcher_background"/>\n'
+              '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+              '</adaptive-icon>\n')
+          os.makedirs(f'{res}/values', exist_ok=True)
+          open(f'{res}/values/ic_launcher_background.xml', 'w').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#1A1E27</color>\n</resources>\n')
+          for r, _, fs in os.walk(res):
+              for f in fs:
+                  if 'ic_launcher' in f: print(os.path.join(r, f))
+          PYICON
+
       - name: Disable release lint (lint crash in webview plugin)
         run: |
           python3 - <<'PY2'
