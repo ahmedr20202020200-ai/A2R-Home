@@ -1,1 +1,200 @@
-test
+name: Build A2R Home APK
+
+on:
+  push:
+    branches: [ '**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # نسخة فلاتر متثبتة (نفس اللي اتراجع عليها الكود)
+          flutter-version: '3.50.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Create Flutter project + pubspec.yaml
+        run: |
+          flutter create --org com.a2r --project-name a2r_home --platforms android temp_app
+          cp -r temp_app/android ./android
+          rm -rf temp_app
+          mkdir -p lib
+          cp main.dart lib/main.dart
+          cat > pubspec.yaml <<'EOF'
+          name: a2r_home
+          description: A2R Home - network, cast and receiver remote
+          publish_to: 'none'
+          version: 1.0.0+1
+          environment:
+            sdk: ^3.5.0
+          dependencies:
+            flutter:
+              sdk: flutter
+            flutter_localizations:
+              sdk: flutter
+            http: 1.6.0
+            crypto: 3.0.8
+            xml: 7.1.0
+            shared_preferences: 2.5.6
+            flutter_secure_storage: 11.2.0
+            network_info_plus: 8.2.2
+            webview_flutter: 4.14.1
+            share_plus: 13.3.1
+            url_launcher: 6.3.3
+            file_picker: 13.4.1
+            path_provider: 2.1.5
+          dependency_overrides:
+            # نسخ من غير JNI (نفس تطبيقاتك التانية)
+            path_provider_android: 2.2.23
+            shared_preferences_android: 2.4.23
+          flutter:
+            uses-material-design: true
+          EOF
+          cat pubspec.yaml
+
+      - name: Configure Android (name, permissions, native bridge)
+        run: |
+          python3 - <<'PY'
+          import glob, re
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'android:label="[^"]*"', 'android:label="A2R Home"', s, count=1)
+          perms = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % x for x in [
+              'INTERNET', 'ACCESS_NETWORK_STATE', 'ACCESS_WIFI_STATE', 'CHANGE_WIFI_MULTICAST_STATE',
+              'POST_NOTIFICATIONS', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION', 'WAKE_LOCK'])
+          s = s.replace('<application', perms + '    <application android:usesCleartextTraffic="true"', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print(s)
+
+          cands = glob.glob('android/app/src/main/**/MainActivity.kt', recursive=True)
+          assert cands, 'MainActivity.kt not found'
+          mp = cands[0]
+          pkg = re.search(r'(?m)^package\s+([\w.]+)', open(mp, encoding='utf-8').read()).group(1)
+          code = '''package PKG
+
+          import android.Manifest
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.net.wifi.WifiManager
+          import android.os.Build
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              private var lock: WifiManager.MulticastLock? = null
+              private var nid = 100
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/native").setMethodCallHandler { call, result ->
+                      try {
+                          when (call.method) {
+                              "multicastLock" -> {
+                                  val on = call.argument<Boolean>("on") ?: false
+                                  if (on) {
+                                      if (lock == null) {
+                                          val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                                          lock = wm.createMulticastLock("a2r_home").apply { setReferenceCounted(false) }
+                                      }
+                                      lock?.acquire()
+                                  } else {
+                                      lock?.release()
+                                  }
+                                  result.success(true)
+                              }
+                              "askNotify" -> {
+                                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.ACCESS_FINE_LOCATION), 7)
+                                  } else if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                                      requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 8)
+                                  }
+                                  result.success(true)
+                              }
+                              "notify" -> {
+                                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                                  if (Build.VERSION.SDK_INT >= 26) {
+                                      nm.createNotificationChannel(NotificationChannel("net", "الشبكة", NotificationManager.IMPORTANCE_DEFAULT))
+                                  }
+                                  val b = if (Build.VERSION.SDK_INT >= 26) android.app.Notification.Builder(this, "net") else android.app.Notification.Builder(this)
+                                  b.setSmallIcon(applicationInfo.icon)
+                                      .setContentTitle(call.argument<String>("title") ?: "")
+                                      .setContentText(call.argument<String>("body") ?: "")
+                                      .setAutoCancel(true)
+                                  nm.notify(nid++, b.build())
+                                  result.success(true)
+                              }
+                              "openVideo" -> {
+                                  val url = call.argument<String>("url") ?: ""
+                                  val i = Intent(Intent.ACTION_VIEW).apply {
+                                      setDataAndType(Uri.parse(url), "video/*")
+                                      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                  }
+                                  startActivity(Intent.createChooser(i, "افتح بـ").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                  result.success(true)
+                              }
+                              else -> result.notImplemented()
+                          }
+                      } catch (e: Exception) {
+                          result.success(false)
+                      }
+                  }
+              }
+
+              override fun onDestroy() {
+                  try { lock?.release() } catch (e: Exception) {}
+                  super.onDestroy()
+              }
+          }
+          '''
+          open(mp, 'w', encoding='utf-8').write(code.replace('PKG', pkg))
+          print(open(mp, encoding='utf-8').read())
+          PY
+
+      - name: Install dependencies
+        run: |
+          rm -f analysis_options.yaml
+          flutter pub get
+          echo "--- JNI deps (لازم تكون فاضية) ---"
+          flutter pub deps --style=compact | grep -i "jni" || echo "no jni"
+
+      - name: Analyze (يوقف البناء لو في خطأ في الكود)
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings lib/main.dart
+
+      - name: Build release APK
+        run: |
+          flutter build apk --release --build-name=1.0.${{ github.run_number }} --build-number=${{ github.run_number }} --dart-define=APP_VERSION=1.0.${{ github.run_number }}
+          cp build/app/outputs/flutter-apk/app-release.apk A2R-Home.apk
+
+      - name: Upload APK (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: A2R-Home-1.0.${{ github.run_number }}
+          path: A2R-Home.apk
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: A2R Home v1.0.${{ github.run_number }}
+          files: A2R-Home.apk
