@@ -19,7 +19,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -170,6 +170,20 @@ jobs:
           open(mp, 'w', encoding='utf-8').write(code.replace('PKG', pkg))
           print(open(mp, encoding='utf-8').read())
           PY
+
+      - name: Disable release lint (lint crash in webview plugin)
+        run: |
+          python3 - <<'PY2'
+          import glob
+          for f in glob.glob('android/app/build.gradle*'):
+              s = open(f, encoding='utf-8').read()
+              if f.endswith('.kts'):
+                  s += '\nandroid {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n}\n'
+              else:
+                  s += '\nandroid {\n    lint {\n        checkReleaseBuilds false\n        abortOnError false\n    }\n}\n'
+              open(f, 'w', encoding='utf-8').write(s)
+              print(f); print(s[-200:])
+          PY2
 
       - name: Install dependencies
         run: |
