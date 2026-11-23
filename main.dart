@@ -33,13 +33,27 @@ Future<void> main() async {
   runApp(const A2RHome());
 }
 
-const Color kGold = Color(0xFFD4A63A);
+const Color kGold = Color(0xFFE6B24A);
+const Color kBg = Color(0xFF0E1015);
+const Color kSurface = Color(0xFF181B22);
+const Color kSurface2 = Color(0xFF20242D);
+const Color kLine = Color(0x1FFFFFFF);
+const Color kMuted = Color(0xFF9AA1AD);
+const Color kOk = Color(0xFF4CD08A);
+const Color kBad = Color(0xFFFF6B6B);
 
 class A2RHome extends StatelessWidget {
   const A2RHome({super.key});
   @override
   Widget build(BuildContext context) {
-    final scheme = ColorScheme.fromSeed(seedColor: kGold, brightness: Brightness.dark, primary: kGold);
+    final scheme = ColorScheme.fromSeed(
+      seedColor: kGold,
+      brightness: Brightness.dark,
+      primary: kGold,
+      onPrimary: const Color(0xFF1A1405),
+      surface: kSurface,
+    );
+    final round = RoundedRectangleBorder(borderRadius: BorderRadius.circular(14));
     return MaterialApp(
       title: 'A2R Home',
       debugShowCheckedModeBanner: false,
@@ -50,13 +64,131 @@ class A2RHome extends StatelessWidget {
       theme: ThemeData(
         colorScheme: scheme,
         useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFF111316),
-        cardTheme: const CardThemeData(color: Color(0xFF1B1E23), margin: EdgeInsets.symmetric(horizontal: 10, vertical: 5)),
-        inputDecorationTheme: const InputDecorationTheme(border: OutlineInputBorder(), isDense: true),
+        scaffoldBackgroundColor: kBg,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: kBg,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          centerTitle: false,
+          titleTextStyle: TextStyle(fontSize: 19, fontWeight: FontWeight.w700, color: Colors.white),
+        ),
+        cardTheme: CardThemeData(
+          color: kSurface,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18), side: const BorderSide(color: kLine)),
+        ),
+        listTileTheme: const ListTileThemeData(iconColor: kGold, contentPadding: EdgeInsets.symmetric(horizontal: 14)),
+        filledButtonTheme: FilledButtonThemeData(style: FilledButton.styleFrom(shape: round, padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12))),
+        outlinedButtonTheme: OutlinedButtonThemeData(style: OutlinedButton.styleFrom(shape: round, side: const BorderSide(color: kLine))),
+        textButtonTheme: TextButtonThemeData(style: TextButton.styleFrom(shape: round)),
+        chipTheme: ChipThemeData(
+          backgroundColor: kSurface2,
+          selectedColor: kGold.withValues(alpha: 0.22),
+          side: const BorderSide(color: kLine),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        ),
+        segmentedButtonTheme: SegmentedButtonThemeData(
+          style: ButtonStyle(
+            shape: WidgetStatePropertyAll(round),
+            side: const WidgetStatePropertyAll(BorderSide(color: kLine)),
+            backgroundColor: WidgetStateProperty.resolveWith((s) => s.contains(WidgetState.selected) ? kGold.withValues(alpha: 0.20) : kSurface),
+          ),
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          isDense: true,
+          filled: true,
+          fillColor: kSurface2,
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+          enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: const BorderSide(color: kLine)),
+          focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: const BorderSide(color: kGold)),
+        ),
+        dialogTheme: DialogThemeData(backgroundColor: kSurface, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22))),
+        snackBarTheme: SnackBarThemeData(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: kSurface2,
+          contentTextStyle: const TextStyle(color: Colors.white),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        ),
+        navigationBarTheme: NavigationBarThemeData(
+          backgroundColor: kSurface,
+          surfaceTintColor: Colors.transparent,
+          indicatorColor: kGold.withValues(alpha: 0.22),
+          height: 66,
+          labelTextStyle: WidgetStateProperty.resolveWith((s) => TextStyle(
+                fontSize: 12.5,
+                fontWeight: s.contains(WidgetState.selected) ? FontWeight.w700 : FontWeight.w500,
+                color: s.contains(WidgetState.selected) ? kGold : kMuted,
+              )),
+          iconTheme: WidgetStateProperty.resolveWith((s) => IconThemeData(color: s.contains(WidgetState.selected) ? kGold : kMuted)),
+        ),
+        dividerTheme: const DividerThemeData(color: kLine, space: 1),
+        progressIndicatorTheme: const ProgressIndicatorThemeData(color: kGold),
       ),
       home: const Shell(),
     );
   }
+}
+
+/// عنوان قسم صغير فوق الكروت
+class SectionTitle extends StatelessWidget {
+  final String text;
+  final IconData? icon;
+  final Widget? trailing;
+  const SectionTitle(this.text, {super.key, this.icon, this.trailing});
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+        child: Row(children: [
+          if (icon != null) ...[Icon(icon, size: 18, color: kGold), const SizedBox(width: 6)],
+          Expanded(child: Text(text, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white70))),
+          if (trailing != null) trailing!,
+        ]),
+      );
+}
+
+/// شكل "مفيش حاجة هنا" بأيقونة كبيرة
+class EmptyState extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String? hint;
+  final Widget? action;
+  const EmptyState({super.key, required this.icon, required this.title, this.hint, this.action});
+  @override
+  Widget build(BuildContext context) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(color: kGold.withValues(alpha: 0.10), shape: BoxShape.circle),
+              child: Icon(icon, size: 40, color: kGold),
+            ),
+            const SizedBox(height: 14),
+            Text(title, textAlign: TextAlign.center, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+            if (hint != null) ...[
+              const SizedBox(height: 6),
+              Text(hint!, textAlign: TextAlign.center, style: const TextStyle(fontSize: 13, color: kMuted)),
+            ],
+            if (action != null) ...[const SizedBox(height: 14), action!],
+          ]),
+        ),
+      );
+}
+
+/// علامة صغيرة ملونة (HD، مشفرة، …)
+class Badge2 extends StatelessWidget {
+  final String text;
+  final Color color;
+  const Badge2(this.text, {super.key, this.color = kGold});
+  @override
+  Widget build(BuildContext context) => Container(
+        margin: const EdgeInsetsDirectional.only(start: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        decoration: BoxDecoration(color: color.withValues(alpha: 0.16), borderRadius: BorderRadius.circular(6), border: Border.all(color: color.withValues(alpha: 0.5))),
+        child: Text(text, style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: color)),
+      );
 }
 
 void toast(BuildContext c, String m) {
@@ -116,26 +248,47 @@ class _ShellState extends State<Shell> {
 
   @override
   Widget build(BuildContext context) {
-    const titles = ['الشبكة', 'الكاست', 'الريسيفر'];
+    const titles = ['الشبكة', 'العرض على التلفزيون', 'الريسيفر'];
+    const icons = [Icons.router_rounded, Icons.cast_rounded, Icons.satellite_alt_rounded];
     return Scaffold(
       appBar: AppBar(
-        title: Text('A2R Home — ${titles[tab]}'),
+        titleSpacing: 12,
+        title: Row(children: [
+          Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(colors: [Color(0xFFF2C766), Color(0xFFB8862A)], begin: Alignment.topLeft, end: Alignment.bottomRight),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(icons[tab], color: const Color(0xFF1A1405), size: 22),
+          ),
+          const SizedBox(width: 10),
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(titles[tab]),
+            Text('A2R Home • $appVersion', style: const TextStyle(fontSize: 11, color: kMuted, fontWeight: FontWeight.w400)),
+          ]),
+        ]),
         actions: [
           IconButton(
             tooltip: 'السجل',
-            icon: const Icon(Icons.bug_report_outlined),
+            icon: const Icon(Icons.receipt_long_rounded, color: kMuted),
             onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LogPage())),
           ),
+          const SizedBox(width: 4),
         ],
       ),
       body: IndexedStack(index: tab, children: const [NetworkPage(), CastPage(), ReceiverPage()]),
       bottomNavigationBar: NavigationBar(
         selectedIndex: tab,
-        onDestinationSelected: (i) => setState(() => tab = i),
+        onDestinationSelected: (i) {
+          HapticFeedback.selectionClick();
+          setState(() => tab = i);
+        },
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.router_outlined), label: 'الشبكة'),
-          NavigationDestination(icon: Icon(Icons.cast), label: 'الكاست'),
-          NavigationDestination(icon: Icon(Icons.satellite_alt), label: 'الريسيفر'),
+          NavigationDestination(icon: Icon(Icons.router_outlined), selectedIcon: Icon(Icons.router_rounded), label: 'الشبكة'),
+          NavigationDestination(icon: Icon(Icons.cast_outlined), selectedIcon: Icon(Icons.cast_rounded), label: 'الكاست'),
+          NavigationDestination(icon: Icon(Icons.satellite_alt_outlined), selectedIcon: Icon(Icons.satellite_alt_rounded), label: 'الريسيفر'),
         ],
       ),
     );
@@ -557,6 +710,13 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       );
     }
     String g(String k) => '${st[k] ?? ''}';
+    String gAny(List<String> ks) {
+      for (final k in ks) {
+        final v = g(k).trim();
+        if (v.isNotEmpty) return v;
+      }
+      return '';
+    }
     final tx = int.tryParse(g('monthly_tx_bytes')) ?? 0, rx = int.tryParse(g('monthly_rx_bytes')) ?? 0;
     final upK = (int.tryParse(g('realtime_tx_thrpt')) ?? 0) * 8 / 1000, downK = (int.tryParse(g('realtime_rx_thrpt')) ?? 0) * 8 / 1000;
     return Card(
@@ -585,9 +745,9 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
             _kv('الشبكة', '${g('network_provider')} ${g('network_type')}'),
             _kv('الإشارة', '${g('signalbar')}/5'),
             _kv('RSRP', g('lte_rsrp')),
-            _kv('RSRQ', g('lte_rsrq')),
-            _kv('SINR', g('lte_snr').isNotEmpty ? g('lte_snr') : g('Z5g_SINR')),
-            _kv('Band', g('lte_band')),
+            _kv('RSRQ', gAny(['lte_rsrq', 'Z4g_rsrq', 'lte_ca_pcell_rsrq'])),
+            _kv('SINR', gAny(['lte_snr', 'Z4g_SINR', 'lte_sinr', 'Z5g_SINR'])),
+            _kv('Band', gAny(['lte_band', 'lte_ca_pcell_band', 'wan_active_band', 'lte_main_band'])),
             _kv('IP الخارجي', g('wan_ipaddr')),
             _kv('دلوقتي ↓/↑', '${downK.toStringAsFixed(0)}/${upK.toStringAsFixed(0)} kbps'),
             _kv('استهلاك الشهر', fmtBytes(tx + rx)),
@@ -1519,10 +1679,15 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   bool radio = false;
   String q = '';
   bool favOnly = false;
-  int view = 0; // 0 ريموت، 1 قنوات
+  bool hdOnly = false;
+  bool ftaOnly = false;
+  int view = 0; // 0 ريموت، 1 قنوات، 2 ضبط الطبق
+  bool touchpad = Store.p.getBool('stb_touchpad') ?? false;
 
   @override
   bool get wantKeepAlive => true;
+
+  bool get connected => gm?.connected == true;
 
   Set<String> get favs => (Store.p.getStringList('stb_favs') ?? []).toSet();
   Future<void> toggleFav(String id) async {
@@ -1545,7 +1710,6 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     });
     found = await discoverReceivers();
     if (found.isEmpty) {
-      // احتياطي: دوّر على أي جهاز فاتح بورت 20000
       final net = await readPhoneNet();
       setState(() => msg = 'مفيش إعلانات — بدوّر على بورت 20000 في الشبكة…');
       final hosts = await scanLan(net.prefix);
@@ -1555,7 +1719,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     }
     setState(() {
       busy = false;
-      msg = found.isEmpty ? 'ملقتش ريسيفر — اكتب العنوان بنفسك (من قايمة الشبكة في الريسيفر)' : 'لقيت ${found.length}';
+      msg = found.isEmpty ? 'ملقتش ريسيفر — اكتب العنوان بنفسك (من قايمة الشبكة في الريسيفر)' : 'لقيت ${found.length} — دوس عليه للاتصال';
     });
   }
 
@@ -1571,11 +1735,15 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       if (t == 2001) _refreshPlaying();
       if (t == 2002) loadChannels();
     };
+    c.addListener(() {
+      if (mounted) setState(() {});
+    });
     try {
       final i = await c.connect();
       gm = c;
       Store.receiverIp = ip;
-      msg = 'متصل: ${i.model} (${i.ip})';
+      found.clear();
+      msg = '${i.model} • ${i.ip}';
       _refreshPlaying();
     } catch (e) {
       msg = 'فشل الاتصال: $e';
@@ -1599,7 +1767,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       channels = await gm!.channels(progress: (n) {
         if (mounted) setState(() => msg = 'بحمّل القنوات… $n');
       });
-      msg = '${channels.length} قناة';
+      msg = '${gm?.info?.model ?? 'الريسيفر'} • ${channels.length} قناة';
     } catch (e) {
       msg = 'مقدرتش أحمّل القنوات: $e';
     }
@@ -1607,9 +1775,8 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   }
 
   Future<void> key(int k) async {
-    HapticFeedback.selectionClick();
     try {
-      if (gm == null) throw StateError('مش متصل');
+      if (gm == null) throw StateError('مش متصل بالريسيفر');
       await gm!.key(k);
     } catch (e) {
       if (mounted) toast(context, '$e');
@@ -1621,210 +1788,367 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     if (ip != null && ip.trim().isNotEmpty) await connect(ip.trim());
   }
 
+  Future<void> showInfo() async {
+    if (gm == null) return;
+    Map<String, dynamic> st = {};
+    try {
+      st = await gm!.state();
+    } catch (e) {
+      if (mounted) toast(context, '$e');
+      return;
+    }
+    if (!mounted) return;
+    const names = {
+      'ProductName': 'الموديل',
+      'SoftwareVersion': 'السوفت وير',
+      'SerialNumber': 'الرقم التسلسلي',
+      'ChannelNum': 'عدد القنوات',
+      'MaxNumOfPrograms': 'أقصى عدد قنوات',
+      'MuteState': 'الصوت مقفول',
+      'SleepSwitch': 'مؤقت النوم شغال',
+      'SleepTime': 'مؤقت النوم (دقيقة)',
+      'ScreenLock': 'قفل الشاشة',
+      'PowerMode': 'وضع الباور',
+    };
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      builder: (c) => ListView(shrinkWrap: true, padding: const EdgeInsets.only(bottom: 20), children: [
+        const SectionTitle('معلومات الريسيفر', icon: Icons.info_outline_rounded),
+        for (final e in st.entries)
+          ListTile(dense: true, title: Text(names[e.key] ?? e.key), trailing: Text('${e.value}', style: const TextStyle(color: kMuted))),
+      ]),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
     return Column(children: [
-      Card(
-        child: Padding(
-          padding: const EdgeInsets.all(8),
-          child: Column(children: [
-            Row(children: [
-              Icon(Icons.satellite_alt, color: gm?.connected == true ? Colors.greenAccent : kGold),
-              const SizedBox(width: 8),
-              Expanded(child: Text(msg.isEmpty ? 'Qmax H1 / H8 — بروتوكول G-MScreen' : msg, style: const TextStyle(fontSize: 13))),
-              if (busy) const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
-            ]),
-            Wrap(spacing: 6, children: [
-              TextButton.icon(onPressed: busy ? null : discover, icon: const Icon(Icons.search), label: const Text('دوّر')),
-              TextButton.icon(onPressed: busy ? null : manual, icon: const Icon(Icons.edit), label: const Text('عنوان يدوي')),
-              if (Store.receiverIp != null && gm?.connected != true)
-                TextButton.icon(onPressed: busy ? null : () => connect(Store.receiverIp!), icon: const Icon(Icons.link), label: Text('اتصل ${Store.receiverIp}')),
-              if (gm?.connected == true) TextButton.icon(onPressed: () => key(K.power), icon: const Icon(Icons.power_settings_new, color: Colors.redAccent), label: const Text('باور')),
-            ]),
-            for (final e in found.entries)
-              ListTile(
-                dense: true,
-                leading: const Icon(Icons.settings_input_antenna),
-                title: Text('${e.value.model} — ${e.key}'),
-                subtitle: e.value.serial.isEmpty ? null : Text('S/N ${e.value.serial}'),
-                onTap: () => connect(e.key),
-              ),
-            const Text('لو تطبيق G-MScreen مفتوح على موبايل تاني الريسيفر ممكن يرفض. والريسيفر في Standby العميق مش بيرد.',
-                style: TextStyle(fontSize: 11, color: Colors.white54)),
-          ]),
+      _header(),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(12, 4, 12, 6),
+        child: SizedBox(
+          width: double.infinity,
+          child: SegmentedButton<int>(
+            showSelectedIcon: false,
+            segments: const [
+              ButtonSegment(value: 0, icon: Icon(Icons.settings_remote_rounded), label: Text('الريموت')),
+              ButtonSegment(value: 1, icon: Icon(Icons.format_list_bulleted_rounded), label: Text('القنوات')),
+              ButtonSegment(value: 2, icon: Icon(Icons.network_check_rounded), label: Text('ضبط الطبق')),
+            ],
+            selected: {view},
+            onSelectionChanged: (s) {
+              HapticFeedback.selectionClick();
+              setState(() => view = s.first);
+              if (view != 0 && channels.isEmpty && connected) loadChannels();
+            },
+          ),
         ),
       ),
-      SegmentedButton<int>(
-        segments: const [
-          ButtonSegment(value: 0, icon: Icon(Icons.settings_remote), label: Text('الريموت')),
-          ButtonSegment(value: 1, icon: Icon(Icons.list), label: Text('القنوات')),
-        ],
-        selected: {view},
-        onSelectionChanged: (s) {
-          setState(() => view = s.first);
-          if (view == 1 && channels.isEmpty) loadChannels();
-        },
+      Expanded(
+        child: !connected && found.isEmpty
+            ? EmptyState(
+                icon: Icons.satellite_alt_rounded,
+                title: 'مش متصل بالريسيفر',
+                hint: 'الموبايل والريسيفر لازم يكونوا على نفس الواي فاي.\nاقفل تطبيق G-MScreen على أي موبايل تاني الأول.',
+                action: Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
+                  FilledButton.icon(onPressed: busy ? null : discover, icon: const Icon(Icons.search_rounded), label: const Text('دوّر على الريسيفر')),
+                  if (Store.receiverIp != null)
+                    OutlinedButton.icon(onPressed: busy ? null : () => connect(Store.receiverIp!), icon: const Icon(Icons.link_rounded), label: Text('اتصل بـ ${Store.receiverIp}')),
+                ]),
+              )
+            : !connected
+                ? ListView(children: [
+                    const SectionTitle('الريسيفرات اللي لقيتها', icon: Icons.settings_input_antenna_rounded),
+                    for (final e in found.entries)
+                      Card(
+                        child: ListTile(
+                          leading: const Icon(Icons.satellite_alt_rounded),
+                          title: Text(e.value.model.isEmpty ? 'ريسيفر' : e.value.model),
+                          subtitle: Text('${e.key}${e.value.serial.isEmpty ? '' : ' • S/N ${e.value.serial}'}'),
+                          trailing: const Icon(Icons.chevron_left_rounded),
+                          onTap: () => connect(e.key),
+                        ),
+                      ),
+                  ])
+                : view == 0
+                    ? (touchpad ? _touchpad() : RemoteControl(onKey: key))
+                    : view == 1
+                        ? _channels()
+                        : DishPage(gm: gm!, channels: channels, playingId: playingId, onZapped: (id) => setState(() => playingId = id)),
       ),
-      Expanded(child: view == 0 ? _remote() : _channels()),
     ]);
   }
 
-  Widget _btn(String t, int k, {IconData? icon, Color? color}) => Padding(
-        padding: const EdgeInsets.all(3),
-        child: FilledButton.tonal(
-          style: FilledButton.styleFrom(
-            backgroundColor: color ?? const Color(0xFF262A31),
-            foregroundColor: Colors.white,
-            minimumSize: const Size(56, 44),
-            padding: const EdgeInsets.symmetric(horizontal: 6),
+  Widget _header() {
+    final on = connected;
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+        child: Row(children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: on ? kOk : (busy ? kGold : kBad),
+              boxShadow: [BoxShadow(color: (on ? kOk : kBad).withValues(alpha: 0.6), blurRadius: 8)],
+            ),
           ),
-          onPressed: () => key(k),
-          child: icon != null ? Icon(icon) : Text(t, style: const TextStyle(fontSize: 13)),
-        ),
-      );
-
-  Widget _remote() {
-    return ListView(padding: const EdgeInsets.all(8), children: [
-      // تاتش باد: اسحب = أسهم، دوسة = OK، دوستين = رجوع
-      GestureDetector(
-        onTap: () => key(K.ok),
-        onDoubleTap: () => key(K.exit),
-        onLongPress: () => key(K.menu),
-        onPanEnd: (d) {
-          final v = d.velocity.pixelsPerSecond;
-          if (v.distance < 200) return;
-          if (v.dx.abs() > v.dy.abs()) {
-            key(v.dx > 0 ? K.right : K.left);
-          } else {
-            key(v.dy > 0 ? K.down : K.up);
-          }
-        },
-        child: Container(
-          height: 170,
-          decoration: BoxDecoration(color: const Color(0xFF1B1E23), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.white12)),
-          alignment: Alignment.center,
-          child: const Text('اسحب للأسهم • دوسة = OK\nدوستين = خروج • ضغطة طويلة = القايمة', textAlign: TextAlign.center, style: TextStyle(color: Colors.white54)),
-        ),
-      ),
-      const SizedBox(height: 8),
-      Directionality(
-        textDirection: TextDirection.ltr,
-        child: Column(children: [
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            _btn('Menu', K.menu, icon: Icons.menu),
-            _btn('', K.up, icon: Icons.keyboard_arrow_up),
-            _btn('Exit', K.exit, icon: Icons.undo),
-          ]),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            _btn('', K.left, icon: Icons.keyboard_arrow_left),
-            _btn('OK', K.ok, color: const Color(0xFF6B5418)),
-            _btn('', K.right, icon: Icons.keyboard_arrow_right),
-          ]),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            _btn('Info', K.info, icon: Icons.info_outline),
-            _btn('', K.down, icon: Icons.keyboard_arrow_down),
-            _btn('EPG', K.epg),
-          ]),
-          const SizedBox(height: 6),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            _btn('', K.volDown, icon: Icons.volume_down),
-            _btn('', K.mute, icon: Icons.volume_off),
-            _btn('', K.volUp, icon: Icons.volume_up),
-            const SizedBox(width: 12),
-            _btn('CH-', K.chDown),
-            _btn('CH+', K.chUp),
-          ]),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            _btn('', K.red, color: Colors.red.shade800),
-            _btn('', K.green, color: Colors.green.shade800),
-            _btn('', K.yellow, color: Colors.amber.shade800),
-            _btn('', K.blue, color: Colors.blue.shade800),
-          ]),
-          for (final row in [
-            [1, 2, 3],
-            [4, 5, 6],
-            [7, 8, 9],
-          ])
-            Row(mainAxisAlignment: MainAxisAlignment.center, children: [for (final n in row) _btn('$n', K.digit(n))]),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            _btn('TV/R', K.tvRadio),
-            _btn('0', K.digit(0)),
-            _btn('Recall', K.recall),
-          ]),
-          const SizedBox(height: 6),
-          Wrap(alignment: WrapAlignment.center, children: [
-            _btn('FAV', K.fav),
-            _btn('SAT', K.sat),
-            _btn('Audio', K.audio),
-            _btn('Sub', K.subtitle),
-            _btn('TXT', K.teletext),
-            _btn('Find', K.find),
-            _btn('USB', K.usb),
-            _btn('P-', K.pageUp),
-            _btn('P+', K.pageDown),
-            _btn('', K.rew, icon: Icons.fast_rewind),
-            _btn('', K.play, icon: Icons.play_arrow),
-            _btn('', K.pause, icon: Icons.pause),
-            _btn('', K.ff, icon: Icons.fast_forward),
-            _btn('', K.stop, icon: Icons.stop),
-            _btn('', K.record, icon: Icons.fiber_manual_record, color: Colors.red.shade900),
-            _btn('Sleep', K.sleep),
-            _btn('Res', K.resolution),
-          ]),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(on ? (gm?.info?.model ?? 'متصل') : 'الريسيفر', style: const TextStyle(fontWeight: FontWeight.w700)),
+              Text(msg.isEmpty ? 'Qmax • بروتوكول G-MScreen' : msg, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, color: kMuted)),
+            ]),
+          ),
+          if (busy) const Padding(padding: EdgeInsets.all(8), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
+          if (on && view == 0)
+            IconButton(
+              tooltip: touchpad ? 'زراير' : 'تاتش باد',
+              icon: Icon(touchpad ? Icons.dialpad_rounded : Icons.touch_app_rounded, color: kGold),
+              onPressed: () {
+                setState(() => touchpad = !touchpad);
+                Store.p.setBool('stb_touchpad', touchpad);
+              },
+            ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert_rounded, color: kMuted),
+            onSelected: (v) {
+              if (v == 'find') discover();
+              if (v == 'ip') manual();
+              if (v == 'info') showInfo();
+              if (v == 'reload') loadChannels();
+              if (v == 'off') {
+                gm?.disconnect();
+                setState(() {
+                  gm = null;
+                  msg = 'اتقفل الاتصال';
+                });
+              }
+            },
+            itemBuilder: (c) => [
+              const PopupMenuItem(value: 'find', child: ListTile(leading: Icon(Icons.search_rounded), title: Text('دوّر على ريسيفر'))),
+              const PopupMenuItem(value: 'ip', child: ListTile(leading: Icon(Icons.edit_rounded), title: Text('عنوان يدوي'))),
+              if (on) const PopupMenuItem(value: 'info', child: ListTile(leading: Icon(Icons.info_outline_rounded), title: Text('معلومات الريسيفر'))),
+              if (on) const PopupMenuItem(value: 'reload', child: ListTile(leading: Icon(Icons.refresh_rounded), title: Text('حدّث القنوات'))),
+              if (on) const PopupMenuItem(value: 'off', child: ListTile(leading: Icon(Icons.link_off_rounded), title: Text('اقفل الاتصال'))),
+            ],
+          ),
         ]),
       ),
-      const SizedBox(height: 6),
-      const Text('إشارة الطبق: افتح قايمة البحث/التركيب على الريسيفر من الريموت هنا — البروتوكول المعروف مفيهوش قراية للإشارة.',
-          textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Colors.white54)),
-    ]);
+    );
   }
+
+  Widget _touchpad() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+      child: Column(children: [
+        Expanded(
+          child: GestureDetector(
+            onTap: () {
+              HapticFeedback.lightImpact();
+              key(K.ok);
+            },
+            onDoubleTap: () {
+              HapticFeedback.mediumImpact();
+              key(K.exit);
+            },
+            onLongPress: () {
+              HapticFeedback.heavyImpact();
+              key(K.menu);
+            },
+            onPanEnd: (d) {
+              final v = d.velocity.pixelsPerSecond;
+              if (v.distance < 200) return;
+              HapticFeedback.selectionClick();
+              if (v.dx.abs() > v.dy.abs()) {
+                key(v.dx > 0 ? K.right : K.left);
+              } else {
+                key(v.dy > 0 ? K.down : K.up);
+              }
+            },
+            child: Container(
+              width: double.infinity,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(colors: [Color(0xFF1E222A), Color(0xFF14171D)], begin: Alignment.topCenter, end: Alignment.bottomCenter),
+                borderRadius: BorderRadius.circular(28),
+                border: Border.all(color: kLine),
+              ),
+              alignment: Alignment.center,
+              child: const Column(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.swipe_rounded, size: 54, color: kGold),
+                SizedBox(height: 12),
+                Text('اسحب في أي اتجاه = الأسهم', style: TextStyle(fontSize: 15)),
+                SizedBox(height: 4),
+                Text('دوسة = OK  •  دوستين = خروج  •  ضغطة طويلة = القايمة', style: TextStyle(fontSize: 12, color: kMuted)),
+              ]),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Directionality(
+          textDirection: TextDirection.ltr,
+          child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+            RemoteKey(icon: Icons.volume_down_rounded, onTap: () => key(K.volDown), repeat: true),
+            RemoteKey(icon: Icons.volume_off_rounded, onTap: () => key(K.mute)),
+            RemoteKey(icon: Icons.volume_up_rounded, onTap: () => key(K.volUp), repeat: true),
+            RemoteKey(label: 'CH−', onTap: () => key(K.chDown)),
+            RemoteKey(label: 'CH+', onTap: () => key(K.chUp)),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _filterChip(String t, bool v, ValueChanged<bool> f, {IconData? icon}) => Padding(
+        padding: const EdgeInsetsDirectional.only(end: 6),
+        child: FilterChip(
+          avatar: icon == null ? null : Icon(icon, size: 16),
+          label: Text(t),
+          selected: v,
+          showCheckmark: false,
+          onSelected: (x) {
+            HapticFeedback.selectionClick();
+            f(x);
+          },
+        ),
+      );
 
   Widget _channels() {
     final f = favs;
     final shown = channels
-        .where((c) => c.radio == radio && (!favOnly || f.contains(c.id)) && (q.isEmpty || c.name.toLowerCase().contains(q.toLowerCase())))
+        .where((c) =>
+            c.radio == radio &&
+            (!favOnly || f.contains(c.id) || c.fav) &&
+            (!hdOnly || c.hd) &&
+            (!ftaOnly || !c.scrambled) &&
+            (q.isEmpty || c.name.toLowerCase().contains(q.toLowerCase()) || '${c.index + 1}' == q.trim()))
         .toList();
     return Column(children: [
       Padding(
-        padding: const EdgeInsets.all(6),
-        child: Row(children: [
-          Expanded(child: TextField(decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'دوّر على قناة'), onChanged: (v) => setState(() => q = v))),
-          IconButton(icon: Icon(radio ? Icons.radio : Icons.tv), tooltip: 'تلفزيون/راديو', onPressed: () => setState(() => radio = !radio)),
-          IconButton(icon: Icon(favOnly ? Icons.star : Icons.star_border, color: kGold), tooltip: 'المفضلة', onPressed: () => setState(() => favOnly = !favOnly)),
-          IconButton(icon: const Icon(Icons.refresh), onPressed: busy ? null : loadChannels),
-        ]),
-      ),
-      const Text('المفضلة هنا محفوظة في التطبيق بس. تعديل القنوات (تغيير الاسم/مسح/نقل) مش مدعوم في البروتوكول المعروف.',
-          style: TextStyle(fontSize: 11, color: Colors.white54)),
-      Expanded(
-        child: ListView.builder(
-          itemCount: shown.length,
-          itemBuilder: (c, i) {
-            final ch = shown[i];
-            final on = ch.id == playingId;
-            return ListTile(
-              dense: true,
-              leading: Text('${ch.index + 1}', style: TextStyle(color: on ? kGold : Colors.white54)),
-              title: Text(ch.name, style: TextStyle(color: on ? kGold : null, fontWeight: on ? FontWeight.bold : null)),
-              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                IconButton(icon: Icon(f.contains(ch.id) ? Icons.star : Icons.star_border, size: 20, color: kGold), onPressed: () => toggleFav(ch.id)),
-                IconButton(icon: const Icon(Icons.phone_android, size: 20), tooltip: 'اتفرج على الموبايل', onPressed: () => watch(ch)),
-              ]),
-              onTap: () async {
-                try {
-                  await gm!.zap(ch);
-                  playingId = ch.id;
-                  setState(() {});
-                } catch (e) {
-                  if (mounted) toast(context, 'مقدرتش أغير القناة: $e');
-                }
-              },
-            );
-          },
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+        child: TextField(
+          decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'دوّر بالاسم أو الرقم'),
+          onChanged: (v) => setState(() => q = v),
         ),
       ),
+      SizedBox(
+        height: 40,
+        child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12), children: [
+          _filterChip(radio ? 'راديو' : 'تلفزيون', true, (_) => setState(() => radio = !radio), icon: radio ? Icons.radio_rounded : Icons.tv_rounded),
+          _filterChip('المفضلة', favOnly, (v) => setState(() => favOnly = v), icon: Icons.star_rounded),
+          _filterChip('HD', hdOnly, (v) => setState(() => hdOnly = v)),
+          _filterChip('مفتوحة', ftaOnly, (v) => setState(() => ftaOnly = v), icon: Icons.lock_open_rounded),
+        ]),
+      ),
+      Expanded(
+        child: channels.isEmpty
+            ? EmptyState(
+                icon: Icons.live_tv_rounded,
+                title: busy ? 'بحمّل القنوات…' : 'مفيش قنوات لسه',
+                action: busy ? null : FilledButton.icon(onPressed: loadChannels, icon: const Icon(Icons.download_rounded), label: const Text('حمّل القنوات')),
+              )
+            : shown.isEmpty
+                ? const EmptyState(icon: Icons.search_off_rounded, title: 'مفيش قنوات بالفلتر ده')
+                : ListView.builder(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    itemCount: shown.length,
+                    itemBuilder: (c, i) {
+                      final ch = shown[i];
+                      final on = ch.id == playingId;
+                      final isFav = f.contains(ch.id) || ch.fav;
+                      return Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: on ? kGold.withValues(alpha: 0.12) : kSurface,
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: on ? kGold.withValues(alpha: 0.6) : kLine),
+                        ),
+                        child: ListTile(
+                          dense: true,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                          leading: Container(
+                            width: 44,
+                            alignment: Alignment.center,
+                            padding: const EdgeInsets.symmetric(vertical: 6),
+                            decoration: BoxDecoration(color: kSurface2, borderRadius: BorderRadius.circular(10)),
+                            child: Text('${ch.index + 1}', style: TextStyle(fontWeight: FontWeight.w700, color: on ? kGold : Colors.white70, fontSize: 12)),
+                          ),
+                          title: Row(children: [
+                            Flexible(child: Text(ch.name, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 14, color: on ? kGold : null, fontWeight: on ? FontWeight.w700 : FontWeight.w500))),
+                            if (ch.hd) const Badge2('HD'),
+                            if (ch.scrambled) const Badge2('مشفرة', color: kBad),
+                            if (ch.locked) const Padding(padding: EdgeInsetsDirectional.only(start: 4), child: Icon(Icons.lock_rounded, size: 14, color: kMuted)),
+                          ]),
+                          subtitle: on ? const Text('شغالة دلوقتي', style: TextStyle(fontSize: 11, color: kGold)) : null,
+                          trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              icon: Icon(isFav ? Icons.star_rounded : Icons.star_outline_rounded, color: kGold),
+                              onPressed: () => toggleFav(ch.id),
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
+                              icon: const Icon(Icons.play_circle_outline_rounded, color: kMuted),
+                              tooltip: 'اتفرج على الموبايل',
+                              onPressed: () => watch(ch),
+                            ),
+                          ]),
+                          onLongPress: () => _details(ch),
+                          onTap: () async {
+                            HapticFeedback.lightImpact();
+                            try {
+                              await gm!.zap(ch);
+                              playingId = ch.id;
+                              setState(() {});
+                            } catch (e) {
+                              if (mounted) toast(context, 'مقدرتش أغير القناة: $e');
+                            }
+                          },
+                        ),
+                      );
+                    },
+                  ),
+      ),
     ]);
+  }
+
+  void _details(StbChannel ch) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (c) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.55,
+        builder: (c, sc) => ListView(controller: sc, children: [
+          SectionTitle(ch.name, icon: Icons.live_tv_rounded),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Wrap(spacing: 8, children: [
+              FilledButton.icon(
+                onPressed: () {
+                  Navigator.pop(c);
+                  gm?.zap(ch);
+                  setState(() => playingId = ch.id);
+                },
+                icon: const Icon(Icons.tv_rounded),
+                label: const Text('شغّلها على التلفزيون'),
+              ),
+              OutlinedButton.icon(onPressed: () => watch(ch), icon: const Icon(Icons.phone_android_rounded), label: const Text('على الموبايل')),
+            ]),
+          ),
+          const SectionTitle('بيانات القناة من الريسيفر'),
+          for (final e in ch.raw.entries)
+            ListTile(dense: true, title: Text(e.key, style: const TextStyle(fontSize: 13)), trailing: Text('${e.value}', style: const TextStyle(color: kMuted))),
+        ]),
+      ),
+    );
   }
 
   Future<void> watch(StbChannel ch) async {
@@ -1843,6 +2167,596 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     } catch (e) {
       if (mounted) toast(context, 'خطأ: $e');
     }
+  }
+}
+
+// ---------------- الريموت ----------------
+/// زرار ريموت: بيتحرك لما يتداس + اهتزاز + تكرار لو فضلت داسس
+class RemoteKey extends StatefulWidget {
+  final String? label;
+  final IconData? icon;
+  final VoidCallback onTap;
+  final Color? color;
+  final Color? fg;
+  final double size;
+  final double? width;
+  final bool repeat;
+  final bool circle;
+  const RemoteKey({super.key, this.label, this.icon, required this.onTap, this.color, this.fg, this.size = 54, this.width, this.repeat = false, this.circle = true});
+  @override
+  State<RemoteKey> createState() => _RemoteKeyState();
+}
+
+class _RemoteKeyState extends State<RemoteKey> {
+  bool down = false;
+  Timer? _rep;
+
+  void _fire() {
+    HapticFeedback.lightImpact();
+    widget.onTap();
+  }
+
+  void _start() {
+    setState(() => down = true);
+    _fire();
+    if (widget.repeat) {
+      _rep = Timer(const Duration(milliseconds: 450), () {
+        _rep = Timer.periodic(const Duration(milliseconds: 160), (_) => _fire());
+      });
+    }
+  }
+
+  void _end() {
+    _rep?.cancel();
+    _rep = null;
+    if (mounted) setState(() => down = false);
+  }
+
+  @override
+  void dispose() {
+    _rep?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = widget.color ?? kSurface2;
+    final w = widget.width ?? widget.size;
+    return Padding(
+      padding: const EdgeInsets.all(4),
+      child: GestureDetector(
+        onTapDown: (_) => _start(),
+        onTapUp: (_) => _end(),
+        onTapCancel: _end,
+        child: AnimatedScale(
+          scale: down ? 0.90 : 1,
+          duration: const Duration(milliseconds: 80),
+          child: Container(
+            width: w,
+            height: widget.size,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: down ? Color.lerp(bg, Colors.white, 0.15) : bg,
+              shape: widget.circle && widget.width == null ? BoxShape.circle : BoxShape.rectangle,
+              borderRadius: widget.circle && widget.width == null ? null : BorderRadius.circular(widget.size / 2),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.07)),
+              boxShadow: down ? [] : [const BoxShadow(color: Color(0x66000000), blurRadius: 6, offset: Offset(0, 3))],
+            ),
+            child: widget.icon != null
+                ? Icon(widget.icon, color: widget.fg ?? Colors.white, size: widget.size * 0.44)
+                : Text(widget.label ?? '', style: TextStyle(color: widget.fg ?? Colors.white, fontWeight: FontWeight.w700, fontSize: widget.size * 0.26)),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// دايرة الأسهم الكبيرة + OK في النص
+class DPad extends StatelessWidget {
+  final void Function(int key) onKey;
+  final double size;
+  const DPad({super.key, required this.onKey, this.size = 236});
+
+  Widget _arrow(IconData i, int k, Alignment a) => Align(
+        alignment: a,
+        child: RemoteKey(icon: i, onTap: () => onKey(k), color: Colors.transparent, size: size * 0.27, repeat: true),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(children: [
+        Container(
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: const RadialGradient(colors: [Color(0xFF2A2F39), Color(0xFF1A1D24)], radius: 0.75),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.08), width: 1.5),
+            boxShadow: const [BoxShadow(color: Color(0x88000000), blurRadius: 18, offset: Offset(0, 8))],
+          ),
+        ),
+        _arrow(Icons.keyboard_arrow_up_rounded, K.up, Alignment.topCenter),
+        _arrow(Icons.keyboard_arrow_down_rounded, K.down, Alignment.bottomCenter),
+        _arrow(Icons.keyboard_arrow_left_rounded, K.left, Alignment.centerLeft),
+        _arrow(Icons.keyboard_arrow_right_rounded, K.right, Alignment.centerRight),
+        Center(
+          child: RemoteKey(
+            label: 'OK',
+            onTap: () => onKey(K.ok),
+            size: size * 0.38,
+            color: kGold,
+            fg: const Color(0xFF1A1405),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+/// زرار طويل زي ريموت الصوت/القنوات (+ فوق، − تحت)
+class Rocker extends StatelessWidget {
+  final String label;
+  final IconData up, down;
+  final VoidCallback onUp, onDown;
+  const Rocker({super.key, required this.label, required this.up, required this.down, required this.onUp, required this.onDown});
+  @override
+  Widget build(BuildContext context) => Container(
+        width: 66,
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        decoration: BoxDecoration(
+          color: kSurface2,
+          borderRadius: BorderRadius.circular(33),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.07)),
+          boxShadow: const [BoxShadow(color: Color(0x66000000), blurRadius: 8, offset: Offset(0, 4))],
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          RemoteKey(icon: up, onTap: onUp, color: Colors.transparent, size: 52, repeat: true),
+          Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: kMuted)),
+          RemoteKey(icon: down, onTap: onDown, color: Colors.transparent, size: 52, repeat: true),
+        ]),
+      );
+}
+
+class RemoteControl extends StatelessWidget {
+  final void Function(int key) onKey;
+  const RemoteControl({super.key, required this.onKey});
+
+  Widget _k(String t, int k, {IconData? icon, Color? color, Color? fg, double size = 50, double? width}) =>
+      RemoteKey(label: t, icon: icon, onTap: () => onKey(k), color: color, fg: fg, size: size, width: width);
+
+  Widget _row(List<Widget> c, {MainAxisAlignment a = MainAxisAlignment.spaceEvenly}) => Row(mainAxisAlignment: a, children: c);
+
+  Widget _color(Color c, int k) => RemoteKey(onTap: () => onKey(k), color: c, size: 30, width: 58);
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
+      child: Center(
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 380),
+          padding: const EdgeInsets.fromLTRB(14, 16, 14, 18),
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(colors: [Color(0xFF1C2028), Color(0xFF121419)], begin: Alignment.topCenter, end: Alignment.bottomCenter),
+            borderRadius: BorderRadius.circular(40),
+            border: Border.all(color: kLine),
+            boxShadow: const [BoxShadow(color: Color(0x99000000), blurRadius: 24, offset: Offset(0, 10))],
+          ),
+          child: Directionality(
+            textDirection: TextDirection.ltr,
+            child: Column(children: [
+              _row([
+                _k('', K.power, icon: Icons.power_settings_new_rounded, color: const Color(0xFF8E2B2B)),
+                _k('TV/R', K.tvRadio, size: 46),
+                _k('', K.mute, icon: Icons.volume_off_rounded),
+              ], a: MainAxisAlignment.spaceBetween),
+              const SizedBox(height: 8),
+              _row([
+                _k('', K.menu, icon: Icons.menu_rounded),
+                _k('EPG', K.epg),
+                _k('', K.info, icon: Icons.info_outline_rounded),
+              ]),
+              const SizedBox(height: 6),
+              DPad(onKey: onKey),
+              const SizedBox(height: 6),
+              _row([
+                _k('', K.exit, icon: Icons.arrow_back_rounded),
+                _k('', K.fav, icon: Icons.star_rounded, fg: kGold),
+                _k('', K.recall, icon: Icons.history_rounded),
+              ]),
+              const SizedBox(height: 10),
+              _row([
+                Rocker(label: 'VOL', up: Icons.add_rounded, down: Icons.remove_rounded, onUp: () => onKey(K.volUp), onDown: () => onKey(K.volDown)),
+                Column(children: [
+                  _k('', K.audio, icon: Icons.graphic_eq_rounded, size: 46),
+                  _k('', K.subtitle, icon: Icons.subtitles_outlined, size: 46),
+                  _k('', K.sat, icon: Icons.satellite_alt_rounded, size: 46),
+                ]),
+                Rocker(label: 'CH', up: Icons.keyboard_arrow_up_rounded, down: Icons.keyboard_arrow_down_rounded, onUp: () => onKey(K.chUp), onDown: () => onKey(K.chDown)),
+              ]),
+              const SizedBox(height: 12),
+              _row([
+                _color(const Color(0xFFD64545), K.red),
+                _color(const Color(0xFF3FAE5A), K.green),
+                _color(const Color(0xFFE2B33C), K.yellow),
+                _color(const Color(0xFF3F7FD6), K.blue),
+              ]),
+              const SizedBox(height: 10),
+              for (final r in const [
+                [1, 2, 3],
+                [4, 5, 6],
+                [7, 8, 9],
+              ])
+                _row([for (final n in r) _k('$n', K.digit(n), size: 58, width: 84)]),
+              _row([
+                _k('TXT', K.teletext, size: 58, width: 84),
+                _k('0', K.digit(0), size: 58, width: 84),
+                _k('', K.find, icon: Icons.search_rounded, size: 58, width: 84),
+              ]),
+              const SizedBox(height: 10),
+              const Divider(),
+              const SizedBox(height: 6),
+              _row([
+                _k('', K.rew, icon: Icons.fast_rewind_rounded, size: 44),
+                _k('', K.play, icon: Icons.play_arrow_rounded, size: 44),
+                _k('', K.pause, icon: Icons.pause_rounded, size: 44),
+                _k('', K.stop, icon: Icons.stop_rounded, size: 44),
+                _k('', K.ff, icon: Icons.fast_forward_rounded, size: 44),
+              ]),
+              _row([
+                _k('', K.record, icon: Icons.fiber_manual_record_rounded, fg: kBad, size: 44),
+                _k('USB', K.usb, size: 44),
+                _k('P−', K.pageUp, size: 44),
+                _k('P+', K.pageDown, size: 44),
+                _k('', K.sleep, icon: Icons.bedtime_outlined, size: 44),
+              ]),
+              _row([
+                _k('Res', K.resolution, size: 44),
+                _k('F1', K.f1, size: 44),
+                _k('F2', K.f2, size: 44),
+                _k('', K.pauseLive, icon: Icons.pause_circle_outline_rounded, size: 44),
+              ]),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------- ضبط الطبق ----------------
+/// قراية القوة/الجودة من رد الريسيفر — بيدوّر على أي مفتاح اسمه شبه strength/quality
+class SignalReading {
+  final double? strength, quality, snr;
+  final bool? locked;
+  const SignalReading({this.strength, this.quality, this.snr, this.locked});
+  bool get empty => strength == null && quality == null;
+}
+
+double? _pct(dynamic v) {
+  final d = double.tryParse('$v'.replaceAll('%', '').trim());
+  if (d == null || d.isNaN) return null;
+  if (d > 100 && d <= 255) return d / 255 * 100;
+  if (d > 255 && d <= 1000) return d / 10;
+  return d.clamp(0, 100).toDouble();
+}
+
+SignalReading parseSignal(dynamic r) {
+  final flat = <String, dynamic>{};
+  void walk(dynamic x) {
+    if (x is Map) {
+      x.forEach((k, v) {
+        if (v is Map || v is List) {
+          walk(v);
+        } else {
+          flat['$k'.toLowerCase()] = v;
+        }
+      });
+    } else if (x is List) {
+      for (final e in x) {
+        walk(e);
+      }
+    }
+  }
+
+  walk(r);
+  double? find(List<String> keys) {
+    for (final e in flat.entries) {
+      if (keys.any((k) => e.key.contains(k))) {
+        final p = _pct(e.value);
+        if (p != null) return p;
+      }
+    }
+    return null;
+  }
+
+  final snrRaw = flat.entries.where((e) => e.key.contains('snr') || e.key.contains('cn') || e.key.contains('mer')).map((e) => double.tryParse('${e.value}')).firstWhere((v) => v != null, orElse: () => null);
+  final lockV = flat.entries.where((e) => e.key.contains('lock') && !e.key.contains('screen')).map((e) => '${e.value}').firstWhere((_) => true, orElse: () => '');
+  return SignalReading(
+    strength: find(['strength', 'level', 'intensity', 'power', 'signal_s', 'sig']),
+    quality: find(['quality', 'qual', 'signal_q']),
+    snr: snrRaw,
+    locked: lockV.isEmpty ? null : (lockV == '1' || lockV.toLowerCase() == 'true'),
+  );
+}
+
+/// فترة الصفارة حسب الجودة: كل ما الإشارة أحسن الصفارة أسرع
+int beepIntervalMs(double q) => (1400 - (q.clamp(0, 100) * 12.4)).round().clamp(150, 1400);
+
+class Gauge extends StatelessWidget {
+  final String label;
+  final double? value;
+  final Color color;
+  const Gauge({super.key, required this.label, required this.value, required this.color});
+  @override
+  Widget build(BuildContext context) {
+    final v = (value ?? 0).clamp(0, 100) / 100;
+    return Column(children: [
+      SizedBox(
+        width: 138,
+        height: 138,
+        child: Stack(alignment: Alignment.center, children: [
+          SizedBox.expand(
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(begin: 0, end: v.toDouble()),
+              duration: const Duration(milliseconds: 350),
+              builder: (c, x, _) => CircularProgressIndicator(
+                value: x,
+                strokeWidth: 12,
+                strokeCap: StrokeCap.round,
+                backgroundColor: kSurface2,
+                color: Color.lerp(kBad, color, x),
+              ),
+            ),
+          ),
+          Column(mainAxisSize: MainAxisSize.min, children: [
+            Text(value == null ? '—' : '${value!.round()}%', style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w800)),
+            Text(label, style: const TextStyle(fontSize: 12, color: kMuted)),
+          ]),
+        ]),
+      ),
+    ]);
+  }
+}
+
+class DishPage extends StatefulWidget {
+  final GmClient gm;
+  final List<StbChannel> channels;
+  final String? playingId;
+  final void Function(String id) onZapped;
+  const DishPage({super.key, required this.gm, required this.channels, required this.playingId, required this.onZapped});
+  @override
+  State<DishPage> createState() => _DishPageState();
+}
+
+class _DishPageState extends State<DishPage> {
+  Timer? poll, beep;
+  SignalReading sig = const SignalReading();
+  String raw = '';
+  bool running = false;
+  bool sound = true;
+  String q = '';
+  List<String> sats = [];
+
+  int? get reqCode => int.tryParse(Store.p.getString('stb_signal_req') ?? '');
+  String get reqFields => Store.p.getString('stb_signal_fields') ?? '';
+
+  @override
+  void dispose() {
+    poll?.cancel();
+    beep?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _tick() async {
+    final code = reqCode;
+    if (code == null) return;
+    Map<String, dynamic> fields = {};
+    if (reqFields.trim().isNotEmpty) {
+      try {
+        fields = Map<String, dynamic>.from(jsonDecode(reqFields) as Map);
+      } catch (_) {}
+    }
+    try {
+      final r = await widget.gm.send(code, fields, timeout: const Duration(seconds: 3));
+      final s = parseSignal(r);
+      raw = jsonEncode(r);
+      if (raw.length > 400) raw = '${raw.substring(0, 400)}…';
+      if (mounted) setState(() => sig = s);
+      _scheduleBeep();
+    } catch (e) {
+      if (mounted) setState(() => raw = 'خطأ: $e');
+    }
+  }
+
+  void _scheduleBeep() {
+    beep?.cancel();
+    if (!running || !sound) return;
+    final qv = sig.quality ?? sig.strength;
+    if (qv == null) return;
+    beep = Timer.periodic(Duration(milliseconds: beepIntervalMs(qv)), (_) {
+      SystemSound.play(SystemSoundType.click);
+      if ((qv) >= 70) HapticFeedback.lightImpact();
+    });
+  }
+
+  void start() {
+    if (reqCode == null) {
+      setCode();
+      return;
+    }
+    setState(() => running = true);
+    AppLog.add('STB', 'signal poll start req=$reqCode fields=$reqFields');
+    poll?.cancel();
+    poll = Timer.periodic(const Duration(milliseconds: 900), (_) => _tick());
+    _tick();
+  }
+
+  void stop() {
+    poll?.cancel();
+    beep?.cancel();
+    setState(() => running = false);
+  }
+
+  Future<void> setCode() async {
+    final ok = await confirm(context,
+        'قراية الإشارة لسه تجريبية: كود الطلب بتاع الإشارة في G-MScreen مش معروف لسه للـQmax.\n\nاكتب كود بس لو انت عارفه (مثلاً من سجل أو من حد جرّبه). كود غلط ممكن يعمل حاجة تانية في الريسيفر.\n\nتكمّل؟');
+    if (!ok || !mounted) return;
+    final c = await askText(context, 'كود طلب الإشارة', initial: Store.p.getString('stb_signal_req') ?? '', type: TextInputType.number);
+    if (c == null || !mounted) return;
+    await Store.p.setString('stb_signal_req', c.trim());
+    if (!mounted) return;
+    final f = await askText(context, 'حقول إضافية (JSON) — سيبها فاضية لو مش عارف', initial: reqFields, hint: '{"TpIndex":"0"}');
+    if (f != null) await Store.p.setString('stb_signal_fields', f.trim());
+    setState(() {});
+  }
+
+  Future<void> showOnTv() async {
+    // تجريبي: على ريسيفرات كتير Info (مرة أو مرتين) بيطلّع بار القوة/الجودة على التلفزيون
+    HapticFeedback.mediumImpact();
+    try {
+      await widget.gm.key(K.info);
+      await Future.delayed(const Duration(milliseconds: 500));
+      await widget.gm.key(K.info);
+    } catch (e) {
+      if (mounted) toast(context, '$e');
+    }
+  }
+
+  Future<void> loadSats() async {
+    try {
+      final r = await widget.gm.send(22, {}, timeout: const Duration(seconds: 8));
+      final out = <String>[];
+      void walk(dynamic x) {
+        if (x is Map) {
+          for (final e in x.entries) {
+            final k = '${e.key}'.toLowerCase();
+            if (k.contains('name') && '${e.value}'.trim().isNotEmpty) out.add('${e.value}');
+            if (e.value is Map || e.value is List) walk(e.value);
+          }
+        } else if (x is List) {
+          for (final e in x) {
+            walk(e);
+          }
+        }
+      }
+
+      walk(r);
+      if (out.isEmpty) out.add(jsonEncode(r).substring(0, min(200, jsonEncode(r).length)));
+      setState(() => sats = out);
+    } catch (e) {
+      if (mounted) toast(context, 'مقدرتش أقرا الأقمار: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final playing = widget.channels.where((c) => c.id == widget.playingId).firstOrNull;
+    final list = q.isEmpty ? <StbChannel>[] : widget.channels.where((c) => c.name.toLowerCase().contains(q.toLowerCase())).take(8).toList();
+    return ListView(padding: const EdgeInsets.only(bottom: 16), children: [
+      const SectionTitle('١. اختار قناة على القمر اللي بتظبط عليه', icon: Icons.live_tv_rounded),
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(playing == null ? 'مفيش قناة معروفة شغالة' : 'شغالة دلوقتي: ${playing.name}', style: const TextStyle(color: kMuted, fontSize: 13)),
+            const SizedBox(height: 8),
+            TextField(decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'اسم القناة (مثلاً Nile)'), onChanged: (v) => setState(() => q = v)),
+            for (final c in list)
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.tv_rounded),
+                title: Text(c.name),
+                onTap: () async {
+                  try {
+                    await widget.gm.zap(c);
+                    widget.onZapped(c.id);
+                    setState(() => q = '');
+                  } catch (e) {
+                    if (mounted) toast(context, '$e');
+                  }
+                },
+              ),
+          ]),
+        ),
+      ),
+      const SectionTitle('٢. شوف الإشارة', icon: Icons.network_check_rounded),
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(children: [
+            Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+              Gauge(label: 'القوة', value: sig.strength, color: kGold),
+              Gauge(label: 'الجودة', value: sig.quality, color: kOk),
+            ]),
+            if (sig.snr != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text('SNR: ${sig.snr}', style: const TextStyle(color: kMuted))),
+            if (sig.locked != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Badge2(sig.locked! ? 'الإشارة ماسكة' : 'مفيش قفل', color: sig.locked! ? kOk : kBad),
+              ),
+            const SizedBox(height: 12),
+            Row(children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: running ? stop : start,
+                  icon: Icon(running ? Icons.stop_rounded : Icons.play_arrow_rounded),
+                  label: Text(running ? 'وقّف القياس' : 'ابدأ القياس'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filledTonal(
+                tooltip: 'الصفارة',
+                onPressed: () {
+                  setState(() => sound = !sound);
+                  _scheduleBeep();
+                },
+                icon: Icon(sound ? Icons.volume_up_rounded : Icons.volume_off_rounded),
+              ),
+              IconButton.filledTonal(tooltip: 'كود الطلب', onPressed: setCode, icon: const Icon(Icons.tune_rounded)),
+            ]),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(color: kGold.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(12), border: Border.all(color: kGold.withValues(alpha: 0.3))),
+              child: Text(
+                reqCode == null
+                    ? 'تجريبي: قراية القوة والجودة على الموبايل محتاجة كود طلب من G-MScreen لسه مش متأكدين منه للـQmax. لحد ما نتأكد، استخدم الزرار اللي تحت يطلّع الإشارة على التلفزيون.'
+                    : 'تجريبي: بقرا بالكود $reqCode كل ثانية تقريباً — الصفارة بتسرع كل ما الجودة تعلى. الرد الخام بيتسجل في السجل.',
+                style: const TextStyle(fontSize: 12, color: Colors.white70),
+              ),
+            ),
+            if (raw.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Directionality(textDirection: TextDirection.ltr, child: Text(raw, style: const TextStyle(fontSize: 10, fontFamily: 'monospace', color: kMuted))),
+              ),
+          ]),
+        ),
+      ),
+      const SectionTitle('٣. على شاشة التلفزيون', icon: Icons.tv_rounded),
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            FilledButton.tonalIcon(onPressed: showOnTv, icon: const Icon(Icons.signal_cellular_alt_rounded), label: const Text('اعرض الإشارة على التلفزيون (زرار Info)')),
+            const SizedBox(height: 6),
+            OutlinedButton.icon(onPressed: () => widget.gm.key(K.exit), icon: const Icon(Icons.close_rounded), label: const Text('اقفله (Exit)')),
+            const SizedBox(height: 8),
+            const Text('حرّك الطبق شوية شوية (يمين/شمال الأول، وبعدين فوق/تحت) واستنى ثانيتين بعد كل حركة عشان الرقم يتحدث.',
+                style: TextStyle(fontSize: 12, color: kMuted)),
+          ]),
+        ),
+      ),
+      SectionTitle('الأقمار اللي على الريسيفر', icon: Icons.public_rounded, trailing: TextButton(onPressed: loadSats, child: const Text('اقرا'))),
+      if (sats.isNotEmpty)
+        Card(
+          child: Column(children: [for (final s in sats) ListTile(dense: true, leading: const Icon(Icons.satellite_alt_rounded, size: 18), title: Text(s))]),
+        ),
+    ]);
   }
 }
 
@@ -2414,7 +3328,8 @@ class ZteRouter {
 
   Future<Map<String, dynamic>> status() => get([
         'network_type', 'network_provider', 'signalbar', 'lte_rsrp', 'lte_rsrq', 'lte_rssi',
-        'lte_snr', 'Z5g_SINR', 'lte_band', 'wan_ipaddr', 'ppp_status', 'realtime_tx_thrpt',
+        'lte_snr', 'Z5g_SINR', 'lte_band', 'Z4g_rsrq', 'lte_ca_pcell_rsrq', 'Z4g_SINR', 'lte_sinr',
+        'lte_ca_pcell_band', 'wan_active_band', 'lte_main_band', 'wan_ipaddr', 'ppp_status', 'realtime_tx_thrpt',
         'realtime_rx_thrpt', 'monthly_tx_bytes', 'monthly_rx_bytes', 'realtime_time',
         'SSID1', 'sms_unread_num', 'wa_inner_version',
       ]);
@@ -2922,8 +3837,16 @@ class DlnaDevice {
 }
 
 String _resolve(String base, String path) {
-  if (path.startsWith('http')) return path;
-  return Uri.parse(base).resolve(path).toString();
+  final t = path.trim();
+  if (t.startsWith('http://') || t.startsWith('https://')) return t;
+  // بعض الأجهزة (زي الـQmax) بتبعت مسار من غير / وفيه ":" زي _urn:schemas-upnp-org:service:AVTransport_control
+  final rel = (t.startsWith('/') || t.startsWith('./') || t.startsWith('../')) ? t : './$t';
+  try {
+    return Uri.parse(base).resolve(Uri.encodeFull(rel)).toString();
+  } catch (_) {
+    final b = Uri.parse(base);
+    return '${b.scheme}://${b.host}:${b.port}/${t.replaceFirst(RegExp(r'^/+'), '')}';
+  }
 }
 
 /// يقرا وصف الجهاز (description.xml) ويطلع روابط التحكم
@@ -3392,6 +4315,17 @@ class StbChannel {
   final int index;
   final Map<String, dynamic> raw;
   StbChannel(this.id, this.name, this.radio, this.index, this.raw);
+  bool _flag(String k) {
+    final v = '${raw[k] ?? ''}'.trim();
+    return v.isNotEmpty && v != '0' && v.toLowerCase() != 'false';
+  }
+
+  // الحقول دي جاية من رد الريسيفر نفسه (طلب 0) — شفناها في سجل Qmax H8
+  bool get hd => _flag('HD');
+  bool get scrambled => _flag('Scramble');
+  bool get locked => _flag('Lock');
+  bool get fav => _flag('FavBit');
+  bool get hasEpg => _flag('EPG');
 }
 
 List<StbChannel> gmParseChannels(dynamic d, int startIndex) {
