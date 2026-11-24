@@ -3,6 +3,11 @@ name: Build A2R Home APK
 on:
   push:
     branches: [ '**' ]
+    # برنامج الكمبيوتر ليه workflow لوحده (pc.yml)
+    paths-ignore:
+      - 'pc_agent.py'
+      - '.github/workflows/pc.yml'
+      - '*.md'
   workflow_dispatch:
 
 permissions:
@@ -50,7 +55,7 @@ jobs:
               sdk: flutter
             http: 1.6.0
             crypto: 3.0.8
-            xml: 7.1.0
+            xml: 6.6.1
             shared_preferences: 2.5.6
             flutter_secure_storage: 11.2.0
             network_info_plus: 8.2.2
@@ -59,6 +64,8 @@ jobs:
             url_launcher: 6.3.3
             file_picker: 13.4.1
             path_provider: 2.1.5
+            qr: 3.0.2
+            youtube_explode_dart: 3.1.0
           dependency_overrides:
             # نسخ من غير JNI (نفس تطبيقاتك التانية)
             path_provider_android: 2.2.23
@@ -70,90 +77,63 @@ jobs:
 
       - name: Configure Android (name, permissions, native bridge)
         run: |
-          python3 - <<'PY'
-          import glob, re
-          p = 'android/app/src/main/AndroidManifest.xml'
-          s = open(p, encoding='utf-8').read()
-          s = re.sub(r'android:label="[^"]*"', 'android:label="A2R Home"', s, count=1)
-          perms = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % x for x in [
-              'INTERNET', 'ACCESS_NETWORK_STATE', 'ACCESS_WIFI_STATE', 'CHANGE_WIFI_MULTICAST_STATE',
-              'POST_NOTIFICATIONS', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION', 'WAKE_LOCK'])
-          s = s.replace('<application', perms + '    <application android:usesCleartextTraffic="true"', 1)
-          open(p, 'w', encoding='utf-8').write(s)
-          print(s)
+          mkdir -p /tmp/a2rkt
+          cat > /tmp/a2rkt/MainActivity.kt <<'KT_END'
+          package com.a2r.a2r_home
 
-          cands = glob.glob('android/app/src/main/**/MainActivity.kt', recursive=True)
-          assert cands, 'MainActivity.kt not found'
-          mp = cands[0]
-          pkg = re.search(r'(?m)^package\s+([\w.]+)', open(mp, encoding='utf-8').read()).group(1)
-          code = '''package PKG
-
-          import android.Manifest
-          import android.app.NotificationChannel
-          import android.app.NotificationManager
-          import android.content.Context
           import android.content.Intent
-          import android.content.pm.PackageManager
-          import android.net.Uri
-          import android.net.wifi.WifiManager
-          import android.os.Build
+          import android.speech.RecognizerIntent
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
 
           class MainActivity : FlutterActivity() {
-              private var lock: WifiManager.MulticastLock? = null
-              private var nid = 100
+              companion object {
+                  // القناة المفتوحة مع التطبيق (علشان زراير الإشعار تبعت للريسيفر على نفس الاتصال)
+                  var live: MethodChannel? = null
+              }
+
+              private var voiceResult: MethodChannel.Result? = null
+              private var pendingAction: String? = null
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/native").setMethodCallHandler { call, result ->
+                  pendingAction = actionOf(intent)
+                  val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/native")
+                  live = ch
+                  ch.setMethodCallHandler { call, result ->
                       try {
                           when (call.method) {
-                              "multicastLock" -> {
-                                  val on = call.argument<Boolean>("on") ?: false
-                                  if (on) {
-                                      if (lock == null) {
-                                          val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                                          lock = wm.createMulticastLock("a2r_home").apply { setReferenceCounted(false) }
-                                      }
-                                      lock?.acquire()
-                                  } else {
-                                      lock?.release()
-                                  }
-                                  result.success(true)
-                              }
                               "askNotify" -> {
-                                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.ACCESS_FINE_LOCATION), 7)
-                                  } else if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                                      requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 8)
-                                  }
+                                  A2RNative.askPermissions(this)
                                   result.success(true)
                               }
-                              "notify" -> {
-                                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                                  if (Build.VERSION.SDK_INT >= 26) {
-                                      nm.createNotificationChannel(NotificationChannel("net", "الشبكة", NotificationManager.IMPORTANCE_DEFAULT))
+                              "voice" -> {
+                                  if (voiceResult != null) {
+                                      result.success(null)
+                                  } else {
+                                      val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                          putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                          putExtra(RecognizerIntent.EXTRA_LANGUAGE, call.argument<String>("lang") ?: "ar-EG")
+                                          putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                                          putExtra(RecognizerIntent.EXTRA_PROMPT, call.argument<String>("prompt") ?: "")
+                                      }
+                                      voiceResult = result
+                                      try {
+                                          startActivityForResult(i, 4711)
+                                      } catch (e: Exception) {
+                                          voiceResult = null
+                                          result.success(null)
+                                      }
                                   }
-                                  val b = if (Build.VERSION.SDK_INT >= 26) android.app.Notification.Builder(this, "net") else android.app.Notification.Builder(this)
-                                  b.setSmallIcon(applicationInfo.icon)
-                                      .setContentTitle(call.argument<String>("title") ?: "")
-                                      .setContentText(call.argument<String>("body") ?: "")
-                                      .setAutoCancel(true)
-                                  nm.notify(nid++, b.build())
-                                  result.success(true)
                               }
-                              "openVideo" -> {
-                                  val url = call.argument<String>("url") ?: ""
-                                  val i = Intent(Intent.ACTION_VIEW).apply {
-                                      setDataAndType(Uri.parse(url), "video/*")
-                                      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                  }
-                                  startActivity(Intent.createChooser(i, "افتح بـ").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                                  result.success(true)
+                              "pinShortcut" -> result.success(A2RNative.pinShortcut(this, call.argument<String>("id") ?: "", call.argument<String>("label") ?: "", call.argument<String>("data") ?: ""))
+                              "initialAction" -> {
+                                  val a = pendingAction
+                                  pendingAction = null
+                                  result.success(a)
                               }
-                              else -> result.notImplemented()
+                              else -> A2RNative.handle(this, call, result)
                           }
                       } catch (e: Exception) {
                           result.success(false)
@@ -161,89 +141,524 @@ jobs:
                   }
               }
 
+              private fun actionOf(i: Intent?): String? =
+                  if (i != null && i.action == A2RNative.ACTION_CHANNEL) i.getStringExtra("ch") else null
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  val a = actionOf(intent) ?: return
+                  val ch = live
+                  if (ch != null) ch.invokeMethod("openChannel", a) else pendingAction = a
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 4711) {
+                      val r = voiceResult
+                      voiceResult = null
+                      val list = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                      r?.success(if (resultCode == RESULT_OK && list != null) ArrayList(list) else null)
+                  }
+              }
+
               override fun onDestroy() {
-                  try { lock?.release() } catch (e: Exception) {}
+                  live = null
+                  A2RNative.releaseLock()
                   super.onDestroy()
               }
           }
-          '''
-          open(mp, 'w', encoding='utf-8').write(code.replace('PKG', pkg))
-          print(open(mp, encoding='utf-8').read())
+          KT_END
+          cat > /tmp/a2rkt/A2RNative.kt <<'KT_END'
+          package com.a2r.a2r_home
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlarmManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.pm.ShortcutInfo
+          import android.content.pm.ShortcutManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.ImageDecoder
+          import android.graphics.Matrix
+          import android.graphics.drawable.Icon
+          import android.media.ExifInterface
+          import android.net.Uri
+          import android.net.wifi.WifiManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import io.flutter.FlutterInjector
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.embedding.engine.dart.DartExecutor
+          import io.flutter.plugin.common.MethodCall
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+          import java.io.FileOutputStream
+
+          /** أوامر أندرويد المشتركة بين التطبيق والشغل اللي في الخلفية */
+          object A2RNative {
+              const val ACTION_CHANNEL = "com.a2r.home.CHANNEL"
+              const val ACTION_ALARM = "com.a2r.home.ALARM"
+              const val ACTION_KEY = "com.a2r.home.KEY"
+              private var lock: WifiManager.MulticastLock? = null
+              private var nid = 100
+
+              fun handle(ctx: Context, call: MethodCall, result: MethodChannel.Result) {
+                  when (call.method) {
+                      "multicastLock" -> {
+                          val on = call.argument<Boolean>("on") ?: false
+                          if (on) {
+                              if (lock == null) {
+                                  val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                                  lock = wm.createMulticastLock("a2r_home").apply { setReferenceCounted(false) }
+                              }
+                              lock?.acquire()
+                          } else {
+                              lock?.release()
+                          }
+                          result.success(true)
+                      }
+                      "notify" -> {
+                          notify(ctx, call.argument<String>("title") ?: "", call.argument<String>("body") ?: "")
+                          result.success(true)
+                      }
+                      "openVideo" -> {
+                          val url = call.argument<String>("url") ?: ""
+                          val i = Intent(Intent.ACTION_VIEW).apply {
+                              setDataAndType(Uri.parse(url), "video/*")
+                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                          }
+                          ctx.startActivity(Intent.createChooser(i, "افتح بـ").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                          result.success(true)
+                      }
+                      "setAlarm" -> {
+                          val id = call.argument<Int>("id") ?: 1
+                          val at = (call.argument<Number>("at") ?: 0L).toLong()
+                          val task = call.argument<String>("task") ?: "{}"
+                          val exact = call.argument<Boolean>("exact") ?: true
+                          result.success(setAlarm(ctx, id, at, task, exact))
+                      }
+                      "cancelAlarm" -> {
+                          val id = call.argument<Int>("id") ?: 1
+                          val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                          am.cancel(alarmIntent(ctx, id, "{}"))
+                          result.success(true)
+                      }
+                      "remoteNotif" -> {
+                          val on = call.argument<Boolean>("on") ?: false
+                          if (on) remoteNotif(ctx, call.argument<String>("title") ?: "الريسيفر") else {
+                              val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                              nm.cancel(REMOTE_ID)
+                          }
+                          result.success(true)
+                      }
+                      "toJpeg" -> {
+                          val src = call.argument<String>("src") ?: ""
+                          val dst = call.argument<String>("dst") ?: ""
+                          val max = call.argument<Int>("max") ?: 1920
+                          val q = call.argument<Int>("q") ?: 90
+                          Thread {
+                              val ok = toJpeg(src, dst, max, q)
+                              Handler(Looper.getMainLooper()).post { result.success(ok) }
+                          }.start()
+                      }
+                      else -> result.notImplemented()
+                  }
+              }
+
+              /** أي صورة (HEIC/PNG/WebP/JPEG كبير) → JPEG أقصى ضلع فيه max، ومتلفّة حسب EXIF */
+              fun toJpeg(src: String, dst: String, max: Int, q: Int): Boolean {
+                  try {
+                      val bmp: Bitmap
+                      if (Build.VERSION.SDK_INT >= 28) {
+                          bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(File(src))) { d, info, _ ->
+                              val w = info.size.width
+                              val h = info.size.height
+                              val s = maxOf(w, h)
+                              if (s > max) {
+                                  val f = max.toDouble() / s
+                                  d.setTargetSize(maxOf(1, (w * f).toInt()), maxOf(1, (h * f).toInt()))
+                              }
+                              d.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                          }
+                      } else {
+                          val o = BitmapFactory.Options()
+                          o.inJustDecodeBounds = true
+                          BitmapFactory.decodeFile(src, o)
+                          var sample = 1
+                          while (maxOf(o.outWidth, o.outHeight) / (sample * 2) >= max) sample *= 2
+                          val o2 = BitmapFactory.Options()
+                          o2.inSampleSize = sample
+                          val b = BitmapFactory.decodeFile(src, o2) ?: return false
+                          val rot = when (ExifInterface(src).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)) {
+                              6 -> 90f
+                              3 -> 180f
+                              8 -> 270f
+                              else -> 0f
+                          }
+                          val sc = minOf(1.0, max.toDouble() / maxOf(b.width, b.height)).toFloat()
+                          val m = Matrix()
+                          m.postScale(sc, sc)
+                          m.postRotate(rot)
+                          bmp = Bitmap.createBitmap(b, 0, 0, b.width, b.height, m, true)
+                      }
+                      FileOutputStream(dst).use { bmp.compress(Bitmap.CompressFormat.JPEG, q, it) }
+                      return File(dst).length() > 0
+                  } catch (e: Throwable) {
+                      return false
+                  }
+              }
+
+              fun releaseLock() {
+                  try { lock?.release() } catch (e: Exception) {}
+              }
+
+              fun askPermissions(a: Activity) {
+                  val want = mutableListOf<String>()
+                  if (Build.VERSION.SDK_INT >= 33 && a.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      want.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  if (a.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      want.add(Manifest.permission.ACCESS_FINE_LOCATION)
+                  }
+                  if (want.isNotEmpty()) a.requestPermissions(want.toTypedArray(), 7)
+              }
+
+              fun notify(ctx: Context, title: String, body: String) {
+                  val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(NotificationChannel("net", "الشبكة", NotificationManager.IMPORTANCE_DEFAULT))
+                  }
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, "net") else Notification.Builder(ctx)
+                  b.setSmallIcon(ctx.applicationInfo.icon)
+                      .setContentTitle(title)
+                      .setContentText(body)
+                      .setStyle(Notification.BigTextStyle().bigText(body))
+                      .setContentIntent(openApp(ctx))
+                      .setAutoCancel(true)
+                  nm.notify(nid++, b.build())
+              }
+
+              private fun openApp(ctx: Context): PendingIntent {
+                  val i = Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                  return PendingIntent.getActivity(ctx, 1, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              }
+
+              private fun alarmIntent(ctx: Context, id: Int, task: String): PendingIntent {
+                  val i = Intent(ctx, A2RAlarmReceiver::class.java).setAction(ACTION_ALARM).putExtra("task", task)
+                  return PendingIntent.getBroadcast(ctx, 5000 + id, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+              }
+
+              /** بيرجع "exact" أو "inexact" (لو أندرويد مش سامح بالمنبه الدقيق) */
+              fun setAlarm(ctx: Context, id: Int, at: Long, task: String, exact: Boolean): String {
+                  val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val pi = alarmIntent(ctx, id, task)
+                  val exactOk = exact && (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms())
+                  return try {
+                      if (exactOk) {
+                          am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+                          "exact"
+                      } else {
+                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+                          "inexact"
+                      }
+                  } catch (e: SecurityException) {
+                      am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+                      "inexact"
+                  }
+              }
+
+              const val REMOTE_ID = 77
+
+              private fun keyAction(ctx: Context, key: Int, icon: Int, title: String): Notification.Action {
+                  val i = Intent(ctx, A2RAlarmReceiver::class.java).setAction(ACTION_KEY).putExtra("key", key)
+                  val pi = PendingIntent.getBroadcast(ctx, 6000 + key, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                  return Notification.Action.Builder(Icon.createWithResource(ctx, icon), title, pi).build()
+              }
+
+              /** ريموت في الإشعارات: قناة −/+ ، صوت −/+ ، كتم */
+              fun remoteNotif(ctx: Context, title: String) {
+                  val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(NotificationChannel("remote", "ريموت الريسيفر", NotificationManager.IMPORTANCE_LOW))
+                  }
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, "remote") else Notification.Builder(ctx)
+                  b.setSmallIcon(ctx.applicationInfo.icon)
+                      .setContentTitle(title)
+                      .setContentText("ريموت سريع")
+                      .setOngoing(true)
+                      .setShowWhen(false)
+                      .setContentIntent(openApp(ctx))
+                      .addAction(keyAction(ctx, 70, android.R.drawable.ic_media_previous, "CH−"))
+                      .addAction(keyAction(ctx, 69, android.R.drawable.ic_media_next, "CH+"))
+                      .addAction(keyAction(ctx, 36, android.R.drawable.arrow_down_float, "VOL−"))
+                      .addAction(keyAction(ctx, 35, android.R.drawable.arrow_up_float, "VOL+"))
+                      .addAction(keyAction(ctx, 23, android.R.drawable.ic_lock_silent_mode, "كتم"))
+                      .setStyle(Notification.MediaStyle().setShowActionsInCompactView(0, 1, 4))
+                  nm.notify(REMOTE_ID, b.build())
+              }
+
+              fun pinShortcut(a: Activity, id: String, label: String, data: String): Boolean {
+                  if (Build.VERSION.SDK_INT < 26) return false
+                  val sm = a.getSystemService(ShortcutManager::class.java) ?: return false
+                  if (!sm.isRequestPinShortcutSupported) return false
+                  val i = Intent(a, MainActivity::class.java).setAction(ACTION_CHANNEL).putExtra("ch", data)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                  val info = ShortcutInfo.Builder(a, "ch_$id")
+                      .setShortLabel(if (label.length > 24) label.substring(0, 24) else label.ifEmpty { "قناة" })
+                      .setIcon(Icon.createWithResource(a, a.applicationInfo.icon))
+                      .setIntent(i)
+                      .build()
+                  return sm.requestPinShortcut(info, null)
+              }
+          }
+
+          /** بيشغّل كود دارت (a2rBgMain) في الخلفية لشغلانة واحدة وبعدين يقفل */
+          object A2RBg {
+              fun run(ctx: Context, task: String, pending: BroadcastReceiver.PendingResult?) {
+                  val app = ctx.applicationContext
+                  val main = Handler(Looper.getMainLooper())
+                  main.post {
+                      var engine: FlutterEngine? = null
+                      var finished = false
+                      var released = false
+                      // أندرويد مش بيستنى الـ receiver كتير: نسيبه بعد 9 ثواني والمحرك يكمل لحد 50 ثانية
+                      val release = {
+                          if (!released) {
+                              released = true
+                              try { pending?.finish() } catch (e: Exception) {}
+                          }
+                      }
+                      val finish = {
+                          if (!finished) {
+                              finished = true
+                              try { engine?.destroy() } catch (e: Exception) {}
+                              release()
+                          }
+                      }
+                      main.postDelayed({ release() }, 9000)
+                      try {
+                          val loader = FlutterInjector.instance().flutterLoader()
+                          loader.startInitialization(app)
+                          loader.ensureInitializationComplete(app, null)
+                          val eng = FlutterEngine(app)
+                          engine = eng
+                          MethodChannel(eng.dartExecutor.binaryMessenger, "a2r/native").setMethodCallHandler { call, result ->
+                              try {
+                                  when (call.method) {
+                                      "bgTask" -> result.success(task)
+                                      "bgDone" -> {
+                                          result.success(true)
+                                          main.post { finish() }
+                                      }
+                                      "askNotify", "voice", "pinShortcut", "initialAction" -> result.success(null)
+                                      else -> A2RNative.handle(app, call, result)
+                                  }
+                              } catch (e: Exception) {
+                                  result.success(false)
+                              }
+                          }
+                          eng.dartExecutor.executeDartEntrypoint(DartExecutor.DartEntrypoint(loader.findAppBundlePath(), "a2rBgMain"))
+                          // أمان: لو دارت مخلصش في 50 ثانية نقفل
+                          main.postDelayed({ finish() }, 50000)
+                      } catch (e: Exception) {
+                          finish()
+                      }
+                  }
+              }
+          }
+
+          class A2RAlarmReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  when (intent.action) {
+                      A2RNative.ACTION_ALARM -> A2RBg.run(context, intent.getStringExtra("task") ?: "{}", goAsync())
+                      A2RNative.ACTION_KEY -> {
+                          val key = intent.getIntExtra("key", 0)
+                          val ch = MainActivity.live
+                          if (ch != null) {
+                              ch.invokeMethod("notifKey", key)
+                          } else {
+                              A2RBg.run(context, "{\"type\":\"key\",\"key\":$key}", goAsync())
+                          }
+                      }
+                  }
+              }
+          }
+
+          class A2RBootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+                      A2RBg.run(context, "{\"type\":\"rearm\"}", goAsync())
+                  }
+              }
+          }
+          KT_END
+          python3 - <<'PY'
+          import glob, os, re
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'android:label="[^"]*"', 'android:label="A2R Home"', s, count=1)
+          perms = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % x for x in [
+              'INTERNET', 'ACCESS_NETWORK_STATE', 'ACCESS_WIFI_STATE', 'CHANGE_WIFI_MULTICAST_STATE',
+              'POST_NOTIFICATIONS', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION', 'WAKE_LOCK',
+              'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM'])
+          # منبه دقيق لمواعيد الحظر: أندرويد 12 بيطلب SCHEDULE_EXACT_ALARM، و13+ بيكفيه USE_EXACT_ALARM
+          perms += '    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32"/>\n'
+          s = s.replace('<application', perms + '    <application android:usesCleartextTraffic="true"', 1)
+
+          cands = glob.glob('android/app/src/main/**/MainActivity.kt', recursive=True)
+          assert cands, 'MainActivity.kt not found'
+          mp = cands[0]
+          pkg = re.search(r'(?m)^package\s+([\w.]+)', open(mp, encoding='utf-8').read()).group(1)
+          print('package:', pkg)
+          receivers = (
+              '        <receiver android:name="%s.A2RAlarmReceiver" android:exported="false"/>\n'
+              '        <receiver android:name="%s.A2RBootReceiver" android:exported="true">\n'
+              '            <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter>\n'
+              '        </receiver>\n' % (pkg, pkg))
+          assert s.count('</application>') == 1
+          s = s.replace('</application>', receivers + '    </application>', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print(s)
+
+          for name in ('MainActivity.kt', 'A2RNative.kt'):
+              code = open('/tmp/a2rkt/' + name, encoding='utf-8').read()
+              code = re.sub(r'(?m)^package\s+[\w.]+', 'package ' + pkg, code, count=1)
+              open(os.path.join(os.path.dirname(mp), name), 'w', encoding='utf-8').write(code)
+              print('---', name, len(code))
           PY
 
-      - name: App icon (A2R Home dish)
+      - name: App icon (A2R — اختيار 2)
         continue-on-error: true
         run: |
           python3 -m venv /tmp/iv
           /tmp/iv/bin/pip install --quiet pillow
           /tmp/iv/bin/python - <<'PYICON'
-          from PIL import Image, ImageDraw
-          import sys
-          GOLD=(232,178,62,255); GOLD_D=(176,126,34,255); GOLD_L=(255,216,122,255); WHITE=(238,241,246,255)
-          def art(S):
-              """رسم الطبق + الإشارة على خلفية شفافة (S×S)"""
-              L = Image.new('RGBA', (S, S), (0,0,0,0))
-              # الطبق: قطع ناقص مايل
-              dish = Image.new('RGBA', (S, S), (0,0,0,0))
-              dd = ImageDraw.Draw(dish)
-              cx, cy, a, b = S*0.5, S*0.5, S*0.30, S*0.16
-              dd.ellipse([cx-a, cy-b, cx+a, cy+b], fill=GOLD)
-              dd.ellipse([cx-a*0.80, cy-b*0.62, cx+a*0.80, cy+b*0.86], fill=GOLD_D)
-              dd.ellipse([cx-a*0.60, cy-b*0.40, cx+a*0.60, cy+b*0.70], fill=GOLD)
-              dish = dish.rotate(38, resample=Image.BICUBIC, center=(cx, cy))
-              L.alpha_composite(dish, (int(-S*0.07), int(S*0.06)))
-              d = ImageDraw.Draw(L)
-              w = max(2, int(S*0.032))
-              # ذراع الـLNB
-              d.line([(S*0.40, S*0.60), (S*0.60, S*0.42)], fill=WHITE, width=w)
-              r = S*0.04
-              d.ellipse([S*0.60-r, S*0.42-r, S*0.60+r, S*0.42+r], fill=WHITE)
-              # الرجل والقاعدة
-              d.line([(S*0.40, S*0.66), (S*0.36, S*0.84)], fill=WHITE, width=w)
-              d.rectangle([int(S*0.24), int(S*0.83), int(S*0.48), int(S*0.83)+int(w*1.2)], fill=WHITE)
-              # موجات الإشارة
-              ax, ay = S*0.62, S*0.40
-              for rr in (0.10, 0.18, 0.26):
-                  R = S*rr
-                  d.arc([ax-R, ay-R, ax+R, ay+R], 280, 350, fill=GOLD_L, width=w)
-              return L
-          def legacy(S):
-              img = Image.new('RGBA', (S, S), (0,0,0,0))
-              bg = Image.new('RGBA', (S, S))
-              bd = ImageDraw.Draw(bg)
-              for y in range(S):
-                  t = y/S
-                  bd.line([(0,y),(S,y)], fill=(int(30-8*t), int(34-8*t), int(44-8*t), 255))
-              m = Image.new('L', (S, S), 0)
-              ImageDraw.Draw(m).rounded_rectangle([0,0,S-1,S-1], radius=int(S*0.23), fill=255)
-              img.paste(bg, (0,0), m)
-              img.alpha_composite(art(S))
-              return img
-          def foreground(S):
-              # الأيقونة التكيفية: الرسم في النص 70% (منطقة الأمان)
-              img = Image.new('RGBA', (S, S), (0,0,0,0))
-              k = int(S*0.70)
-              img.alpha_composite(art(k), ((S-k)//2, (S-k)//2))
-              return img
+          from PIL import Image, ImageDraw, ImageFilter, ImageFont
+          import math, os, glob, subprocess
+          # أيقونة A2R Home — اختيار أحمد رقم 2: A2R دهبي + خط + موجات بث، على خلفية غامقة
+          S = 2048
+          GOLD1 = (255, 214, 102); GOLD2 = (214, 150, 30)
 
-          import os
+          def find_font():
+              pats = ['/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+                      '/usr/share/fonts/**/DejaVuSans-Bold.ttf', '/usr/share/fonts/**/LiberationSans-Bold.ttf']
+              for _ in range(2):
+                  for p in pats:
+                      hits = glob.glob(p, recursive=True)
+                      if hits:
+                          return hits[0]
+                  try:
+                      subprocess.run('sudo apt-get install -y -qq fonts-dejavu-core', shell=True, timeout=180)
+                  except Exception:
+                      pass
+              return None
+
+          def grad(fn):
+              n = 256
+              g = Image.new('RGB', (n, n)); px = g.load()
+              for y in range(n):
+                  for x in range(n):
+                      px[x, y] = fn(x / (n - 1), y / (n - 1))
+              return g.resize((S, S), Image.BICUBIC)
+
+          def mix(c1, c2, u):
+              u = max(0.0, min(1.0, u))
+              return tuple(int(c1[i] + (c2[i] - c1[i]) * u) for i in range(3))
+
+          def bg_dark():
+              return grad(lambda x, y: mix((44, 52, 72), (12, 14, 22), math.hypot(x - .5, y - .32) / .95))
+
+          def gold():
+              a = math.radians(75); dx, dy = math.cos(a), math.sin(a)
+              k = abs(dx) * .5 + abs(dy) * .5
+              return grad(lambda x, y: mix(GOLD1, GOLD2, ((x - .5) * dx + (y - .5) * dy) / k * .5 + .5))
+
+          def arc(d, cx, cy, r, a0, a1, w):
+              d.arc([cx - r, cy - r, cx + r, cy + r], a0, a1, fill=255, width=w)
+              rm = r - w / 2
+              for a in (a0, a1):
+                  t = math.radians(a); x, y = cx + rm * math.cos(t), cy + rm * math.sin(t)
+                  d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=255)
+
+          def fg_layer():
+              m = Image.new('L', (S, S), 0); d = ImageDraw.Draw(m)
+              font = find_font()
+              print('font:', font)
+              if font:
+                  f = ImageFont.truetype(font, int(S * .255))
+                  bb = d.textbbox((0, 0), 'A2R', font=f)
+                  tw, th = bb[2] - bb[0], bb[3] - bb[1]
+                  d.text(((S - tw) / 2 - bb[0], S * .55 - bb[1]), 'A2R', font=f, fill=255)
+                  by = S * .55 + th + S * .04
+                  d.rounded_rectangle([S * .5 - tw / 2, by, S * .5 + tw / 2, by + S * .03], radius=S * .015, fill=255)
+                  ox, oy, sc = S * .5, S * .455, 1.0
+              else:
+                  ox, oy, sc = S * .5, S * .62, 1.5   # من غير خط: الموجات بس أكبر
+              w = int(S * .04 * sc)
+              rr = S * .036 * sc
+              d.ellipse([ox - rr, oy - rr, ox + rr, oy + rr], fill=255)
+              for r in (.095, .16, .225):
+                  arc(d, ox, oy, S * r * sc + w / 2, 228, 312, w)
+              fg = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+              sh = m.filter(ImageFilter.GaussianBlur(45)).point(lambda v: v * 120 // 255)
+              tmp = Image.new('L', (S, S), 0); tmp.paste(sh, (0, 35))
+              fg.paste(Image.new('RGBA', (S, S), (0, 0, 0, 255)), (0, 0), tmp)
+              fg.paste(gold().convert('RGBA'), (0, 0), m)
+              return fg
+
+          BG = bg_dark()
+          FG = fg_layer()
+          FULL = BG.convert('RGBA'); FULL.alpha_composite(FG)
+
+          def legacy(px):
+              big = px * 4
+              img = FULL.resize((big, big), Image.LANCZOS)
+              msk = Image.new('L', (big, big), 0)
+              ImageDraw.Draw(msk).rounded_rectangle([0, 0, big - 1, big - 1], radius=int(big * .22), fill=255)
+              out = Image.new('RGBA', (big, big), (0, 0, 0, 0)); out.paste(img, (0, 0), msk)
+              return out.resize((px, px), Image.LANCZOS)
+
+          def round_icon(px):
+              big = px * 4
+              img = FULL.resize((big, big), Image.LANCZOS)
+              msk = Image.new('L', (big, big), 0); ImageDraw.Draw(msk).ellipse([0, 0, big - 1, big - 1], fill=255)
+              out = Image.new('RGBA', (big, big), (0, 0, 0, 0)); out.paste(img, (0, 0), msk)
+              return out.resize((px, px), Image.LANCZOS)
+
+          def adaptive(px108):
+              inner = round(px108 * 72 / 108); off = (px108 - inner) // 2
+              fg = Image.new('RGBA', (px108, px108), (0, 0, 0, 0))
+              fg.paste(FG.resize((inner, inner), Image.LANCZOS), (off, off))
+              bg = BG.resize((inner, inner), Image.LANCZOS).resize((px108, px108), Image.LANCZOS)
+              return bg, fg
+
           res = 'android/app/src/main/res'
           for name, px in {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}.items():
               d = f'{res}/mipmap-{name}'
               os.makedirs(d, exist_ok=True)
-              legacy(px * 4).resize((px, px), Image.LANCZOS).save(f'{d}/ic_launcher.png')
-              fp = px * 108 // 48
-              foreground(fp * 2).resize((fp, fp), Image.LANCZOS).save(f'{d}/ic_launcher_foreground.png')
+              legacy(px).save(f'{d}/ic_launcher.png')
+              round_icon(px).save(f'{d}/ic_launcher_round.png')
+              b, f = adaptive(px * 108 // 48)
+              b.save(f'{d}/ic_launcher_background.png')
+              f.save(f'{d}/ic_launcher_foreground.png')
           os.makedirs(f'{res}/mipmap-anydpi-v26', exist_ok=True)
-          open(f'{res}/mipmap-anydpi-v26/ic_launcher.xml', 'w').write(
-              '<?xml version="1.0" encoding="utf-8"?>\n'
-              '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
-              '    <background android:drawable="@color/ic_launcher_background"/>\n'
-              '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
-              '</adaptive-icon>\n')
-          os.makedirs(f'{res}/values', exist_ok=True)
-          open(f'{res}/values/ic_launcher_background.xml', 'w').write(
-              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#1A1E27</color>\n</resources>\n')
+          xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                 '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                 '    <background android:drawable="@mipmap/ic_launcher_background"/>\n'
+                 '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                 '</adaptive-icon>\n')
+          for n in ('ic_launcher', 'ic_launcher_round'):
+              open(f'{res}/mipmap-anydpi-v26/{n}.xml', 'w').write(xml)
           for r, _, fs in os.walk(res):
               for f in fs:
                   if 'ic_launcher' in f: print(os.path.join(r, f))
