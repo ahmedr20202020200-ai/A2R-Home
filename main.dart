@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:ui' show DartPluginRegistrant;
 
 import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
@@ -16,11 +17,13 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:qr/qr.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:xml/xml.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yte;
 
 
 // ======== ui_shell.dart ========
@@ -238,18 +241,48 @@ class Shell extends StatefulWidget {
   State<Shell> createState() => _ShellState();
 }
 
+/// قناة مطلوبة من اختصار الشاشة الرئيسية ("0:ProgramId" تلفزيون / "1:ProgramId" راديو)
+final ValueNotifier<String?> kOpenChannel = ValueNotifier(null);
+
+/// زرار من إشعار الريموت والتطبيق مفتوح
+Future<void> sendRemoteKey(int k) async {
+  final g = GmClient.active;
+  if (g != null && g.connected) {
+    await g.key(k);
+  } else {
+    final r = await Bg.run({'type': 'key', 'key': k});
+    AppLog.add('STB', 'notif key $r');
+  }
+}
+
 class _ShellState extends State<Shell> {
   int tab = 0;
   @override
   void initState() {
     super.initState();
     Native.askNotifyPermission();
+    Native4.listen(
+      openChannel: (d) async {
+        if (mounted) setState(() => tab = 2);
+        kOpenChannel.value = d;
+      },
+      notifKey: sendRemoteKey,
+    );
+    Native4.initialAction().then((d) {
+      if (d != null && d.isNotEmpty && mounted) {
+        setState(() => tab = 2);
+        kOpenChannel.value = d;
+      }
+    });
+    // المنبهات بتتمسح لو التطبيق اتحدّث — نرجّعها
+    Schedule.rearm();
+    Quota.rearm();
   }
 
   @override
   Widget build(BuildContext context) {
-    const titles = ['الشبكة', 'العرض على التلفزيون', 'الريسيفر'];
-    const icons = [Icons.router_rounded, Icons.cast_rounded, Icons.satellite_alt_rounded];
+    const titles = ['الشبكة', 'العرض على التلفزيون', 'الريسيفر', 'الكمبيوتر'];
+    const icons = [Icons.router_rounded, Icons.cast_rounded, Icons.satellite_alt_rounded, Icons.desktop_windows_rounded];
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 12,
@@ -278,7 +311,7 @@ class _ShellState extends State<Shell> {
           const SizedBox(width: 4),
         ],
       ),
-      body: IndexedStack(index: tab, children: const [NetworkPage(), CastPage(), ReceiverPage()]),
+      body: IndexedStack(index: tab, children: const [NetworkPage(), CastPage(), ReceiverPage(), PcPage()]),
       bottomNavigationBar: NavigationBar(
         selectedIndex: tab,
         onDestinationSelected: (i) {
@@ -289,6 +322,7 @@ class _ShellState extends State<Shell> {
           NavigationDestination(icon: Icon(Icons.router_outlined), selectedIcon: Icon(Icons.router_rounded), label: 'الشبكة'),
           NavigationDestination(icon: Icon(Icons.cast_outlined), selectedIcon: Icon(Icons.cast_rounded), label: 'الكاست'),
           NavigationDestination(icon: Icon(Icons.satellite_alt_outlined), selectedIcon: Icon(Icons.satellite_alt_rounded), label: 'الريسيفر'),
+          NavigationDestination(icon: Icon(Icons.desktop_windows_outlined), selectedIcon: Icon(Icons.desktop_windows_rounded), label: 'الكمبيوتر'),
         ],
       ),
     );
@@ -436,6 +470,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       }
       router = r;
       Store.routerIp = ip;
+      Store.p.setBool('router_last_ok', true);
       routerMsg = 'متصل بالراوتر ($ip) — ${r.scheme?.name}';
       if (mounted) setState(() {});
       return true;
@@ -567,6 +602,20 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     }
     if (!quiet || router == null) await scan(silentNotify: before.isEmpty);
     _checkNew(before);
+    // v4: سجل الأجهزة + الباقة + المواعيد
+    try {
+      await DeviceHistory.update([for (final h in hosts.values) (key: h.mac.isNotEmpty ? h.mac : h.ip, name: label(h), ip: h.ip)]);
+      if (router != null) {
+        final total = (int.tryParse('${st['monthly_tx_bytes'] ?? ''}') ?? 0) + (int.tryParse('${st['monthly_rx_bytes'] ?? ''}') ?? 0);
+        await Quota.sample(total);
+        if (Schedule.rules.isNotEmpty) {
+          final m = await Schedule.syncRouter(router: router);
+          if (m.startsWith('تم')) blockedMacs = (await router!.blockList()).macs;
+        }
+      }
+    } catch (e) {
+      AppLog.add('ROUTER', 'v4 refresh $e');
+    }
     if (mounted) setState(() {});
   }
 
@@ -670,6 +719,19 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           ActionChip(avatar: const Icon(Icons.speed, size: 18), label: const Text('سرعة النت'), onPressed: _speed),
           ActionChip(avatar: const Icon(Icons.network_ping, size: 18), label: const Text('Ping'), onPressed: () => _pingAsk()),
           ActionChip(avatar: const Icon(Icons.power_settings_new, size: 18), label: const Text('تشغيل جهاز (WOL)'), onPressed: () => _wol(null)),
+          ActionChip(avatar: const Icon(Icons.qr_code_2_rounded, size: 18), label: const Text('QR الواي فاي'), onPressed: _qr),
+          ActionChip(avatar: const Icon(Icons.schedule_rounded, size: 18), label: const Text('مواعيد الحظر'), onPressed: () async {
+            await Navigator.push(context, MaterialPageRoute(builder: (_) => SchedulePage(router: router, devices: [
+                  for (final h in hosts.values)
+                    if (h.mac.isNotEmpty) (mac: h.mac, name: label(h))
+                ])));
+            if (mounted) setState(() {});
+          }),
+          ActionChip(avatar: const Icon(Icons.data_usage_rounded, size: 18), label: const Text('باقة النت'), onPressed: () {
+            final total = (int.tryParse('${st['monthly_tx_bytes'] ?? ''}') ?? 0) + (int.tryParse('${st['monthly_rx_bytes'] ?? ''}') ?? 0);
+            Navigator.push(context, MaterialPageRoute(builder: (_) => QuotaPage(routerTotal: router == null ? null : total)));
+          }),
+          ActionChip(avatar: const Icon(Icons.history_rounded, size: 18), label: const Text('سجل الأجهزة'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryPage()))),
           ActionChip(
             avatar: const Icon(Icons.business, size: 18),
             label: Text(Oui.table.isEmpty ? 'نزّل أسماء الشركات' : 'شركات: ${Oui.table.length}'),
@@ -732,6 +794,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
               itemBuilder: (_) => const [
                 PopupMenuItem(value: 'sms', child: Text('الرسايل SMS')),
                 PopupMenuItem(value: 'wifi', child: Text('باسورد الواي فاي')),
+                PopupMenuItem(value: 'qr', child: Text('QR الواي فاي (للضيوف)')),
                 PopupMenuItem(value: 'wifi_off', child: Text('قفل الواي فاي (تجريبي)')),
                 PopupMenuItem(value: 'wifi_on', child: Text('فتح الواي فاي (تجريبي)')),
                 PopupMenuItem(value: 'reboot', child: Text('ريستارت الراوتر')),
@@ -777,6 +840,8 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       switch (a) {
         case 'sms':
           await Navigator.push(context, MaterialPageRoute(builder: (_) => SmsPage(router: r)));
+        case 'qr':
+          await _qr();
         case 'wifi':
           final w = await r.wifiInfo();
           if (!mounted) return;
@@ -944,6 +1009,18 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     );
   }
 
+  Future<void> _qr() async {
+    var ssid = net?.ssid ?? '', pw = '';
+    if (router != null) {
+      try {
+        final w = await router!.wifiInfo();
+        if (w.ssid.isNotEmpty) ssid = w.ssid;
+        pw = w.key;
+      } catch (_) {}
+    }
+    if (mounted) await showWifiQr(context, ssid: ssid.replaceAll('"', ''), password: pw);
+  }
+
   Future<void> _pingAsk() async {
     final ip = await askText(context, 'Ping لعنوان', initial: '8.8.8.8');
     if (ip != null && ip.trim().isNotEmpty) await _ping(ip.trim());
@@ -1101,7 +1178,8 @@ class QueueItem {
   final File? file; // لو من الموبايل
   final Map<String, String> headers; // Referer/User-Agent (للنت)
   bool viaPhone; // يعدّي على سيرفر الموبايل (proxy)
-  QueueItem(this.title, this.url, {this.subtitle, this.file, this.headers = const {}, this.viaPhone = false});
+  final String? mime; // لو معروف (روابط يوتيوب مفيهاش امتداد)
+  QueueItem(this.title, this.url, {this.subtitle, this.file, this.headers = const {}, this.viaPhone = false, this.mime});
 }
 
 /// طريقة العرض على الشاشة
@@ -1127,6 +1205,36 @@ class CastState extends ChangeNotifier {
   int _gmMedia = 0;
   String _gmUrl = '';
   int _seq = 0;
+  /// كمّلنا الفيديو من الثانية دي (علشان زرار «من الأول»)
+  int? resumedFrom;
+  DateTime _lastSave = DateTime(2000);
+
+  void _saveResume() {
+    if (playing < 0 || playing >= queue.length || state != 'PLAYING') return;
+    if (DateTime.now().difference(_lastSave).inSeconds < 10) return;
+    _lastSave = DateTime.now();
+    ResumeStore.put(ResumeStore.keyOf(queue[playing]), pos, dur);
+  }
+
+  Future<void> fromStart() async {
+    resumedFrom = null;
+    await seek(Duration.zero);
+    if (playing >= 0 && playing < queue.length) await ResumeStore.put(ResumeStore.keyOf(queue[playing]), Duration.zero, dur);
+    notifyListeners();
+  }
+
+  Future<void> _maybeResume(int i) async {
+    if (i < 0 || i >= queue.length) return;
+    final saved = ResumeStore.get(ResumeStore.keyOf(queue[i]));
+    if (saved == null || saved < 30) return;
+    try {
+      await seek(Duration(seconds: saved));
+      resumedFrom = saved;
+      _note('كمّلت من ${fmtHms(Duration(seconds: saved))} (زي آخر مرة) — «من الأول» لو عايز تبدأ من الأول');
+    } catch (e) {
+      AppLog.add('CAST', 'resume seek ✗ $e');
+    }
+  }
 
   /// الريسيفر متوصّل في تبويب الريسيفر؟
   GmClient? get gm {
@@ -1195,7 +1303,7 @@ class CastState extends ChangeNotifier {
     }
     if (q.viaPhone) {
       if (ip == null) throw StateError('الموبايل لازم يكون على نفس الواي فاي بتاع الشاشة');
-      return MediaServer.I.proxy(q.url, {'User-Agent': kChromeUa, ...q.headers}, ip, mime: await probeMime(q.url, q.headers));
+      return MediaServer.I.proxy(q.url, {'User-Agent': kChromeUa, ...q.headers}, ip, mime: q.mime ?? await probeMime(q.url, q.headers));
     }
     return q.url;
   }
@@ -1212,24 +1320,33 @@ class CastState extends ChangeNotifier {
     if (way == CastWay.gm && gm == null) throw StateError('الريسيفر مش متصل — افتح تبويب الريسيفر واتصل الأول');
     final my = ++_seq;
     playing = i;
+    resumedFrom = null;
     pos = dur = Duration.zero;
     state = '';
     busy = true;
     notifyListeners();
     final q = queue[i];
     try {
-      final mime = q.file != null ? mimeOf(q.file!.path) : await probeMime(q.url, q.headers);
-      final url = await _urlFor(q);
+      // الصور: بنحوّلها JPEG ≤1920 بكسل (HEIC/PNG/WebP/صور 12 ميجا الريسيفر مش بيقدر يفتحها)
+      final img = q.file != null && isImagePath(q.file!.path) ? await prepareCastImage(q.file!) : null;
+      final mime = img != null ? 'image/jpeg' : (q.file != null ? mimeOf(q.file!.path) : q.mime ?? await probeMime(q.url, q.headers));
+      final url = img != null ? await _shareFile(img) : await _urlFor(q);
       _note('بشغّل "${q.title}" ${way == CastWay.gm ? 'بطريقة G-MScreen' : 'على ${current!.name}'}${q.viaPhone ? ' عبر الموبايل' : ''}…');
-      if (way == CastWay.gm) {
+      if (mime.startsWith('image')) {
+        await _sendImage(url, q.title);
+      } else if (way == CastWay.gm) {
         _gmMedia = gmMediaTypeFor(mime);
         _gmUrl = url;
         await gm!.castSend(_gmMedia, 0, url);
       } else {
         await client!.load(url, q.title, subtitle: q.subtitle, mime: mime);
       }
-      _note('اتبعت للشاشة — مستني يبدأ…');
-      _watchStart(my, i);
+      if (mime.startsWith('image')) {
+        _watchImage(my, url);
+      } else {
+        _note('اتبعت للشاشة — مستني يبدأ…');
+        _watchStart(my, i);
+      }
     } catch (e) {
       AppLog.add('CAST', 'play ✗ $e');
       // زي Web Video Caster: لو الرابط المباشر اترفض نجرب عبر الموبايل
@@ -1256,6 +1373,78 @@ class CastState extends ChangeNotifier {
     }
   }
 
+  Future<String> _shareFile(File f) async {
+    final ip = await phoneIpFor(_targetIp());
+    if (ip == null) throw StateError('الموبايل لازم يكون على نفس الواي فاي بتاع الشاشة');
+    final url = await MediaServer.I.share(f, ip);
+    MediaServer.I.fetched.remove(MediaServer.idOfUrl(url));
+    return url;
+  }
+
+  /// null = لسه منعرفش، true = الـDLNA بيعرض صور، false = الصور بتشتغل بطريقة G-MScreen بس
+  bool? dlnaImagesOk;
+
+  /// يبعت صورة (رابطها جاهز على سيرفر الموبايل) بالطريقة اللي اشتغلت قبل كده
+  Future<void> _sendImage(String url, String title) async {
+    final g = gm;
+    final useGm = g != null && (way == CastWay.gm || client == null || dlnaImagesOk == false);
+    if (useGm) {
+      await g.castSend(1, 0, url);
+    } else {
+      if (client == null) throw StateError('اختار الشاشة الأول (أو اتصل بالريسيفر من تبويب الريسيفر)');
+      await client!.load(url, title, mime: 'image/jpeg');
+    }
+  }
+
+  /// عرض صورة واحدة (للعرض العادي وللـ Slideshow) — نفس المسار المتصلّح
+  Future<void> showImage(File f, {String? title}) async {
+    final img = await prepareCastImage(f);
+    final url = await _shareFile(img);
+    final my = ++_seq;
+    await _sendImage(url, title ?? f.uri.pathSegments.last);
+    _watchImage(my, url);
+  }
+
+  /// الصورة: مفيش PLAYING دايمًا — بنشوف هل الريسيفر طلب الصورة من الموبايل فعلًا
+  void _watchImage(int my, String url) {
+    final id = MediaServer.idOfUrl(url);
+    final usedGm = gm != null && (way == CastWay.gm || client == null || dlnaImagesOk == false);
+    _note('الصورة اتبعتت — بستنى الشاشة تحمّلها…');
+    Future(() async {
+      bool got() => id != null && MediaServer.I.fetched.contains(id);
+      for (var k = 0; k < 8; k++) {
+        await Future.delayed(const Duration(seconds: 1));
+        if (my != _seq) return;
+        if (got()) {
+          if (!usedGm) dlnaImagesOk = true;
+          _note('الصورة ظهرت على الشاشة ✓ (الريسيفر حمّلها${usedGm ? ' بطريقة G-MScreen' : ''})');
+          return;
+        }
+      }
+      if (my != _seq) return;
+      final g = gm;
+      if (!usedGm && g != null) {
+        _note('الريسيفر مطلبش الصورة بالـDLNA — بجرب طريقة G-MScreen…');
+        try {
+          await g.castSend(1, 0, url);
+          for (var k = 0; k < 6; k++) {
+            await Future.delayed(const Duration(seconds: 1));
+            if (my != _seq) return;
+            if (got()) {
+              dlnaImagesOk = false;
+              _note('الصورة ظهرت ✓ (بطريقة G-MScreen — الصور الجاية هتتبعت بيها على طول)');
+              return;
+            }
+          }
+        } catch (e) {
+          AppLog.add('CAST', 'gm image ✗ $e');
+        }
+      }
+      if (my != _seq) return;
+      _note(kImageUnsupportedAr);
+    });
+  }
+
   /// لو الشاشة مبدأتش خلال 12 ثانية والرابط مباشر → نعيده عبر الموبايل
   void _watchStart(int my, int i) {
     Future(() async {
@@ -1265,6 +1454,7 @@ class CastState extends ChangeNotifier {
         await poll();
         if (state == 'PLAYING' || state == 'PAUSED_PLAYBACK' || pos > Duration.zero) {
           _note('شغال ✓');
+          await _maybeResume(i);
           return;
         }
       }
@@ -1328,6 +1518,7 @@ class CastState extends ChangeNotifier {
         pos = Duration(milliseconds: s.currentMs);
         dur = Duration(milliseconds: s.totalMs);
         state = s.mediaType == -1 ? 'NO_MEDIA_PRESENT' : s.stateName;
+        _saveResume();
         notifyListeners();
         if (ended && playing + 1 < queue.length) await playIndex(playing + 1);
         return;
@@ -1339,6 +1530,7 @@ class CastState extends ChangeNotifier {
       pos = s.pos;
       dur = s.dur;
       state = s.state;
+      _saveResume();
       notifyListeners();
       if (ended && playing + 1 < queue.length) await playIndex(playing + 1);
     } catch (_) {}
@@ -1540,6 +1732,11 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
               onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const IptvPage())),
             ),
             FilledButton.tonalIcon(icon: const Icon(Icons.link), label: const Text('رابط'), onPressed: addLink),
+            FilledButton.tonalIcon(
+              icon: const Icon(Icons.slideshow_rounded),
+              label: const Text('عرض صور'),
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SlideshowPage())),
+            ),
           ]),
         ),
         if (cs.playing >= 0 && cs.playing < cs.queue.length) _remote(),
@@ -1620,6 +1817,8 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
         child: Column(children: [
           Text(cs.queue[cs.playing].title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
           Text('${cs.way == CastWay.gm ? 'G-MScreen' : 'DLNA'} • ${castStateAr(cs.state)}', style: const TextStyle(fontSize: 11, color: Colors.white54)),
+          if (cs.resumedFrom != null)
+            TextButton.icon(onPressed: () => _run(cs.fromStart), icon: const Icon(Icons.restart_alt_rounded, size: 18), label: Text('كمّلت من ${fmtHms(Duration(seconds: cs.resumedFrom!))} — من الأول')),
           Row(children: [
             Text(fmtHms(cs.pos), style: const TextStyle(fontSize: 11)),
             Expanded(
@@ -1692,14 +1891,146 @@ const String kSnifferJs = r'''
 (function(){
  if (window.__a2r) return; window.__a2r = 1;
  var seen = {};
- function rep(u){ try{ if(!u) return; u = new URL(u, location.href).href; if(seen[u]) return; seen[u]=1; A2R.postMessage(u);}catch(e){} }
- var of = window.fetch; if (of) window.fetch = function(i, o){ try{ rep(typeof i === 'string' ? i : i.url); }catch(e){} return of.apply(this, arguments); };
- var oo = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(m, u){ rep(u); return oo.apply(this, arguments); };
- function scan(){ document.querySelectorAll('video,source,audio').forEach(function(v){ if(v.src && v.src.indexOf('blob:')!==0) rep(v.src); if(v.currentSrc && v.currentSrc.indexOf('blob:')!==0) rep(v.currentSrc); });
-   try{ performance.getEntriesByType('resource').forEach(function(e){ rep(e.name); }); }catch(e){} }
+ function send(k, u){ try{ A2R.postMessage(k + u); }catch(e){} }
+ function rep(u, k){ try{ if(!u) return; u = String(u); if(u.indexOf('blob:')===0){ if(!seen['blob']){ seen['blob']=1; send('b:', location.href);} return; } if(u.indexOf('data:')===0) return; u = new URL(u, location.href).href; var key=(k||'u:')+u; if(seen[key]) return; seen[key]=1; send(k||'u:', u);}catch(e){} }
+ function isMediaType(ct){ ct = (ct||'').toLowerCase(); return ct.indexOf('video/')===0 || ct.indexOf('audio/')===0 || ct.indexOf('mpegurl')>=0 || ct.indexOf('dash+xml')>=0; }
+ var of = window.fetch;
+ if (of) window.fetch = function(i, o){
+   var u = ''; try{ u = typeof i === 'string' ? i : (i && i.url) || ''; rep(u); }catch(e){}
+   var p = of.apply(this, arguments);
+   try{ p.then(function(r){ try{ if(isMediaType(r.headers.get('content-type'))) rep(r.url || u, 'm:'); }catch(e){} }); }catch(e){}
+   return p;
+ };
+ var oo = XMLHttpRequest.prototype.open;
+ XMLHttpRequest.prototype.open = function(m, u){
+   var x = this; rep(u);
+   try{ x.addEventListener('readystatechange', function(){ if(x.readyState===2){ try{ if(isMediaType(x.getResponseHeader('content-type'))) rep(x.responseURL || u, 'm:'); }catch(e){} } }); }catch(e){}
+   return oo.apply(this, arguments);
+ };
+ function scan(){
+   document.querySelectorAll('video,source,audio').forEach(function(v){
+     if(v.tagName==='VIDEO' && !seen['vid']){ seen['vid']=1; send('v:', location.href); }
+     if(v.src) rep(v.src, 'm:'); if(v.currentSrc) rep(v.currentSrc, 'm:');
+   });
+   try{ performance.getEntriesByType('resource').forEach(function(e){ rep(e.name); }); }catch(e){}
+ }
  setInterval(scan, 1500); scan();
 })();
 ''';
+
+/// مانع الإعلانات: بيتحقن بعد الصفحة — بيقفل النوافذ المنبثقة ويشيل إطارات/عناصر الإعلانات
+String adblockJs(List<String> hosts) => '''
+(function(){
+ if (window.__a2rAd) return; window.__a2rAd = 1;
+ var H = ${jsonEncode(hosts)};
+ function bad(u){ try{ var h = new URL(u, location.href).hostname.toLowerCase(); for (var i=0;i<H.length;i++){ if(h===H[i] || h.slice(-H[i].length-1)==='.'+H[i]) return true; } }catch(e){} return false; }
+ try{ window.open = function(){ try{ A2R.postMessage('p:popup'); }catch(e){} return null; }; }catch(e){}
+ var SEL = 'ins.adsbygoogle,.adsbygoogle,[id^="google_ads"],[id^="div-gpt-ad"],[class*="ad-banner"],[class*="adsbox"],[data-ad-slot],iframe[src*="ads"]';
+ function clean(){
+   document.querySelectorAll('iframe,script[src],img[src],a[href]').forEach(function(e){
+     var u = e.src || e.href || ''; if(u && bad(u)){ if(e.tagName==='A'){ e.removeAttribute('href'); e.onclick=null; } else { e.remove(); } }
+   });
+   try{ document.querySelectorAll(SEL).forEach(function(e){ e.style.setProperty('display','none','important'); }); }catch(e){}
+   document.querySelectorAll('a[target="_blank"]').forEach(function(a){ if(bad(a.href)) a.removeAttribute('href'); });
+ }
+ clean(); setInterval(clean, 2000);
+})();
+''';
+
+/// دومينات الإعلانات المشهورة (مواقع الأفلام والماتشات بتستخدمها للـ popups)
+const List<String> kAdHosts = [
+  'doubleclick.net', 'googlesyndication.com', 'googleadservices.com', 'adservice.google.com', '2mdn.net',
+  'adnxs.com', 'amazon-adsystem.com', 'criteo.com', 'pubmatic.com', 'rubiconproject.com', 'openx.net',
+  'smartadserver.com', 'moatads.com', 'taboola.com', 'outbrain.com', 'revcontent.com', 'mgid.com',
+  'popads.net', 'popcash.net', 'propellerads.com', 'propellerclick.com', 'adsterra.com', 'adsterratech.com',
+  'exoclick.com', 'exosrv.com', 'juicyads.com', 'trafficjunky.net', 'onclickads.net', 'onclkds.com',
+  'adskeeper.com', 'hilltopads.net', 'a-ads.com', 'clickadu.com', 'admaven.com', 'ad-maven.com',
+  'popunder.net', 'adcash.com', 'zeropark.com', 'richpush.co', 'monetag.com', 'galaksion.com',
+  'bidvertiser.com', 'yllix.com', 'adf.ly', 'shorte.st', 'highperformanceformat.com', 'profitablegatecpm.com',
+  'realsrv.com', 'tsyndicate.com', 'adspyglass.com', 'popmyads.com', 'clickaine.com', 'pushame.com',
+];
+
+bool isAdHost(String host, [List<String> list = kAdHosts]) {
+  final h = host.toLowerCase();
+  for (final d in list) {
+    if (h == d || h.endsWith('.$d')) return true;
+  }
+  return false;
+}
+
+bool isAdUrl(String url) => isAdHost(Uri.tryParse(url)?.host ?? '');
+
+/// يوتيوب: الفيديو بيتبعت مقطّع ومحمي (MSE/blob) — مش بنستخرجه (شروط يوتيوب + بيبوظ كل شوية)
+bool isYouTubeUrl(String url) {
+  final h = (Uri.tryParse(url)?.host ?? '').toLowerCase();
+  return h == 'youtu.be' || h == 'youtube.com' || h.endsWith('.youtube.com') || h == 'youtube-nocookie.com' || h.endsWith('.youtube-nocookie.com');
+}
+
+/// رابط ينفع يتبعت للشاشة؟ (مش مقاطع يوتيوب ولا blob)
+bool castableUrl(String url, {bool mimeConfirmed = false}) {
+  final u = url.toLowerCase();
+  if (!u.startsWith('http')) return false;
+  final host = Uri.tryParse(u)?.host ?? '';
+  if (host.endsWith('googlevideo.com') || isYouTubeUrl(u)) return false;
+  // مقاطع HLS (.ts / .m4s) لوحدها مش بتتعرض — بنستنى الـ m3u8
+  if (RegExp(r'\.(ts|m4s|aac)(\?|#|$)').hasMatch(u)) return false;
+  return mimeConfirmed || looksLikeMedia(url);
+}
+
+class BrowserEntry {
+  final String url, title;
+  final int ts;
+  BrowserEntry(this.url, this.title, this.ts);
+  Map<String, dynamic> toJson() => {'u': url, 't': title, 's': ts};
+  static BrowserEntry? fromJson(dynamic m) =>
+      m is Map && m['u'] is String ? BrowserEntry(m['u'] as String, '${m['t'] ?? ''}', (m['s'] as num?)?.toInt() ?? 0) : null;
+}
+
+/// المفضلة والسجل بتاع المتصفح (SharedPreferences)
+class BrowserStore {
+  static List<BrowserEntry> _read(String k) {
+    try {
+      return (jsonDecode(Store.p.getString(k) ?? '[]') as List).map(BrowserEntry.fromJson).whereType<BrowserEntry>().toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<void> _write(String k, List<BrowserEntry> l) => Store.p.setString(k, jsonEncode(l.map((e) => e.toJson()).toList()));
+
+  static List<BrowserEntry> get bookmarks => _read('br_bm');
+  static List<BrowserEntry> get history => _read('br_hist');
+  static bool isBookmarked(String url) => bookmarks.any((e) => e.url == url);
+
+  static Future<bool> toggleBookmark(String url, String title) async {
+    final l = bookmarks;
+    final had = l.any((e) => e.url == url);
+    if (had) {
+      l.removeWhere((e) => e.url == url);
+    } else {
+      l.insert(0, BrowserEntry(url, title.isEmpty ? url : title, DateTime.now().millisecondsSinceEpoch));
+    }
+    await _write('br_bm', l);
+    return !had;
+  }
+
+  static Future<void> removeBookmark(String url) async => _write('br_bm', bookmarks..removeWhere((e) => e.url == url));
+
+  static Future<void> addHistory(String url, String title, {int max = 150}) async {
+    if (!url.startsWith('http')) return;
+    await _write('br_hist', historyAdd(history, BrowserEntry(url, title, DateTime.now().millisecondsSinceEpoch), max: max));
+  }
+
+  static Future<void> clearHistory() => Store.p.remove('br_hist');
+  static bool get adblock => Store.p.getBool('br_adblock') ?? true;
+  static set adblock(bool v) => Store.p.setBool('br_adblock', v);
+}
+
+/// يضيف للسجل: الأحدث فوق، من غير تكرار نفس الرابط، وبحد أقصى
+List<BrowserEntry> historyAdd(List<BrowserEntry> l, BrowserEntry e, {int max = 150}) {
+  final out = [e, ...l.where((x) => x.url != e.url)];
+  return out.length > max ? out.sublist(0, max) : out;
+}
 
 class BrowserPage extends StatefulWidget {
   const BrowserPage({super.key});
@@ -1712,12 +2043,113 @@ class _BrowserPageState extends State<BrowserPage> {
   final urlC = TextEditingController();
   final List<String> found = [];
   String title = '';
+  String url = '';
   double prog = 0;
+  bool hasVideo = false; // في عنصر فيديو في الصفحة
+  bool blobOnly = false; // الفيديو جاي من blob (مقطّع/محمي)
+  int adsBlocked = 0;
+  bool canBack = false, canFwd = false;
+  bool adblock = BrowserStore.adblock;
+  DateTime _lastBack = DateTime(2000);
+  int _backTaps = 0;
 
-  void _found(String u) {
-    if (!looksLikeMedia(u) || found.contains(u)) return;
-    AppLog.add('CAST', 'sniffed $u');
+  bool get youtube => isYouTubeUrl(url);
+  String? get ytId => ytVideoId(url);
+  bool ytBusy = false;
+
+  /// يوتيوب: نجيب الجودات ونخليه يختار
+  Future<void> castYouTube() async {
+    final id = ytId;
+    if (id == null || ytBusy) return;
+    setState(() => ytBusy = true);
+    YtResult? r;
+    try {
+      r = await YouTubeCast.streams(id);
+    } catch (e) {
+      if (mounted) toast(context, YouTubeCast.errorAr(e));
+    }
+    if (mounted) setState(() => ytBusy = false);
+    if (r == null || !mounted) return;
+    final pick = await showModalBottomSheet<YtChoice>(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (c) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(c).size.height * 0.75),
+          child: ListView(shrinkWrap: true, children: [
+            const SectionTitle('اختار الجودة', icon: Icons.high_quality_rounded),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 6),
+              child: Text(
+                  'يوتيوب بيبعت الجودات العالية صورة لوحدها وصوت لوحده، والريسيفر مبيقدرش يجمعهم — فاللي ظاهر هنا بس اللي فيه صورة وصوت مع بعض.',
+                  style: TextStyle(fontSize: 12, color: kMuted)),
+            ),
+            if (r!.muxed.isNotEmpty) const SectionTitle('فيديو + صوت (مضمون)', icon: Icons.movie_rounded),
+            for (final ch in r.muxed)
+              ListTile(
+                leading: const Icon(Icons.play_circle_fill_rounded, color: kGold),
+                title: Text(ch.label),
+                subtitle: Text(ch.detail, style: const TextStyle(fontSize: 12)),
+                onTap: () => Navigator.pop(c, ch),
+              ),
+            if (r.hls.isNotEmpty) const SectionTitle('HLS — جودة أعلى (لو الريسيفر بيشغّل m3u8)', icon: Icons.hd_rounded),
+            for (final (i, ch) in r.hls.indexed)
+              ListTile(
+                leading: Icon(i == 0 ? Icons.auto_awesome_rounded : Icons.stream_rounded, color: kGold),
+                title: Text(i == 0 && ch.height < 99999 ? 'أعلى جودة — ${ch.label}' : ch.label),
+                subtitle: Text(i == 0 ? 'لو مشتغلش، ارجع واختار من «فيديو + صوت»' : ch.detail, style: const TextStyle(fontSize: 12)),
+                onTap: () => Navigator.pop(c, ch),
+              ),
+          ]),
+        ),
+      ),
+    );
+    if (pick == null) return;
+    AppLog.add('CAST', 'youtube $id اختار ${pick.label} ${pick.hls ? 'HLS' : 'muxed'} ${ytLogUrl(pick.url)}');
+    await web.runJavaScript("document.querySelectorAll('video').forEach(function(v){try{v.pause()}catch(e){}})").catchError((_) {});
+    final name = title.replaceAll(RegExp(r'\s*-\s*YouTube\s*$'), '');
+    try {
+      await CastState.I.add(QueueItem('${name.isEmpty ? 'YouTube' : name} (${pick.label})', pick.url,
+          mime: pick.mime, headers: {'User-Agent': kChromeUa, 'Referer': 'https://www.youtube.com/', 'Origin': 'https://www.youtube.com'}));
+      if (mounted) toast(context, 'اتبعت للشاشة — ${pick.label}');
+    } catch (e) {
+      if (mounted) toast(context, '$e');
+    }
+  }
+
+  void _msg(String m) {
+    if (m.length < 2) return;
+    final k = m.substring(0, 2), v = m.substring(2);
+    switch (k) {
+      case 'u:':
+        _found(v, false);
+      case 'm:':
+        _found(v, true);
+      case 'v:':
+        if (!hasVideo) setState(() => hasVideo = true);
+      case 'b:':
+        if (!blobOnly) setState(() => blobOnly = true);
+      case 'p:':
+        setState(() => adsBlocked++);
+      default:
+        _found(m, false); // نسخة قديمة من السكريبت
+    }
+  }
+
+  void _found(String u, bool mime) {
+    if (!castableUrl(u, mimeConfirmed: mime) || found.contains(u)) return;
+    AppLog.add('CAST', 'sniffed${mime ? '(mime)' : ''} $u');
     setState(() => found.insert(0, u));
+  }
+
+  Future<void> _nav() async {
+    final b = await web.canGoBack(), f = await web.canGoForward();
+    if (mounted && (b != canBack || f != canFwd)) setState(() {
+      canBack = b;
+      canFwd = f;
+    });
   }
 
   @override
@@ -1725,28 +2157,49 @@ class _BrowserPageState extends State<BrowserPage> {
     super.initState();
     web = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..addJavaScriptChannel('A2R', onMessageReceived: (m) => _found(m.message))
+      ..setUserAgent(kChromeUa)
+      ..addJavaScriptChannel('A2R', onMessageReceived: (m) => _msg(m.message))
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (r) {
-          if (looksLikeMedia(r.url)) {
-            _found(r.url);
+          if (adblock && isAdUrl(r.url)) {
+            AppLog.add('CAST', 'adblock ✗ ${r.url}');
+            setState(() => adsBlocked++);
             return NavigationDecision.prevent;
           }
-          if (!r.url.startsWith('http')) return NavigationDecision.prevent;
+          if (looksLikeMedia(r.url) && castableUrl(r.url)) {
+            _found(r.url, false);
+            return NavigationDecision.prevent;
+          }
+          if (!r.url.startsWith('http')) return NavigationDecision.prevent; // intent:// وغيره
           return NavigationDecision.navigate;
         },
         onPageStarted: (u) {
           urlC.text = u;
-          setState(() => found.clear());
+          setState(() {
+            url = u;
+            found.clear();
+            hasVideo = false;
+            blobOnly = false;
+          });
+          _nav();
         },
         onProgress: (p) => setState(() => prog = p / 100),
         onPageFinished: (u) async {
           await web.runJavaScript(kSnifferJs).catchError((_) {});
+          if (adblock) await web.runJavaScript(adblockJs(kAdHosts)).catchError((_) {});
           title = await web.getTitle() ?? '';
+          url = u;
+          BrowserStore.addHistory(u, title);
+          _nav();
           if (mounted) setState(() {});
         },
         onUrlChange: (c) {
-          if (c.url != null) _found(c.url!);
+          if (c.url == null) return;
+          url = c.url!;
+          urlC.text = url;
+          _found(c.url!, false);
+          _nav();
+          if (mounted) setState(() {});
         },
       ))
       ..loadRequest(Uri.parse(Store.homePage));
@@ -1759,79 +2212,227 @@ class _BrowserPageState extends State<BrowserPage> {
     web.loadRequest(Uri.parse(u));
   }
 
+  void close() {
+    if (mounted) Navigator.of(context).pop();
+  }
+
+  /// زرار الرجوع: يرجع صفحة، ولو الصفحة مرجعتش (يوتيوب بيعمل كده) أو مفيش صفحات → يقفل المتصفح
+  Future<void> back() async {
+    final now = DateTime.now();
+    _backTaps = now.difference(_lastBack) < const Duration(milliseconds: 1500) ? _backTaps + 1 : 1;
+    _lastBack = now;
+    if (_backTaps >= 3) return close(); // 3 دوسات ورا بعض = اقفل على طول
+    if (!await web.canGoBack()) return close();
+    final before = await web.currentUrl();
+    await web.goBack();
+    await Future.delayed(const Duration(milliseconds: 600));
+    if (!mounted) return;
+    if (await web.currentUrl() == before && before != null) close();
+  }
+
   Future<void> cast(String u) async {
     final name = title.isNotEmpty ? title : (Uri.parse(u).pathSegments.lastOrNull ?? 'فيديو');
     try {
-      await CastState.I.add(QueueItem(name, u, headers: {if (urlC.text.startsWith('http')) 'Referer': urlC.text, 'User-Agent': kChromeUa}));
+      await CastState.I.add(QueueItem(name, u, headers: {if (url.startsWith('http')) 'Referer': url, 'User-Agent': kChromeUa}));
       if (mounted) toast(context, 'اتبعت للشاشة');
     } catch (e) {
       if (mounted) toast(context, '$e');
     }
   }
 
+  Future<void> _list(bool bookmarks) async {
+    final picked = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (c) => StatefulBuilder(builder: (c, ss) {
+        final l = bookmarks ? BrowserStore.bookmarks : BrowserStore.history;
+        return SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: MediaQuery.of(c).size.height * 0.7),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              SectionTitle(bookmarks ? 'المفضلة' : 'السجل', icon: bookmarks ? Icons.star_rounded : Icons.history_rounded,
+                  trailing: !bookmarks && l.isNotEmpty
+                      ? TextButton(onPressed: () async {
+                          await BrowserStore.clearHistory();
+                          ss(() {});
+                        }, child: const Text('امسح الكل'))
+                      : null),
+              if (l.isEmpty)
+                Padding(padding: const EdgeInsets.all(24), child: Text(bookmarks ? 'مفيش مواقع في المفضلة — دوس النجمة وانت في الموقع' : 'السجل فاضي', style: const TextStyle(color: kMuted))),
+              Flexible(
+                child: ListView(shrinkWrap: true, children: [
+                  for (final e in l)
+                    ListTile(
+                      leading: Icon(bookmarks ? Icons.star_rounded : Icons.public, color: kGold, size: 20),
+                      title: Text(e.title.isEmpty ? e.url : e.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      subtitle: Text(e.url, maxLines: 1, overflow: TextOverflow.ellipsis, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 11)),
+                      onTap: () => Navigator.pop(c, e.url),
+                      trailing: bookmarks
+                          ? IconButton(icon: const Icon(Icons.delete_outline, size: 20), onPressed: () async {
+                              await BrowserStore.removeBookmark(e.url);
+                              ss(() {});
+                            })
+                          : null,
+                    ),
+                ]),
+              ),
+            ]),
+          ),
+        );
+      }),
+    );
+    if (picked != null) go(picked);
+  }
+
+  Future<void> _menu(String v) async {
+    switch (v) {
+      case 'bm':
+        await _list(true);
+      case 'hist':
+        await _list(false);
+      case 'home':
+        Store.homePage = url;
+        toast(context, 'اتحفظت كصفحة رئيسية');
+      case 'ad':
+        setState(() => adblock = !adblock);
+        BrowserStore.adblock = adblock;
+        toast(context, adblock ? 'مانع الإعلانات اشتغل' : 'مانع الإعلانات اتقفل');
+        web.reload();
+    }
+    if (mounted) setState(() {});
+  }
+
+  Widget _banner() {
+    String? t;
+    IconData icon = Icons.info_outline_rounded;
+    if (ytId != null) {
+      return const SizedBox.shrink(); // زرار الكاست الذهبي ظاهر
+    } else if (hasVideo && found.isEmpty && blobOnly) {
+      t = 'الفيديو ده بيشتغل بطريقة محمية/مقطّعة (blob) — لو ملقيتش زرار الكاست بعد ما يشتغل، الموقع ده مش هينفع يتبعت.';
+    } else if (hasVideo && found.isEmpty) {
+      t = 'شغّل الفيديو الأول — زرار الكاست الذهبي هيظهر أول ما ألقط رابطه.';
+    }
+    if (t == null) return const SizedBox.shrink();
+    return Container(
+      width: double.infinity,
+      color: kSurface2,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Icon(icon, color: kGold, size: 18),
+        const SizedBox(width: 8),
+        Expanded(child: Text(t, style: const TextStyle(fontSize: 12))),
+      ]),
+    );
+  }
+
+  void _foundSheet() => showModalBottomSheet(
+        context: context,
+        backgroundColor: kSurface,
+        builder: (c) => SafeArea(
+          child: ListView(shrinkWrap: true, children: [
+            const ListTile(title: Text('الفيديوهات اللي اتلقطت — دوس علشان تبعت للشاشة')),
+            for (final u in found)
+              ListTile(
+                leading: Text(mimeOf(u).split('/').last.replaceAll('x-mpegURL', 'm3u8'), style: const TextStyle(color: kGold, fontSize: 11)),
+                title: Text(u, maxLines: 2, overflow: TextOverflow.ellipsis, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12)),
+                onTap: () {
+                  Navigator.pop(c);
+                  cast(u);
+                },
+                trailing: IconButton(icon: const Icon(Icons.copy, size: 18), onPressed: () => Clipboard.setData(ClipboardData(text: u))),
+              ),
+          ]),
+        ),
+      );
+
   @override
   Widget build(BuildContext context) {
+    final starred = BrowserStore.isBookmarked(url);
     return PopScope(
       canPop: false,
-      onPopInvokedWithResult: (did, _) async {
-        if (did) return;
-        if (await web.canGoBack()) {
-          await web.goBack();
-        } else if (context.mounted) {
-          Navigator.pop(context);
-        }
+      onPopInvokedWithResult: (did, _) {
+        if (!did) back();
       },
       child: Scaffold(
         appBar: AppBar(
+          automaticallyImplyLeading: false,
           titleSpacing: 0,
+          leading: IconButton(icon: const Icon(Icons.close_rounded), tooltip: 'اقفل المتصفح', onPressed: close),
           title: TextField(
             controller: urlC,
             textDirection: TextDirection.ltr,
             keyboardType: TextInputType.url,
             textInputAction: TextInputAction.go,
             onSubmitted: go,
-            decoration: const InputDecoration(hintText: 'اكتب رابط أو ابحث', border: InputBorder.none),
+            decoration: const InputDecoration(hintText: 'اكتب رابط أو ابحث', border: InputBorder.none, filled: false),
           ),
           actions: [
-            IconButton(icon: const Icon(Icons.refresh), onPressed: () => web.reload()),
             IconButton(
-              icon: const Icon(Icons.home_outlined),
-              tooltip: 'خليها الصفحة الرئيسية',
-              onPressed: () {
-                Store.homePage = urlC.text;
-                toast(context, 'اتحفظت كصفحة رئيسية');
+              icon: Icon(starred ? Icons.star_rounded : Icons.star_outline_rounded, color: kGold),
+              tooltip: 'المفضلة',
+              onPressed: () async {
+                final on = await BrowserStore.toggleBookmark(url, title);
+                if (mounted) toast(context, on ? 'اتضاف للمفضلة' : 'اتشال من المفضلة');
+                setState(() {});
               },
+            ),
+            PopupMenuButton<String>(
+              onSelected: _menu,
+              itemBuilder: (_) => [
+                const PopupMenuItem(value: 'bm', child: ListTile(leading: Icon(Icons.star_rounded), title: Text('المفضلة'))),
+                const PopupMenuItem(value: 'hist', child: ListTile(leading: Icon(Icons.history_rounded), title: Text('السجل'))),
+                const PopupMenuItem(value: 'home', child: ListTile(leading: Icon(Icons.home_outlined), title: Text('خليها الصفحة الرئيسية'))),
+                PopupMenuItem(
+                  value: 'ad',
+                  child: ListTile(
+                    leading: Icon(adblock ? Icons.shield_rounded : Icons.shield_outlined, color: adblock ? kOk : null),
+                    title: Text(adblock ? 'مانع الإعلانات: شغال' : 'مانع الإعلانات: مقفول'),
+                    subtitle: adsBlocked > 0 ? Text('اتمنع $adsBlocked') : null,
+                  ),
+                ),
+              ],
             ),
           ],
           bottom: prog < 1 ? PreferredSize(preferredSize: const Size.fromHeight(2), child: LinearProgressIndicator(value: prog)) : null,
         ),
-        body: WebViewWidget(controller: web),
-        floatingActionButton: found.isEmpty
+        body: Column(children: [
+          _banner(),
+          Expanded(child: WebViewWidget(controller: web)),
+        ]),
+        bottomNavigationBar: SafeArea(
+          child: Container(
+            height: 52,
+            decoration: const BoxDecoration(color: kSurface, border: Border(top: BorderSide(color: kLine))),
+            child: Directionality(
+              textDirection: TextDirection.ltr,
+              child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                IconButton(icon: const Icon(Icons.arrow_back_rounded), tooltip: 'رجوع', onPressed: back),
+                IconButton(icon: const Icon(Icons.arrow_forward_rounded), tooltip: 'قدام', onPressed: canFwd ? () => web.goForward() : null),
+                IconButton(icon: const Icon(Icons.refresh_rounded), tooltip: 'تحديث', onPressed: () => web.reload()),
+                IconButton(icon: const Icon(Icons.home_rounded), tooltip: 'الرئيسية', onPressed: () => go(Store.homePage)),
+                IconButton(icon: const Icon(Icons.close_rounded, color: kBad), tooltip: 'اقفل', onPressed: close),
+              ]),
+            ),
+          ),
+        ),
+        floatingActionButton: ytId != null
+            ? FloatingActionButton.extended(
+                backgroundColor: kGold,
+                foregroundColor: const Color(0xFF1A1405),
+                icon: ytBusy ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF1A1405))) : const Icon(Icons.cast_rounded),
+                label: Text(ytBusy ? 'بجيب الجودات…' : 'ابعت للشاشة'),
+                onPressed: ytBusy ? null : castYouTube,
+              )
+            : found.isEmpty
             ? null
             : FloatingActionButton.extended(
-                icon: const Icon(Icons.cast),
-                label: Text('${found.length} فيديو'),
-                onPressed: () => showModalBottomSheet(
-                  context: context,
-                  builder: (c) => SafeArea(
-                    child: ListView(shrinkWrap: true, children: [
-                      const ListTile(title: Text('الفيديوهات اللي اتلقطت — دوس علشان تبعت للشاشة')),
-                      for (final u in found)
-                        ListTile(
-                          leading: Text(mimeOf(u).split('/').last.replaceAll('x-mpegURL', 'm3u8'), style: const TextStyle(color: kGold, fontSize: 11)),
-                          title: Text(u, maxLines: 2, overflow: TextOverflow.ellipsis, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12)),
-                          onTap: () {
-                            Navigator.pop(c);
-                            cast(u);
-                          },
-                          trailing: IconButton(
-                            icon: const Icon(Icons.copy, size: 18),
-                            onPressed: () => Clipboard.setData(ClipboardData(text: u)),
-                          ),
-                        ),
-                    ]),
-                  ),
-                ),
+                backgroundColor: kGold,
+                foregroundColor: const Color(0xFF1A1405),
+                icon: const Icon(Icons.cast_rounded),
+                label: Text(found.length == 1 ? 'ابعت للشاشة' : '${found.length} فيديو'),
+                onPressed: () => found.length == 1 ? cast(found.first) : _foundSheet(),
               ),
       ),
     );
@@ -1983,10 +2584,93 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     setState(() {});
   }
 
+  bool notifRemote = Store.p.getBool('stb_notif') ?? false;
+
+  @override
+  void initState() {
+    super.initState();
+    kOpenChannel.addListener(_openFromShortcut);
+    if (notifRemote) Native4.remoteNotif(true);
+    if (kOpenChannel.value != null) WidgetsBinding.instance.addPostFrameCallback((_) => _openFromShortcut());
+  }
+
   @override
   void dispose() {
+    kOpenChannel.removeListener(_openFromShortcut);
     gm?.disconnect();
     super.dispose();
+  }
+
+  /// اختصار قناة من الشاشة الرئيسية: نتصل لو مش متصلين وبعدين نغيّر القناة
+  Future<void> _openFromShortcut() async {
+    final d = kOpenChannel.value;
+    if (d == null || d.length < 3) return;
+    kOpenChannel.value = null;
+    final radio = d.startsWith('1:');
+    final id = d.substring(2);
+    if (!connected && Store.receiverIp != null) await connect(Store.receiverIp!);
+    if (!connected) {
+      if (mounted) toast(context, 'مقدرتش أتصل بالريسيفر');
+      return;
+    }
+    final ch = channels.where((c) => c.id == id && c.radio == radio).firstOrNull ?? StbChannel(id, 'قناة $id', radio, 0, const {});
+    try {
+      await gm!.zap(ch);
+      setState(() => playingId = id);
+      AppLog.add('STB', 'shortcut zap $d');
+    } catch (e) {
+      if (mounted) toast(context, '$e');
+    }
+  }
+
+  Future<void> pinChannel(StbChannel ch) async {
+    final ok = await Native4.pinShortcut('ch_${ch.radio ? 1 : 0}_${ch.id}', ch.name, '${ch.radio ? 1 : 0}:${ch.id}');
+    if (mounted) toast(context, ok ? 'وافق على الإضافة للشاشة الرئيسية' : 'الشاشة الرئيسية (اللانشر) مش بتقبل اختصارات');
+  }
+
+  Future<void> setNotifRemote(bool on) async {
+    notifRemote = on;
+    await Store.p.setBool('stb_notif', on);
+    if (on) await Native.askNotifyPermission();
+    await Native4.remoteNotif(on, title: gm?.info?.model ?? 'ريموت الريسيفر');
+    if (mounted) {
+      setState(() {});
+      if (on) toast(context, 'الريموت في الإشعارات — بيشتغل لما الموبايل على واي فاي البيت');
+    }
+  }
+
+  Future<void> voice() async {
+    if (!connected) {
+      toast(context, 'اتصل بالريسيفر الأول');
+      return;
+    }
+    final heard = await Native4.voice(prompt: 'قول: افتح MBC • قناة 105 • علّي الصوت • اقفل');
+    if (heard.isEmpty) return;
+    if (channels.isEmpty) await loadChannels();
+    final c = parseVoiceCommand(heard, channels);
+    AppLog.add('STB', 'voice "${heard.first}" → ${c.kind.name} ${c.describe}');
+    if (!mounted) return;
+    switch (c.kind) {
+      case VoiceKind.none:
+        toast(context, 'مفهمتش «${c.heard}» — جرّب تاني');
+      case VoiceKind.keys:
+        if (c.keys.first == K.power && !await confirm(context, 'أقفل/أفتح الريسيفر؟')) return;
+        for (final k in c.keys) {
+          await key(k);
+          await Future.delayed(const Duration(milliseconds: 250));
+        }
+        if (mounted) toast(context, '«${c.heard}» ✓');
+      case VoiceKind.number:
+        for (final k in digitKeys(c.number)) {
+          await key(k);
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+        if (mounted) toast(context, 'قناة ${c.number}');
+      case VoiceKind.channel:
+        await gm!.zap(c.channel!);
+        setState(() => playingId = c.channel!.id);
+        if (mounted) toast(context, c.channel!.name);
+    }
   }
 
   Future<void> discover() async {
@@ -2202,6 +2886,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
             ]),
           ),
           if (busy) const Padding(padding: EdgeInsets.all(8), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
+          if (on) IconButton(tooltip: 'أمر صوتي', icon: const Icon(Icons.mic_rounded, color: kGold), onPressed: voice),
           if (on && view == 0)
             IconButton(
               tooltip: touchpad ? 'زراير' : 'تاتش باد',
@@ -2218,6 +2903,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               if (v == 'ip') manual();
               if (v == 'info') showInfo();
               if (v == 'reload') loadChannels();
+              if (v == 'notif') setNotifRemote(!notifRemote);
               if (v == 'timers' && gm != null) {
                 Navigator.push(context, MaterialPageRoute(builder: (_) => TimersPage(gm: gm!, channels: channels, playingId: playingId)));
               }
@@ -2235,6 +2921,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               if (on) const PopupMenuItem(value: 'info', child: ListTile(leading: Icon(Icons.info_outline_rounded), title: Text('معلومات الريسيفر'))),
               if (on) const PopupMenuItem(value: 'timers', child: ListTile(leading: Icon(Icons.alarm_rounded), title: Text('المؤقتات (تسجيل/تشغيل)'))),
               if (on) const PopupMenuItem(value: 'reload', child: ListTile(leading: Icon(Icons.refresh_rounded), title: Text('حدّث القنوات'))),
+              PopupMenuItem(value: 'notif', child: ListTile(leading: const Icon(Icons.notifications_active_rounded), title: Text(notifRemote ? 'شيل الريموت من الإشعارات' : 'ريموت في الإشعارات'))),
               if (on) const PopupMenuItem(value: 'off', child: ListTile(leading: Icon(Icons.link_off_rounded), title: Text('اقفل الاتصال'))),
             ],
           ),
@@ -2441,6 +3128,14 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                 label: const Text('شغّلها على التلفزيون'),
               ),
               OutlinedButton.icon(onPressed: () => watch(ch), icon: const Icon(Icons.phone_android_rounded), label: const Text('على الموبايل')),
+              OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.pop(c);
+                  pinChannel(ch);
+                },
+                icon: const Icon(Icons.add_to_home_screen_rounded),
+                label: const Text('اختصار على الشاشة'),
+              ),
               OutlinedButton.icon(
                 onPressed: () {
                   Navigator.pop(c);
@@ -3209,7 +3904,12 @@ class AppLog extends ChangeNotifier {
             (m) => '${m[1]}=***')
         .replaceAllMapped(
             RegExp(r'"(WPAPSK1|password|WPAPSK1_encode)"\s*:\s*"[^"]*"', caseSensitive: false),
-            (m) => '"${m[1]}":"***"');
+            (m) => '"${m[1]}":"***"')
+        // روابط يوتيوب: الهوست + itag بس (التوقيع ميتكتبش في السجل)
+        .replaceAllMapped(RegExp(r'https?://([A-Za-z0-9.\-]*googlevideo\.com)[^\s"<>&]*(?:&amp;[^\s"<>]*)*'), (m) {
+          final it = RegExp(r'itag[=/](\d+)').firstMatch(m[0]!)?.group(1);
+          return 'https://${m[1]}/…${it == null ? '' : 'itag=$it'}';
+        });
   }
 
   static void add(String tag, String msg) {
@@ -3336,6 +4036,15 @@ class Native {
     try {
       await _ch.invokeMethod('askNotify');
     } catch (_) {}
+  }
+
+  /// صورة → JPEG (بيتعمل في Kotlin: بيفهم HEIC ويلف حسب EXIF)
+  static Future<bool> toJpeg(String src, String dst, {int max = 1920, int quality = 90}) async {
+    try {
+      return await _ch.invokeMethod('toJpeg', {'src': src, 'dst': dst, 'max': max, 'q': quality}) == true;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// يفتح رابط فيديو (rtsp/http) في مشغل خارجي زي VLC/MX
@@ -3723,6 +4432,33 @@ class ZteRouter {
       macs: splitList('${j['wifi_mac_black_list'] ?? ''}').map(normMac).toList(),
       names: splitList('${j['wifi_hostname_black_list'] ?? ''}'),
     );
+  }
+
+  /// حظر/فك أكتر من جهاز في أمر واحد (المواعيد)
+  Future<bool> setBlockedMany({Map<String, String> add = const {}, Set<String> remove = const {}}) async {
+    final cur = await blockList();
+    final macs = [...cur.macs];
+    final names = [...cur.names];
+    for (final m0 in remove) {
+      final i = macs.indexOf(normMac(m0));
+      if (i >= 0) {
+        macs.removeAt(i);
+        if (i < names.length) names.removeAt(i);
+      }
+    }
+    for (final e in add.entries) {
+      final m = normMac(e.key);
+      if (!macs.contains(m)) {
+        macs.add(m);
+        names.add(e.value.isEmpty ? 'A2R' : e.value.replaceAll(';', ' '));
+      }
+    }
+    final r = await set('WIFI_MAC_FILTER', {
+      'ACL_mode': macs.isEmpty ? '0' : '2',
+      'wifi_mac_black_list': macs.join(';'),
+      'wifi_hostname_black_list': names.join(';'),
+    });
+    return '${r['result']}' == 'success' || '${r['result']}' == '0';
   }
 
   Future<bool> setBlocked(String mac, String name, bool block) async {
@@ -4373,6 +5109,8 @@ const Map<String, String> kExtMime = {
   'gif': 'image/gif',
   'bmp': 'image/bmp',
   'webp': 'image/webp',
+  'heic': 'image/heic',
+  'heif': 'image/heif',
   'srt': 'text/srt',
   'vtt': 'text/vtt',
 };
@@ -4398,7 +5136,15 @@ bool isLiveMime(String m) => isHlsMime(m) || m.toLowerCase().contains('dash');
 const String kDlnaFlags = 'DLNA.ORG_FLAGS=01700000000000000000000000000000';
 const String kDlnaUa = 'Android/UPnP/1.0 DLNADOC/1.50 A2RHome/1.0';
 
-String dlnaFeatures(String mime) => isLiveMime(mime) ? 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;$kDlnaFlags' : 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kDlnaFlags';
+// الصور: بروفايل JPEG_LRG + أعلام Interactive/Background (مش Streaming) — زي BubbleUPnP
+const String kDlnaImageFlags = 'DLNA.ORG_FLAGS=00F00000000000000000000000000000';
+String dlnaFeatures(String mime) => mime.startsWith('image/jpeg')
+    ? 'DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kDlnaImageFlags'
+    : mime.startsWith('image')
+        ? 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kDlnaImageFlags'
+        : isLiveMime(mime)
+            ? 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;$kDlnaFlags'
+            : 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kDlnaFlags';
 
 String protocolInfoFor(String mime, {bool dlna = true}) => 'http-get:*:$mime:${dlna ? dlnaFeatures(mime) : '*'}';
 
@@ -4532,6 +5278,15 @@ class DlnaClient {
     }
     if (last != null) throw last;
     await Future.delayed(const Duration(milliseconds: 500));
+    if (m.startsWith('image')) {
+      // أجهزة كتير بتعرض الصورة بعد SetAVTransportURI على طول وبترفض Play — مش هنعتبره فشل
+      try {
+        await play();
+      } catch (e) {
+        AppLog.add('CAST', 'Play للصورة اترفض (عادي في أجهزة كتير): $e');
+      }
+      return;
+    }
     for (var i = 0; i < 4; i++) {
       try {
         await play();
@@ -4655,6 +5410,12 @@ class MediaServer {
   final Map<String, _Shared> _items = {};
   final Map<String, String> _byKey = {};
   String _host = '';
+  /// الملفات اللي الشاشة طلبتها فعلًا (علشان نعرف لو الريسيفر رفض الصورة من غير ما يطلبها)
+  final Set<String> fetched = {};
+  static String? idOfUrl(String url) {
+    final s = Uri.tryParse(url)?.pathSegments ?? const [];
+    return s.length >= 2 && (s[0] == 'f' || s[0] == 'p') ? s[1] : null;
+  }
 
   Future<String> _base(String phoneIp) async {
     _srv ??= await _start();
@@ -4715,6 +5476,7 @@ class MediaServer {
         await res.close();
         return;
       }
+      if (q.method == 'GET') fetched.add(seg[1]);
       AppLog.add('CAST', 'serve ${q.method} /${seg[0]}/${seg[1]} from ${q.connectionInfo?.remoteAddress.address} range=${q.headers.value('range')}');
       if (it.file != null) {
         await _serveFile(q, it);
@@ -5907,5 +6669,2152 @@ class _TimerEditPageState extends State<TimerEditPage> {
         Padding(padding: const EdgeInsets.all(16), child: FilledButton.icon(onPressed: save, icon: const Icon(Icons.save), label: const Text('احفظ على الريسيفر'))),
       ]),
     );
+  }
+}
+
+// ======== youtube.dart ========
+// كاست فيديوهات يوتيوب من المتصفح (زي Web Video Caster) — بمكتبة youtube_explode_dart (Dart خالص).
+// استخدام شخصي في البيت. يوتيوب بيغير طريقته كل فترة، فلو وقف: حدّث نسخة المكتبة في build.yml.
+
+/// رقم الفيديو من أي رابط يوتيوب (watch / youtu.be / shorts / embed / live / m.youtube.com)
+String? ytVideoId(String url) {
+  final u = Uri.tryParse(url.trim());
+  if (u == null || !u.hasScheme) return null;
+  final h = u.host.toLowerCase();
+  bool ok(String? id) => id != null && RegExp(r'^[0-9A-Za-z_\-]{11}$').hasMatch(id);
+  if (h == 'youtu.be') {
+    final id = u.pathSegments.isEmpty ? null : u.pathSegments.first;
+    return ok(id) ? id : null;
+  }
+  if (!(h == 'youtube.com' || h.endsWith('.youtube.com') || h == 'youtube-nocookie.com' || h.endsWith('.youtube-nocookie.com'))) return null;
+  final v = u.queryParameters['v'];
+  if (u.path == '/watch' || u.path == '/watch/') return ok(v) ? v : null;
+  final seg = u.pathSegments;
+  if (seg.length >= 2 && const ['shorts', 'embed', 'live', 'v', 'e'].contains(seg[0])) return ok(seg[1]) ? seg[1] : null;
+  return null;
+}
+
+/// جودة واحدة ينفع تتبعت للشاشة
+class YtChoice {
+  final String label; // "720p"
+  final String detail; // "mp4 • 24 MB"
+  final String url;
+  final String mime;
+  final int height;
+  final int itag;
+  final bool hls;
+  YtChoice(this.label, this.detail, this.url, this.mime, this.height, this.itag, {this.hls = false});
+}
+
+class YtResult {
+  final String id;
+  final List<YtChoice> muxed; // فيديو+صوت في ملف واحد (أضمن حاجة — غالبًا لحد 360p)
+  final List<YtChoice> hls; // HLS (جودات أعلى/بث مباشر — لو الريسيفر بيشغّل m3u8)
+  final DateTime at;
+  YtResult(this.id, this.muxed, this.hls) : at = DateTime.now();
+  bool get isEmpty => muxed.isEmpty && hls.isEmpty;
+}
+
+/// ترتيب: الأعلى جودة الأول، ومن غير تكرار نفس الارتفاع
+List<YtChoice> ytSortChoices(List<YtChoice> l) {
+  final s = [...l]..sort((a, b) => b.height != a.height ? b.height.compareTo(a.height) : a.itag.compareTo(b.itag));
+  final seen = <String>{};
+  return s.where((c) => seen.add('${c.hls}-${c.height}')).toList();
+}
+
+/// للسجل: الهوست + itag بس (من غير التوقيع وباقي الباراميترات)
+String ytLogUrl(String url) {
+  final u = Uri.tryParse(url);
+  if (u == null) return '?';
+  final itag = u.queryParameters['itag'] ?? RegExp(r'/itag/(\d+)').firstMatch(u.path)?.group(1);
+  return '${u.host}${itag == null ? '' : ' itag=$itag'}';
+}
+
+class YouTubeCast {
+  static yte.YoutubeExplode? _yt;
+  static final Map<String, YtResult> _cache = {};
+
+  static String errorAr(Object e) {
+    final s = '$e';
+    if (e is TimeoutException || e is SocketException) return 'النت بطيء أو مقطوع — جرّب تاني';
+    if (e is yte.VideoRequiresPurchaseException) return 'الفيديو ده مدفوع — مينفعش يتبعت';
+    if (e is yte.VideoUnplayableException || s.contains('unplayable') || s.contains('Sign in')) {
+      return 'يوتيوب مش سامح بتشغيل الفيديو ده برا تطبيقه (خاص / للكبار / ممنوع في البلد)';
+    }
+    return 'يوتيوب غيّر حاجة — جرّب تاني أو حدّث التطبيق';
+  }
+
+  static Future<YtResult> streams(String id) async {
+    final c = _cache[id];
+    if (c != null && DateTime.now().difference(c.at) < const Duration(hours: 2)) return c;
+    final yt = _yt ??= yte.YoutubeExplode();
+    AppLog.add('CAST', 'youtube $id: بجيب الجودات…');
+    final muxed = <YtChoice>[];
+    final hls = <YtChoice>[];
+    Object? firstErr;
+    try {
+      final m = await yt.videos.streamsClient.getManifest(id).timeout(const Duration(seconds: 25));
+      for (final s in m.muxed) {
+        muxed.add(YtChoice(s.qualityLabel, '${s.container.name} • ${fmtBytes(s.size.totalBytes)}', s.url.toString(),
+            s.container.name == 'webm' ? 'video/webm' : 'video/mp4', s.videoResolution.height, s.tag));
+      }
+      for (final s in m.hls.whereType<yte.HlsMuxedStreamInfo>()) {
+        hls.add(YtChoice(s.qualityLabel, 'HLS', s.url.toString(), 'application/x-mpegURL', s.videoResolution.height, s.tag, hls: true));
+      }
+    } catch (e) {
+      firstErr = e;
+      AppLog.add('CAST', 'youtube $id manifest ✗ ${e.runtimeType}: ${ytShortErr(e)}');
+    }
+    // HLS (عميل iOS): جودات أعلى فيها صوت وصورة مع بعض
+    if (hls.isEmpty) {
+      try {
+        final m = await yt.videos.streamsClient.getManifest(id, ytClients: [yte.YoutubeApiClient.ios]).timeout(const Duration(seconds: 25));
+        for (final s in m.hls.whereType<yte.HlsMuxedStreamInfo>()) {
+          hls.add(YtChoice(s.qualityLabel, 'HLS', s.url.toString(), 'application/x-mpegURL', s.videoResolution.height, s.tag, hls: true));
+        }
+        if (muxed.isEmpty) {
+          for (final s in m.muxed) {
+            muxed.add(YtChoice(s.qualityLabel, '${s.container.name} • ${fmtBytes(s.size.totalBytes)}', s.url.toString(), 'video/mp4', s.videoResolution.height, s.tag));
+          }
+        }
+      } catch (e) {
+        AppLog.add('CAST', 'youtube $id ios/hls ✗ ${e.runtimeType}: ${ytShortErr(e)}');
+      }
+    }
+    // بث مباشر: رابط HLS الرئيسي (جودة تلقائية)
+    try {
+      final live = await yt.videos.streamsClient.getHttpLiveStreamUrl(yte.VideoId(id)).timeout(const Duration(seconds: 15));
+      hls.insert(0, YtChoice('تلقائي (بث مباشر)', 'HLS', live, 'application/x-mpegURL', 99999, 0, hls: true));
+    } catch (_) {/* مش بث مباشر — عادي */}
+    final r = YtResult(id, ytSortChoices(muxed), ytSortChoices(hls));
+    AppLog.add('CAST', 'youtube $id: muxed=${r.muxed.map((c) => '${c.label}/${c.itag}').join(',')} hls=${r.hls.map((c) => c.label).join(',')}');
+    if (r.isEmpty) throw firstErr ?? StateError('مفيش جودات');
+    _cache[id] = r;
+    return r;
+  }
+}
+
+String ytShortErr(Object e) {
+  final s = '$e'.replaceAll(RegExp(r'https?://\S+'), '<url>');
+  return s.length > 200 ? s.substring(0, 200) : s;
+}
+
+// ======== cast_images.dart ========
+const String kImageUnsupportedAr =
+    'الريسيفر استلم أمر الصورة بس مطلبهاش من الموبايل — غالبًا مش بيعرض صور عن طريق الشبكة (DLNA). الفيديو شغال عادي؛ للصور جرّب فلاشة USB. لو عايزنا نتأكد ابعت السجل.';
+
+bool isImagePath(String p) => mimeOf(p).startsWith('image');
+
+/// اسم ملف الـJPEG المتجهّز (ثابت لنفس الصورة علشان الكاش)
+String castJpegName(String path, int len, int modMs) =>
+    'img_${md5Hex('$path|$len|$modMs').substring(0, 16)}.jpg';
+
+/// يجهّز الصورة للريسيفر: JPEG، أقصى ضلع 1920، متلفّة صح (EXIF). لو التحويل فشل والصورة JPEG أصلًا نبعتها زي ما هي.
+Future<File> prepareCastImage(File f, {int max = 1920}) async {
+  try {
+    final st = await f.stat();
+    final dir = Directory('${(await getTemporaryDirectory()).path}/cast_img');
+    await dir.create(recursive: true);
+    final out = File('${dir.path}/${castJpegName(f.path, st.size, st.modified.millisecondsSinceEpoch)}');
+    if (await out.exists() && await out.length() > 0) return out;
+    final ok = await Native.toJpeg(f.path, out.path, max: max);
+    AppLog.add('CAST', 'صورة ${f.uri.pathSegments.last} (${fmtBytes(st.size)}) → JPEG ${ok ? fmtBytes(await out.length()) : 'فشل'}');
+    if (ok) return out;
+  } catch (e) {
+    AppLog.add('CAST', 'تجهيز الصورة ✗ $e');
+  }
+  if (mimeOf(f.path) == 'image/jpeg') return f;
+  throw StateError('مقدرتش أحوّل الصورة لـ JPEG (نوعها: ${extOf(f.path) ?? '؟'})');
+}
+
+// ======== v4_native.dart ========
+// جسر أندرويد للمميزات الجديدة (المنبه، الإشعار-ريموت، الصوت، الاختصارات) + الشغل في الخلفية
+
+class Native4 {
+  static const _ch = MethodChannel('a2r/native');
+
+  static Future<T?> _call<T>(String m, [Map<String, dynamic>? a]) async {
+    try {
+      return await _ch.invokeMethod<T>(m, a);
+    } catch (e) {
+      AppLog.add('ERR', 'native $m ✗ $e');
+      return null;
+    }
+  }
+
+  /// بيرجع "exact" أو "inexact"
+  static Future<String?> setAlarm(int id, DateTime at, Map<String, dynamic> task, {bool exact = true}) =>
+      _call<String>('setAlarm', {'id': id, 'at': at.millisecondsSinceEpoch, 'task': jsonEncode(task), 'exact': exact});
+  static Future<void> cancelAlarm(int id) => _call('cancelAlarm', {'id': id});
+  static Future<void> remoteNotif(bool on, {String title = 'ريموت الريسيفر'}) => _call('remoteNotif', {'on': on, 'title': title});
+  static Future<List<String>> voice({String prompt = 'قول الأمر'}) async {
+    final r = await _call<List<dynamic>>('voice', {'lang': 'ar-EG', 'prompt': prompt});
+    return r?.map((e) => '$e').toList() ?? [];
+  }
+
+  static Future<bool> pinShortcut(String id, String label, String data) async => await _call<bool>('pinShortcut', {'id': id, 'label': label, 'data': data}) == true;
+  static Future<String?> initialAction() => _call<String>('initialAction');
+
+  /// الأوامر اللي جاية من أندرويد للتطبيق وهو مفتوح
+  static void listen({required Future<void> Function(String data) openChannel, required Future<void> Function(int key) notifKey}) {
+    _ch.setMethodCallHandler((c) async {
+      if (c.method == 'openChannel') await openChannel('${c.arguments}');
+      if (c.method == 'notifKey') await notifKey((c.arguments as num).toInt());
+      return null;
+    });
+  }
+}
+
+/// نقطة الدخول للشغل في الخلفية (Kotlin A2RBg بيشغّلها في محرك Flutter من غير شاشة)
+@pragma('vm:entry-point')
+Future<void> a2rBgMain() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  DartPluginRegistrant.ensureInitialized();
+  const ch = MethodChannel('a2r/native');
+  var result = '';
+  Map<String, dynamic> task = {};
+  try {
+    await Store.init();
+    task = Map<String, dynamic>.from(jsonDecode(await ch.invokeMethod<String>('bgTask') ?? '{}') as Map);
+    result = await Bg.run(task).timeout(const Duration(seconds: 40));
+  } catch (e) {
+    result = 'خطأ: $e';
+  }
+  try {
+    await Store.p.setString('bg_last', '${DateTime.now().toIso8601String().substring(0, 16)} ${task['type']}: $result');
+  } catch (_) {}
+  try {
+    await ch.invokeMethod('bgDone');
+  } catch (_) {}
+}
+
+class Bg {
+  static Future<String> run(Map<String, dynamic> t) async {
+    switch (t['type']) {
+      case 'sched':
+        final r = await Schedule.syncRouter(background: true);
+        await Schedule.rearm();
+        return r;
+      case 'quota':
+        final r = await Quota.backgroundCheck();
+        await Quota.rearm();
+        return r;
+      case 'rearm':
+        await Schedule.rearm();
+        await Quota.rearm();
+        return 'rearm';
+      case 'key':
+        final ip = Store.receiverIp;
+        if (ip == null) return 'مفيش ريسيفر محفوظ';
+        final g = GmClient(ip);
+        try {
+          await g.connect();
+          await g.key((t['key'] as num).toInt());
+          await Future.delayed(const Duration(milliseconds: 400));
+        } finally {
+          await g.disconnect();
+        }
+        return 'key ${t['key']}';
+    }
+    return 'مش معروف';
+  }
+
+  /// دخول الراوتر من الخلفية — بس لو آخر دخول من التطبيق نجح (علشان الراوتر ميقفلش بسبب محاولات غلط)
+  static Future<ZteRouter?> router() async {
+    if (Store.p.getBool('router_last_ok') != true) return null;
+    final ip = Store.routerIp;
+    final pw = await Store.routerPassword();
+    if (ip == null || pw == null || pw.isEmpty) return null;
+    final r = ZteRouter(ip);
+    try {
+      final res = await r.login(pw, force: schemeFromName(Store.loginScheme)).timeout(const Duration(seconds: 15));
+      if (!res.ok) {
+        // باسورد اتغير أو الراوتر قافل؟ نوقف الخلفية لحد ما يدخل من التطبيق تاني
+        await Store.p.setBool('router_last_ok', false);
+        r.close();
+        return null;
+      }
+      return r;
+    } catch (_) {
+      r.close();
+      return null;
+    }
+  }
+}
+
+// ======== v4_net.dart ========
+// مواعيد الحظر + باقة النت + سجل الأجهزة + QR الواي فاي
+
+/// قاعدة حظر: جهاز (MAC) محظور في أيام معينة من ساعة لساعة (ممكن تعدّي نص الليل)
+class BlockRule {
+  String id, mac, name;
+  Set<int> days; // 1=الاتنين … 7=الحد (زي DateTime.weekday)
+  int from, to; // دقايق من نص الليل
+  bool enabled;
+  BlockRule({required this.id, required this.mac, required this.name, required this.days, required this.from, required this.to, this.enabled = true});
+
+  Map<String, dynamic> toJson() => {'id': id, 'mac': mac, 'name': name, 'days': days.toList()..sort(), 'from': from, 'to': to, 'on': enabled};
+  static BlockRule fromJson(Map m) => BlockRule(
+        id: '${m['id']}',
+        mac: normMac('${m['mac']}'),
+        name: '${m['name'] ?? ''}',
+        days: ((m['days'] as List?) ?? const []).map((e) => (e as num).toInt()).toSet(),
+        from: (m['from'] as num?)?.toInt() ?? 0,
+        to: (m['to'] as num?)?.toInt() ?? 0,
+        enabled: m['on'] != false,
+      );
+
+  /// شغالة دلوقتي؟ (لو from > to يبقى بتعدّي نص الليل: اليوم اللي بدأت فيه هو اللي بيتحسب)
+  bool activeAt(DateTime t) {
+    if (!enabled || days.isEmpty) return false;
+    final m = t.hour * 60 + t.minute;
+    final today = days.contains(t.weekday);
+    final yesterday = days.contains(t.weekday == 1 ? 7 : t.weekday - 1);
+    if (from == to) return today; // اليوم كله
+    if (from < to) return today && m >= from && m < to;
+    return (today && m >= from) || (yesterday && m < to);
+  }
+}
+
+String fmtMin(int m) => '${(m ~/ 60).toString().padLeft(2, '0')}:${(m % 60).toString().padLeft(2, '0')}';
+const List<String> kDayNamesAr = ['الاتنين', 'التلات', 'الأربع', 'الخميس', 'الجمعة', 'السبت', 'الحد'];
+
+/// الـ MACs اللي المفروض تكون محظورة دلوقتي
+Set<String> macsBlockedAt(List<BlockRule> rules, DateTime t) => rules.where((r) => r.activeAt(t)).map((r) => r.mac).toSet();
+
+/// أقرب وقت بعد [now] حالة أي قاعدة بتتغير فيه (بداية أو نهاية)
+DateTime? nextRuleEvent(List<BlockRule> rules, DateTime now) {
+  DateTime? best;
+  final base = DateTime(now.year, now.month, now.day);
+  for (final r in rules.where((r) => r.enabled && r.days.isNotEmpty)) {
+    for (var d = 0; d <= 8; d++) {
+      final day = DateTime(base.year, base.month, base.day + d);
+      for (final m in {r.from, r.to}) {
+        final t = DateTime(day.year, day.month, day.day, m ~/ 60, m % 60);
+        if (!t.isAfter(now)) continue;
+        // الحدث ده بيغيّر حاجة فعلًا؟
+        final before = r.activeAt(t.subtract(const Duration(minutes: 1)));
+        final after = r.activeAt(t);
+        if (before == after) continue;
+        if (best == null || t.isBefore(best)) best = t;
+        break;
+      }
+    }
+  }
+  return best;
+}
+
+/// يحسب الحظر المطلوب: يضيف اللي لازم يتحظر، ويشيل بس اللي المواعيد هي اللي حظرته (الحظر اليدوي ميتلمسش)
+({Set<String> add, Set<String> remove}) scheduleDiff({required Set<String> current, required Set<String> wanted, required Set<String> managed, required Set<String> appliedBySchedule}) {
+  final add = wanted.difference(current);
+  final remove = current.where((m) => managed.contains(m) && !wanted.contains(m) && appliedBySchedule.contains(m)).toSet();
+  return (add: add, remove: remove);
+}
+
+class Schedule {
+  static List<BlockRule> get rules {
+    try {
+      return (jsonDecode(Store.p.getString('sched_rules') ?? '[]') as List).map((e) => BlockRule.fromJson(e as Map)).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<void> save(List<BlockRule> l) async {
+    await Store.p.setString('sched_rules', jsonEncode(l.map((e) => e.toJson()).toList()));
+    await rearm();
+  }
+
+  static Set<String> get applied => (Store.p.getStringList('sched_applied') ?? []).toSet();
+  static Future<void> setApplied(Set<String> s) => Store.p.setStringList('sched_applied', s.toList());
+
+  /// المنبه الجاي (عند أقرب بداية/نهاية)
+  static Future<String> rearm() async {
+    final n = nextRuleEvent(rules, DateTime.now());
+    if (n == null) {
+      await Native4.cancelAlarm(1001);
+      await Store.p.remove('sched_next');
+      return 'مفيش مواعيد';
+    }
+    final kind = await Native4.setAlarm(1001, n.add(const Duration(seconds: 5)), {'type': 'sched'});
+    await Store.p.setString('sched_next', '${n.toIso8601String()}|$kind');
+    return '$n $kind';
+  }
+
+  /// يطبّق الحظر على الراوتر (من التطبيق أو من الخلفية)
+  static Future<String> syncRouter({ZteRouter? router, bool background = false}) async {
+    final l = rules;
+    if (l.isEmpty) return 'مفيش قواعد';
+    final r = router ?? await Bg.router();
+    if (r == null) return 'مقدرتش أدخل الراوتر (الموبايل لازم يكون على واي فاي البيت)';
+    try {
+      final cur = await r.blockList();
+      final wanted = macsBlockedAt(l, DateTime.now());
+      final managed = l.map((e) => e.mac).toSet();
+      final d = scheduleDiff(current: cur.macs.toSet(), wanted: wanted, managed: managed, appliedBySchedule: applied);
+      if (d.add.isEmpty && d.remove.isEmpty) return 'مفيش تغيير';
+      final names = {for (final x in l) x.mac: x.name};
+      final ok = await r.setBlockedMany(add: {for (final m in d.add) m: names[m] ?? ''}, remove: d.remove);
+      if (ok) await setApplied(applied.union(d.add).difference(d.remove));
+      final msg = '${ok ? 'تم' : 'الراوتر مأكدش'}: حظر ${d.add.length} / فك ${d.remove.length}';
+      AppLog.add('ROUTER', 'schedule $msg add=${d.add} remove=${d.remove}');
+      if (background && ok) {
+        for (final m in d.add) {
+          Native.notify('مواعيد الحظر', 'اتحظر ${names[m]?.isNotEmpty == true ? names[m] : m}');
+        }
+        for (final m in d.remove) {
+          Native.notify('مواعيد الحظر', 'اتفك الحظر عن ${names[m]?.isNotEmpty == true ? names[m] : m}');
+        }
+      }
+      return msg;
+    } finally {
+      if (router == null) r.close();
+    }
+  }
+}
+
+// ---------------- باقة النت ----------------
+String dayKey(DateTime t) => '${t.year}-${t.month.toString().padLeft(2, '0')}-${t.day.toString().padLeft(2, '0')}';
+
+/// بداية الشهر بتاع الباقة حسب يوم التجديد (لو اليوم 31 والشهر أقصر → آخر يوم)
+DateTime quotaPeriodStart(DateTime now, int resetDay) {
+  int clampDay(int y, int m) => min(resetDay, DateTime(y, m + 1, 0).day);
+  final thisStart = DateTime(now.year, now.month, clampDay(now.year, now.month));
+  if (!now.isBefore(thisStart)) return thisStart;
+  final py = now.month == 1 ? now.year - 1 : now.year, pm = now.month == 1 ? 12 : now.month - 1;
+  return DateTime(py, pm, clampDay(py, pm));
+}
+
+/// يضيف قراءة عداد الراوتر (monthly_tx+rx) لاستهلاك اليوم. لو العداد رجع لورا (اتصفّر) نعتبر القراءة كلها جديدة.
+({Map<String, int> daily, int last}) quotaAddSample(Map<String, int> daily, int? last, int total, DateTime now, {int keepDays = 70}) {
+  final d = Map<String, int>.from(daily);
+  if (last != null) {
+    final diff = total >= last ? total - last : total;
+    final k = dayKey(now);
+    d[k] = (d[k] ?? 0) + diff;
+  }
+  final cut = dayKey(now.subtract(Duration(days: keepDays)));
+  d.removeWhere((k, _) => k.compareTo(cut) < 0);
+  return (daily: d, last: total);
+}
+
+int quotaUsedSince(Map<String, int> daily, DateTime start) {
+  final s = dayKey(start);
+  return daily.entries.where((e) => e.key.compareTo(s) >= 0).fold(0, (a, e) => a + e.value);
+}
+
+/// التنبيه اللي لازم يطلع (80 أو 95) لو لسه مطلعش في الفترة دي
+int? quotaAlertDue(double pct, int alreadyAlerted) {
+  if (pct >= 95 && alreadyAlerted < 95) return 95;
+  if (pct >= 80 && alreadyAlerted < 80) return 80;
+  return null;
+}
+
+class Quota {
+  static double get gb => Store.p.getDouble('quota_gb') ?? 0;
+  static int get resetDay => Store.p.getInt('quota_day') ?? 1;
+  static Map<String, int> get daily {
+    try {
+      return Map<String, int>.from((jsonDecode(Store.p.getString('quota_daily') ?? '{}') as Map).map((k, v) => MapEntry('$k', (v as num).toInt())));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static int? get last => Store.p.getInt('quota_last');
+
+  /// تعويض يدوي: "استهلكت لحد دلوقتي X" (للشهر الأول قبل ما التطبيق يبدأ يعدّ)
+  static int get offset {
+    final p = Store.p.getString('quota_off_period');
+    return p == dayKey(quotaPeriodStart(DateTime.now(), resetDay)) ? (Store.p.getInt('quota_off') ?? 0) : 0;
+  }
+
+  static Future<void> setOffset(int bytesUsedNow) async {
+    final start = quotaPeriodStart(DateTime.now(), resetDay);
+    final counted = quotaUsedSince(daily, start);
+    await Store.p.setString('quota_off_period', dayKey(start));
+    await Store.p.setInt('quota_off', max(0, bytesUsedNow - counted));
+  }
+
+  static int get used => quotaUsedSince(daily, quotaPeriodStart(DateTime.now(), resetDay)) + offset;
+  static double get pct => gb <= 0 ? 0 : used * 100 / (gb * 1e9);
+
+  static Future<void> sample(int total) async {
+    if (total <= 0) return;
+    final r = quotaAddSample(daily, last, total, DateTime.now());
+    await Store.p.setString('quota_daily', jsonEncode(r.daily));
+    await Store.p.setInt('quota_last', r.last);
+    await _alert();
+  }
+
+  static Future<void> _alert() async {
+    if (gb <= 0) return;
+    final period = dayKey(quotaPeriodStart(DateTime.now(), resetDay));
+    final saved = (Store.p.getString('quota_alert') ?? '').split(':');
+    final already = saved.length == 2 && saved[0] == period ? int.tryParse(saved[1]) ?? 0 : 0;
+    final due = quotaAlertDue(pct, already);
+    if (due == null) return;
+    await Store.p.setString('quota_alert', '$period:$due');
+    Native.notify('باقة النت: $due%', 'استهلكت ${fmtBytes(used)} من ${gb.toStringAsFixed(0)} جيجا${due >= 95 ? ' — الباقة قربت تخلص!' : ''}');
+  }
+
+  static Future<String> rearm() async {
+    if (gb <= 0) {
+      await Native4.cancelAlarm(1002);
+      return 'مفيش باقة';
+    }
+    await Native4.setAlarm(1002, DateTime.now().add(const Duration(hours: 1)), {'type': 'quota'}, exact: false);
+    return 'كل ساعة';
+  }
+
+  static Future<String> backgroundCheck() async {
+    if (gb <= 0) return 'مفيش باقة';
+    final r = await Bg.router();
+    if (r == null) return 'مقدرتش أدخل الراوتر';
+    try {
+      final st = await r.get(['monthly_tx_bytes', 'monthly_rx_bytes']);
+      final total = (int.tryParse('${st['monthly_tx_bytes']}') ?? 0) + (int.tryParse('${st['monthly_rx_bytes']}') ?? 0);
+      await sample(total);
+      // سجل الأجهزة كمان (كل ساعة)
+      try {
+        final list = await r.stations();
+        await DeviceHistory.update([for (final s in list) (key: s.mac.isEmpty ? s.ip : s.mac, name: s.hostname, ip: s.ip)]);
+      } catch (_) {}
+      return 'استهلاك ${fmtBytes(used)} (${pct.toStringAsFixed(0)}%)';
+    } finally {
+      r.close();
+    }
+  }
+}
+
+// ---------------- سجل الأجهزة ----------------
+class DevSeen {
+  String name, ip;
+  int first, last, joins;
+  DevSeen(this.name, this.ip, this.first, this.last, this.joins);
+  Map<String, dynamic> toJson() => {'n': name, 'ip': ip, 'f': first, 'l': last, 'j': joins};
+  static DevSeen fromJson(Map m) => DevSeen('${m['n'] ?? ''}', '${m['ip'] ?? ''}', (m['f'] as num).toInt(), (m['l'] as num).toInt(), (m['j'] as num?)?.toInt() ?? 1);
+}
+
+/// يحدّث السجل: جهاز جديد = أول ظهور؛ لو كان غايب أكتر من 15 دقيقة ورجع = دخلة جديدة
+Map<String, DevSeen> historyUpdate(Map<String, DevSeen> h, List<({String key, String name, String ip})> present, DateTime now, {Duration gap = const Duration(minutes: 15)}) {
+  final t = now.millisecondsSinceEpoch;
+  final out = Map<String, DevSeen>.from(h);
+  for (final p in present) {
+    if (p.key.isEmpty) continue;
+    final e = out[p.key];
+    if (e == null) {
+      out[p.key] = DevSeen(p.name, p.ip, t, t, 1);
+    } else {
+      if (t - e.last > gap.inMilliseconds) e.joins++;
+      e.last = t;
+      if (p.name.isNotEmpty) e.name = p.name;
+      if (p.ip.isNotEmpty) e.ip = p.ip;
+    }
+  }
+  return out;
+}
+
+class DeviceHistory {
+  static Map<String, DevSeen> get all {
+    try {
+      return (jsonDecode(Store.p.getString('dev_hist') ?? '{}') as Map).map((k, v) => MapEntry('$k', DevSeen.fromJson(v as Map)));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static Future<void> update(List<({String key, String name, String ip})> present) async {
+    final h = historyUpdate(all, present, DateTime.now());
+    await Store.p.setString('dev_hist', jsonEncode(h.map((k, v) => MapEntry(k, v.toJson()))));
+  }
+
+  static Future<void> clear() => Store.p.remove('dev_hist');
+}
+
+// ---------------- QR الواي فاي ----------------
+String _qrEsc(String s) => s.replaceAllMapped(RegExp(r'([\\;,:"])'), (m) => '\\${m[1]}');
+
+/// صيغة QR اللي كاميرا أي موبايل بتفهمها
+String wifiQrString(String ssid, String password, {bool hidden = false}) {
+  final t = password.isEmpty ? 'nopass' : 'WPA';
+  return 'WIFI:T:$t;S:${_qrEsc(ssid)};${password.isEmpty ? '' : 'P:${_qrEsc(password)};'}${hidden ? 'H:true;' : ''};';
+}
+
+class QrPainter extends CustomPainter {
+  final String data;
+  QrPainter(this.data);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final qr = QrImage(QrCode.fromData(data: data, errorCorrectLevel: QrErrorCorrectLevel.M));
+    final n = qr.moduleCount, quiet = 2;
+    final cell = size.width / (n + quiet * 2);
+    canvas.drawRect(Offset.zero & size, Paint()..color = Colors.white);
+    final p = Paint()..color = Colors.black;
+    for (var r = 0; r < n; r++) {
+      for (var c = 0; c < n; c++) {
+        if (qr.isDark(r, c)) canvas.drawRect(Rect.fromLTWH((c + quiet) * cell, (r + quiet) * cell, cell + 0.4, cell + 0.4), p);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(QrPainter o) => o.data != data;
+}
+
+Future<void> showWifiQr(BuildContext context, {String ssid = '', String password = ''}) async {
+  final sC = TextEditingController(text: ssid), pC = TextEditingController(text: password);
+  await showDialog(
+    context: context,
+    builder: (d) => StatefulBuilder(
+      builder: (d, ss) => AlertDialog(
+        title: const Text('شارك الواي فاي'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            if (sC.text.isNotEmpty)
+              SizedBox(width: 230, height: 230, child: CustomPaint(painter: QrPainter(wifiQrString(sC.text, pC.text)))),
+            const SizedBox(height: 8),
+            const Text('خلي الضيف يفتح الكاميرا على الكود ده', style: TextStyle(fontSize: 12, color: kMuted)),
+            TextField(controller: sC, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'اسم الشبكة'), onChanged: (_) => ss(() {})),
+            TextField(controller: pC, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'الباسورد'), onChanged: (_) => ss(() {})),
+          ]),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(d), child: const Text('تمام'))],
+      ),
+    ),
+  );
+}
+
+// ======== v4_net_ui.dart ========
+class SchedulePage extends StatefulWidget {
+  final List<({String mac, String name})> devices;
+  final ZteRouter? router;
+  const SchedulePage({super.key, required this.devices, this.router});
+  @override
+  State<SchedulePage> createState() => _SchedulePageState();
+}
+
+class _SchedulePageState extends State<SchedulePage> {
+  List<BlockRule> rules = Schedule.rules;
+  String status = '';
+
+  Future<void> _save() async {
+    await Schedule.save(rules);
+    if (widget.router != null) status = await Schedule.syncRouter(router: widget.router);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> edit([BlockRule? r]) async {
+    final isNew = r == null;
+    final devs = widget.devices.where((d) => d.mac.isNotEmpty).toList();
+    if (isNew && devs.isEmpty) {
+      toast(context, 'ادخل الراوتر الأول علشان أعرف الـ MAC بتاع الأجهزة');
+      return;
+    }
+    final x = r == null
+        ? BlockRule(id: '${DateTime.now().millisecondsSinceEpoch}', mac: devs.first.mac, name: devs.first.name, days: {1, 2, 3, 4, 5, 6, 7}, from: 0, to: 7 * 60)
+        : BlockRule.fromJson(r.toJson());
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => StatefulBuilder(
+        builder: (d, ss) => AlertDialog(
+          title: Text(isNew ? 'ميعاد حظر جديد' : 'تعديل الميعاد'),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              DropdownButtonFormField<String>(
+                isExpanded: true,
+                initialValue: devs.any((e) => e.mac == x.mac) ? x.mac : null,
+                decoration: const InputDecoration(labelText: 'الجهاز'),
+                items: [for (final e in devs) DropdownMenuItem(value: e.mac, child: Text('${e.name} (${e.mac.substring(9)})', overflow: TextOverflow.ellipsis))],
+                onChanged: (v) => ss(() {
+                  x.mac = v ?? x.mac;
+                  x.name = devs.firstWhere((e) => e.mac == x.mac).name;
+                }),
+              ),
+              const SizedBox(height: 12),
+              Row(children: [
+                Expanded(child: OutlinedButton(onPressed: () async {
+                  final t = await showTimePicker(context: d, initialTime: TimeOfDay(hour: x.from ~/ 60, minute: x.from % 60));
+                  if (t != null) ss(() => x.from = t.hour * 60 + t.minute);
+                }, child: Text('من ${fmtMin(x.from)}'))),
+                const SizedBox(width: 8),
+                Expanded(child: OutlinedButton(onPressed: () async {
+                  final t = await showTimePicker(context: d, initialTime: TimeOfDay(hour: x.to ~/ 60, minute: x.to % 60));
+                  if (t != null) ss(() => x.to = t.hour * 60 + t.minute);
+                }, child: Text('لـ ${fmtMin(x.to)}'))),
+              ]),
+              if (x.from > x.to) const Padding(padding: EdgeInsets.only(top: 4), child: Text('بيعدّي نص الليل (لحد تاني يوم)', style: TextStyle(fontSize: 11, color: kMuted))),
+              const SizedBox(height: 8),
+              Wrap(spacing: 4, children: [
+                for (var i = 1; i <= 7; i++)
+                  FilterChip(
+                    label: Text(kDayNamesAr[i - 1], style: const TextStyle(fontSize: 12)),
+                    selected: x.days.contains(i),
+                    showCheckmark: false,
+                    onSelected: (v) => ss(() => v ? x.days.add(i) : x.days.remove(i)),
+                  ),
+              ]),
+            ]),
+          ),
+          actions: [
+            if (!isNew) TextButton(onPressed: () {
+              rules.removeWhere((e) => e.id == x.id);
+              Navigator.pop(d, true);
+            }, child: const Text('امسح', style: TextStyle(color: kBad))),
+            TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('إلغاء')),
+            FilledButton(onPressed: () {
+              rules.removeWhere((e) => e.id == x.id);
+              rules.add(x);
+              Navigator.pop(d, true);
+            }, child: const Text('حفظ')),
+          ],
+        ),
+      ),
+    );
+    if (ok == true) await _save();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final next = (Store.p.getString('sched_next') ?? '').split('|');
+    return Scaffold(
+      appBar: AppBar(title: const Text('مواعيد الحظر')),
+      floatingActionButton: FloatingActionButton.extended(onPressed: () => edit(), icon: const Icon(Icons.add_alarm_rounded), label: const Text('ميعاد جديد')),
+      body: ListView(padding: const EdgeInsets.only(bottom: 90), children: [
+        const Card(
+          child: Padding(
+            padding: EdgeInsets.all(12),
+            child: Text(
+                'التطبيق هو اللي بيحظر/يفك في الميعاد (عن طريق قايمة MAC السودا في الراوتر). لازم الموبايل ده يكون على واي فاي البيت ومفتوح النت وقتها. '
+                'راوترك مفيهوش "رقابة أبوية بمواعيد" مؤكدة نقدر نستخدمها، فعلشان كده بنعملها من الموبايل.\n'
+                'انتبه: الحظر بالـ MAC — لو الموبايل التاني مفعّل "MAC عشوائي" لازم تقفله للشبكة دي.',
+                style: TextStyle(fontSize: 12, color: kMuted)),
+          ),
+        ),
+        if (status.isNotEmpty) Padding(padding: const EdgeInsets.symmetric(horizontal: 16), child: Text(status, style: const TextStyle(color: kGold))),
+        if (next.length == 2) Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+          child: Text('التغيير الجاي: ${next[0].replaceFirst('T', ' ').substring(0, 16)}${next[1] == 'inexact' ? ' (أندرويد ممكن يأخره كام دقيقة — فعّل "المنبهات والتذكيرات" للتطبيق)' : ''}', style: const TextStyle(fontSize: 12, color: kMuted)),
+        ),
+        Padding(padding: const EdgeInsets.fromLTRB(16, 4, 16, 0), child: Text('آخر شغل في الخلفية: ${Store.p.getString('bg_last') ?? '—'}', style: const TextStyle(fontSize: 11, color: kMuted))),
+        if (rules.isEmpty) const EmptyState(icon: Icons.schedule_rounded, title: 'مفيش مواعيد', hint: 'مثال: موبايل الولد يتقفل من 12 بالليل لـ 7 الصبح'),
+        for (final r in rules)
+          Card(
+            child: ListTile(
+              leading: Icon(Icons.block, color: r.activeAt(DateTime.now()) ? kBad : kMuted),
+              title: Text(r.name.isEmpty ? r.mac : r.name),
+              subtitle: Text('${fmtMin(r.from)} ← ${fmtMin(r.to)} • ${r.days.length == 7 ? 'كل يوم' : (r.days.toList()..sort()).map((d) => kDayNamesAr[d - 1]).join('، ')}${r.activeAt(DateTime.now()) ? '\nمحظور دلوقتي' : ''}'),
+              trailing: Switch(value: r.enabled, onChanged: (v) {
+                r.enabled = v;
+                _save();
+              }),
+              onTap: () => edit(r),
+            ),
+          ),
+      ]),
+    );
+  }
+}
+
+class QuotaPage extends StatefulWidget {
+  final int? routerTotal;
+  const QuotaPage({super.key, this.routerTotal});
+  @override
+  State<QuotaPage> createState() => _QuotaPageState();
+}
+
+class _QuotaPageState extends State<QuotaPage> {
+  Future<void> settings() async {
+    final gC = TextEditingController(text: Quota.gb > 0 ? Quota.gb.toStringAsFixed(0) : '');
+    final dC = TextEditingController(text: '${Quota.resetDay}');
+    final uC = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: const Text('الباقة'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            TextField(controller: gC, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'حجم الباقة (جيجا) — 0 = مفيش تنبيه')),
+            TextField(controller: dC, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'يوم التجديد في الشهر (1-31)')),
+            TextField(controller: uC, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'استهلكت كام جيجا لحد النهارده؟ (اختياري)')),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('حفظ')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await Store.p.setDouble('quota_gb', double.tryParse(gC.text.trim()) ?? 0);
+    await Store.p.setInt('quota_day', (int.tryParse(dC.text.trim()) ?? 1).clamp(1, 31));
+    final u = double.tryParse(uC.text.trim());
+    if (u != null) await Quota.setOffset((u * 1e9).round());
+    await Quota.rearm();
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final d = Quota.daily;
+    final days = List.generate(30, (i) => DateTime.now().subtract(Duration(days: 29 - i)));
+    final maxV = max(1, days.map((t) => d[dayKey(t)] ?? 0).fold(0, max));
+    final pct = Quota.pct;
+    return Scaffold(
+      appBar: AppBar(title: const Text('باقة النت'), actions: [IconButton(icon: const Icon(Icons.tune_rounded), onPressed: settings)]),
+      body: ListView(padding: const EdgeInsets.all(12), children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(Quota.gb <= 0 ? 'حدد حجم الباقة من ⚙ علشان التنبيهات' : 'استهلكت ${fmtBytes(Quota.used)} من ${Quota.gb.toStringAsFixed(0)} جيجا',
+                  style: const TextStyle(fontWeight: FontWeight.w700)),
+              const SizedBox(height: 8),
+              if (Quota.gb > 0) LinearProgressIndicator(value: (pct / 100).clamp(0, 1), minHeight: 10, color: pct >= 95 ? kBad : (pct >= 80 ? Colors.orange : kGold), borderRadius: BorderRadius.circular(6)),
+              const SizedBox(height: 6),
+              Text('من ${dayKey(quotaPeriodStart(DateTime.now(), Quota.resetDay))} • تنبيه عند 80% و 95% (بيتشيك كل ساعة تقريبًا لما الموبايل على واي فاي البيت)',
+                  style: const TextStyle(fontSize: 11, color: kMuted)),
+              if (widget.routerTotal != null) Text('عداد الراوتر للشهر: ${fmtBytes(widget.routerTotal!)}', style: const TextStyle(fontSize: 11, color: kMuted)),
+            ]),
+          ),
+        ),
+        const SectionTitle('استهلاك آخر 30 يوم', icon: Icons.bar_chart_rounded),
+        SizedBox(
+          height: 170,
+          child: Directionality(
+            textDirection: TextDirection.ltr,
+            child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+              for (final t in days)
+                Expanded(
+                  child: Tooltip(
+                    message: '${dayKey(t)}: ${fmtBytes(d[dayKey(t)] ?? 0)}',
+                    child: Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 1),
+                      height: 4 + 150 * (d[dayKey(t)] ?? 0) / maxV,
+                      decoration: BoxDecoration(color: kGold.withValues(alpha: 0.8), borderRadius: BorderRadius.circular(2)),
+                    ),
+                  ),
+                ),
+            ]),
+          ),
+        ),
+        for (final t in days.reversed.where((t) => (d[dayKey(t)] ?? 0) > 0).take(14))
+          ListTile(dense: true, title: Text(dayKey(t)), trailing: Text(fmtBytes(d[dayKey(t)] ?? 0))),
+        if (d.isEmpty) const Padding(padding: EdgeInsets.all(16), child: Text('لسه مفيش قراءات — التطبيق بيبدأ يعدّ من دلوقتي', style: TextStyle(color: kMuted))),
+      ]),
+    );
+  }
+}
+
+class HistoryPage extends StatefulWidget {
+  const HistoryPage({super.key});
+  @override
+  State<HistoryPage> createState() => _HistoryPageState();
+}
+
+class _HistoryPageState extends State<HistoryPage> {
+  String _t(int ms) {
+    final t = DateTime.fromMillisecondsSinceEpoch(ms);
+    return '${dayKey(t)} ${fmtMin(t.hour * 60 + t.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final names = Store.deviceNames;
+    final l = DeviceHistory.all.entries.toList()..sort((a, b) => b.value.last.compareTo(a.value.last));
+    return Scaffold(
+      appBar: AppBar(title: const Text('سجل الأجهزة'), actions: [
+        IconButton(icon: const Icon(Icons.delete_outline), onPressed: () async {
+          if (await confirm(context, 'تمسح السجل؟')) {
+            await DeviceHistory.clear();
+            setState(() {});
+          }
+        }),
+      ]),
+      body: l.isEmpty
+          ? const EmptyState(icon: Icons.history_rounded, title: 'السجل فاضي', hint: 'بيتملى لما تفتح تبويب الشبكة (وكل ساعة لو حددت باقة)')
+          : ListView(children: [
+              for (final e in l)
+                ListTile(
+                  leading: const Icon(Icons.devices_other, color: kGold),
+                  title: Text(names[e.key] ?? (e.value.name.isNotEmpty ? e.value.name : e.key)),
+                  subtitle: Text('أول مرة: ${_t(e.value.first)}\nآخر مرة: ${_t(e.value.last)} • ${e.value.ip} • دخل ${e.value.joins} مرة', style: const TextStyle(fontSize: 12)),
+                  isThreeLine: true,
+                ),
+            ]),
+    );
+  }
+}
+
+// ======== v4_voice.dart ========
+// أوامر صوتية للريسيفر: "افتح MBC" ، "قناة 105" ، "علي الصوت" ، "اقفل"
+
+String normAr(String s) {
+  var t = s.toLowerCase();
+  t = t.replaceAll(RegExp('[\u064B-\u0652\u0640]'), ''); // تشكيل وتطويل
+  t = t.replaceAll(RegExp('[أإآٱ]'), 'ا').replaceAll('ة', 'ه').replaceAll('ى', 'ي').replaceAll('ؤ', 'و').replaceAll('ئ', 'ي');
+  const ind = '٠١٢٣٤٥٦٧٨٩', per = '۰۱۲۳۴۵۶۷۸۹';
+  for (var i = 0; i < 10; i++) {
+    t = t.replaceAll(ind[i], '$i').replaceAll(per[i], '$i');
+  }
+  t = t.replaceAll(RegExp(r'[^\w\s\u0600-\u06FF]'), ' ');
+  return t.replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
+const Map<String, int> _numWords = {
+  'صفر': 0, 'واحد': 1, 'واحده': 1, 'اتنين': 2, 'اثنين': 2, 'اثنان': 2, 'تلاته': 3, 'ثلاثه': 3, 'تلات': 3, 'اربعه': 4, 'اربع': 4,
+  'خمسه': 5, 'خمس': 5, 'سته': 6, 'ست': 6, 'سبعه': 7, 'سبع': 7, 'تمانيه': 8, 'ثمانيه': 8, 'تمن': 8, 'تسعه': 9, 'تسع': 9, 'عشره': 10, 'عشر': 10,
+  'حداشر': 11, 'اتناشر': 12, 'تلتاشر': 13, 'اربعتاشر': 14, 'خمستاشر': 15, 'ستاشر': 16, 'سبعتاشر': 17, 'تمنتاشر': 18, 'تسعتاشر': 19,
+  'عشرين': 20, 'تلاتين': 30, 'ثلاثين': 30, 'اربعين': 40, 'خمسين': 50, 'ستين': 60, 'سبعين': 70, 'تمانين': 80, 'ثمانين': 80, 'تسعين': 90,
+  'ميه': 100, 'مائه': 100, 'مية': 100, 'ميتين': 200, 'تلتميه': 300, 'ربعميه': 400, 'خمسميه': 500, 'ستميه': 600, 'سبعميه': 700, 'تمنميه': 800, 'تسعميه': 900,
+  'الف': 1000, 'الفين': 2000,
+};
+
+/// "مية وخمسة" → 105 ، "105" → 105
+int? parseArNumber(String s) {
+  final d = RegExp(r'\d+').firstMatch(s);
+  if (d != null) return int.parse(d.group(0)!);
+  var total = 0;
+  var any = false;
+  for (var w in normAr(s).split(' ')) {
+    if (w.startsWith('و') && w.length > 2 && !_numWords.containsKey(w)) w = w.substring(1);
+    final v = _numWords[w];
+    if (v != null) {
+      total += v;
+      any = true;
+    }
+  }
+  return any ? total : null;
+}
+
+// أسماء الحروف الإنجليزي زي ما بتتنطق بالعربي ("ام بي سي" → mbc)
+const Map<String, String> _letterNames = {
+  'اي': 'a', 'ايه': 'a', 'بي': 'b', 'سي': 'c', 'دي': 'd', 'اف': 'f', 'جي': 'g', 'اتش': 'h', 'اتشي': 'h', 'جاي': 'j', 'جيه': 'j',
+  'كي': 'k', 'كيه': 'k', 'ال': 'l', 'ام': 'm', 'ان': 'n', 'او': 'o', 'كيو': 'q', 'ار': 'r', 'اس': 's', 'تي': 't', 'يو': 'u',
+  'في': 'v', 'دبليو': 'w', 'دبل': 'w', 'اكس': 'x', 'واي': 'y', 'زد': 'z', 'زي': 'z',
+};
+
+const Map<String, String> _arLatin = {
+  'ا': 'a', 'ب': 'b', 'ت': 't', 'ث': 's', 'ج': 'g', 'ح': 'h', 'خ': 'kh', 'د': 'd', 'ذ': 'z', 'ر': 'r', 'ز': 'z', 'س': 's', 'ش': 'sh',
+  'ص': 's', 'ض': 'd', 'ط': 't', 'ظ': 'z', 'ع': 'a', 'غ': 'gh', 'ف': 'f', 'ق': 'k', 'ك': 'k', 'ل': 'l', 'م': 'm', 'ن': 'n', 'ه': 'h',
+  'و': 'o', 'ي': 'i', 'ء': '',
+};
+
+/// النص العربي بالحروف اللاتيني (أسماء الحروف الأول، وبعدين نطق تقريبي)
+String arToLatin(String s) {
+  final out = <String>[];
+  for (final w in normAr(s).split(' ')) {
+    if (w.isEmpty) continue;
+    if (_letterNames.containsKey(w)) {
+      out.add(_letterNames[w]!);
+    } else if (RegExp(r'^[a-z0-9]+$').hasMatch(w)) {
+      out.add(w);
+    } else {
+      out.add(w.split('').map((c) => _arLatin[c] ?? c).join());
+    }
+  }
+  // حروف ورا بعض (m b c) تتلزق
+  return out.join(' ').replaceAllMapped(RegExp(r'\b([a-z]) (?=[a-z]\b)'), (m) => m[1]!);
+}
+
+/// الهيكل: من غير حروف العلة والمسافات (علشان "rotana" ≈ "روتانا")
+String skeleton(String s) => s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '').replaceAll('c', 'k').replaceAll('q', 'k').replaceAll('ph', 'f').replaceAll(RegExp(r'(?<!^)[aeiouy]'), '');
+
+int levenshtein(String a, String b) {
+  if (a == b) return 0;
+  if (a.isEmpty) return b.length;
+  if (b.isEmpty) return a.length;
+  var prev = List<int>.generate(b.length + 1, (i) => i);
+  for (var i = 1; i <= a.length; i++) {
+    final cur = List<int>.filled(b.length + 1, 0)..[0] = i;
+    for (var j = 1; j <= b.length; j++) {
+      cur[j] = [prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)].reduce(min);
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+double _sim(String a, String b) {
+  if (a.isEmpty || b.isEmpty) return 0;
+  if (a == b) return 1;
+  final s = 1 - levenshtein(a, b) / max(a.length, b.length);
+  final contains = (b.contains(a) || a.contains(b)) && min(a.length, b.length) >= 3 ? 0.85 : 0.0;
+  return max(s, contains);
+}
+
+/// درجة تشابه اسم القناة مع اللي اتقال
+double channelScore(String spoken, String channelName) {
+  final digitsS = RegExp(r'\d+').allMatches(normAr(spoken)).map((m) => m[0]).join(' ');
+  final digitsC = RegExp(r'\d+').allMatches(channelName).map((m) => m[0]).join(' ');
+  final a1 = normAr(spoken).replaceAll(RegExp(r'\d'), '').replaceAll(' ', ''), c1 = normAr(channelName).replaceAll(RegExp(r'\d'), '').replaceAll(' ', '');
+  final lat = arToLatin(spoken).replaceAll(RegExp(r'\d'), '');
+  var s = max(_sim(a1, c1), max(_sim(lat.replaceAll(' ', ''), c1.replaceAll(RegExp(r'[^a-z]'), '')), _sim(skeleton(lat), skeleton(channelName.replaceAll(RegExp(r'\d'), '')))));
+  if (digitsS.isNotEmpty || digitsC.isNotEmpty) s = digitsS == digitsC ? s + 0.1 : s - 0.25;
+  return s;
+}
+
+enum VoiceKind { keys, number, channel, none }
+
+class VoiceCmd {
+  final VoiceKind kind;
+  final List<int> keys;
+  final int number;
+  final StbChannel? channel;
+  final String heard;
+  const VoiceCmd(this.kind, {this.keys = const [], this.number = 0, this.channel, this.heard = ''});
+  String get describe => switch (kind) {
+        VoiceKind.keys => 'زرار',
+        VoiceKind.number => 'قناة رقم $number',
+        VoiceKind.channel => channel!.name,
+        VoiceKind.none => 'مفهمتش',
+      };
+}
+
+const _openWords = ['افتح', 'افتحلي', 'شغل', 'شغللي', 'حط', 'هات', 'روح', 'روح علي', 'حطلي', 'عايز', 'عاوز', 'قناه'];
+
+/// يفهم الأمر من اقتراحات التعرف على الكلام (أول اقتراح يتفهم بيكسب)
+VoiceCmd parseVoiceCommand(List<String> texts, List<StbChannel> channels) {
+  for (final raw in texts) {
+    final t = normAr(raw);
+    if (t.isEmpty) continue;
+    bool has(List<String> w) => w.any((x) => RegExp('(^| )${RegExp.escape(x)}( |\$)').hasMatch(t));
+    if (has(['علي الصوت', 'ارفع الصوت', 'على الصوت', 'زود الصوت', 'صوت اعلي', 'volume up'])) return VoiceCmd(VoiceKind.keys, keys: const [K.volUp, K.volUp, K.volUp], heard: raw);
+    if (has(['وطي الصوت', 'واطي الصوت', 'قلل الصوت', 'اخفض الصوت', 'نزل الصوت', 'صوت اوطي', 'volume down'])) return VoiceCmd(VoiceKind.keys, keys: const [K.volDown, K.volDown, K.volDown], heard: raw);
+    if (has(['اكتم', 'كتم', 'اسكت', 'mute', 'اقفل الصوت', 'شيل الصوت'])) return VoiceCmd(VoiceKind.keys, keys: const [K.mute], heard: raw);
+    if (has(['اقفل', 'اطفي', 'قفل', 'power', 'اقفل الريسيفر', 'اطفي الريسيفر', 'افتح الريسيفر'])) return VoiceCmd(VoiceKind.keys, keys: const [K.power], heard: raw);
+    if (has(['اللي بعدها', 'القناه اللي بعدها', 'التاليه', 'بعدها', 'next'])) return VoiceCmd(VoiceKind.keys, keys: const [K.chUp], heard: raw);
+    if (has(['اللي قبلها', 'القناه اللي قبلها', 'السابقه', 'قبلها', 'previous'])) return VoiceCmd(VoiceKind.keys, keys: const [K.chDown], heard: raw);
+    if (has(['رجوع', 'خروج', 'ارجع', 'اخرج', 'exit', 'back'])) return VoiceCmd(VoiceKind.keys, keys: const [K.exit], heard: raw);
+    if (has(['القائمه', 'القايمه', 'منيو', 'menu'])) return VoiceCmd(VoiceKind.keys, keys: const [K.menu], heard: raw);
+    if (has(['دليل', 'epg'])) return VoiceCmd(VoiceKind.keys, keys: const [K.epg], heard: raw);
+    // "قناة 105" / "رقم 105" / "105"
+    final numOnly = RegExp(r'^(قناه |رقم |القناه رقم |القناه |channel )?([\d]+)$').firstMatch(t);
+    final words = t.replaceAll(RegExp(r'^(قناه|رقم|القناه رقم|القناه|افتح|شغل)\s*'), '');
+    final wn = RegExp(r'\d').hasMatch(words) ? null : parseArNumber(words);
+    if (numOnly != null) return VoiceCmd(VoiceKind.number, number: int.parse(numOnly.group(2)!), heard: raw);
+    if (wn != null && words.split(' ').every((w) => _numWords.containsKey(w) || _numWords.containsKey(w.startsWith('و') ? w.substring(1) : w))) {
+      return VoiceCmd(VoiceKind.number, number: wn, heard: raw);
+    }
+    // اسم قناة
+    var q = t;
+    for (final w in _openWords) {
+      if (q.startsWith('$w ')) q = q.substring(w.length + 1);
+    }
+    if (q.isEmpty || channels.isEmpty) continue;
+    StbChannel? best;
+    var bestS = 0.0;
+    for (final c in channels) {
+      if (c.radio) continue;
+      final s = channelScore(q, c.name);
+      if (s > bestS) {
+        bestS = s;
+        best = c;
+      }
+    }
+    if (best != null && bestS >= 0.6) return VoiceCmd(VoiceKind.channel, channel: best, heard: raw);
+  }
+  return VoiceCmd(VoiceKind.none, heard: texts.isEmpty ? '' : texts.first);
+}
+
+/// رقم القناة بالزراير: 1 0 5 OK
+List<int> digitKeys(int n) => [...'$n'.split('').map((c) => K.digit(int.parse(c))), K.ok];
+
+// ======== v4_cast.dart ========
+// عرض صور (Slideshow) + كمّل الفيديو من مكان ما وقفت
+
+/// مكان الوقوف المحفوظ لكل فيديو (بالثواني)
+class ResumeStore {
+  static Map<String, int> get _m {
+    try {
+      return Map<String, int>.from((jsonDecode(Store.p.getString('resume_pos') ?? '{}') as Map).map((k, v) => MapEntry('$k', (v as num).toInt())));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static String keyOf(QueueItem q) => q.file?.path ?? q.url.split('?').first;
+  static int? get(String k) => _m[k];
+
+  static Future<void> put(String k, Duration pos, Duration dur) async {
+    final m = _m;
+    final v = resumeValue(pos, dur);
+    if (v == null) {
+      if (m.remove(k) == null) return;
+    } else {
+      m.remove(k);
+      m[k] = v;
+    }
+    while (m.length > 200) {
+      m.remove(m.keys.first);
+    }
+    await Store.p.setString('resume_pos', jsonEncode(m));
+  }
+}
+
+/// نحفظ بس لو الفيديو أطول من دقيقتين، وعدّى 30 ثانية، ومش فاضل أقل من 30 ثانية (يعني خلص)
+int? resumeValue(Duration pos, Duration dur) {
+  if (dur.inSeconds < 120 || pos.inSeconds < 30 || dur.inSeconds - pos.inSeconds < 30) return null;
+  return pos.inSeconds;
+}
+
+/// ترتيب الصور: عادي أو عشوائي (مع بذرة علشان الاختبارات)
+List<int> slideOrder(int n, {bool shuffle = false, int? seed}) {
+  final l = List<int>.generate(n, (i) => i);
+  if (shuffle) l.shuffle(Random(seed));
+  return l;
+}
+
+class SlideshowPage extends StatefulWidget {
+  const SlideshowPage({super.key});
+  @override
+  State<SlideshowPage> createState() => _SlideshowPageState();
+}
+
+class _SlideshowPageState extends State<SlideshowPage> {
+  final cs = CastState.I;
+  List<File> files = [];
+  List<int> order = [];
+  int at = -1;
+  int seconds = Store.p.getInt('slide_sec') ?? 6;
+  bool shuffle = Store.p.getBool('slide_shuffle') ?? false;
+  bool loop = true;
+  bool running = false;
+
+  @override
+  void dispose() {
+    _run++;
+    running = false;
+    super.dispose();
+  }
+
+  Future<void> pick() async {
+    final r = await FilePicker.pickFiles(type: FileType.image);
+    if (r.isEmpty) return;
+    final out = <File>[];
+    for (final f in r) {
+      final x = await pickedToFile(f);
+      if (x != null) out.add(x);
+    }
+    setState(() {
+      files = out;
+      order = slideOrder(files.length, shuffle: shuffle);
+      at = -1;
+    });
+  }
+
+  Future<void> show(int i) async {
+    if (files.isEmpty) return;
+    if (i >= order.length) {
+      if (!loop) {
+        stop();
+        return;
+      }
+      order = slideOrder(files.length, shuffle: shuffle);
+      i = 0;
+    }
+    if (i < 0) i = order.length - 1;
+    setState(() => at = i);
+    try {
+      await cs.showImage(files[order[i]], title: 'صورة ${i + 1}');
+    } catch (e) {
+      if (mounted) toast(context, castErrorAr(e));
+      stop();
+    }
+  }
+
+  int _run = 0;
+
+  /// لفة العرض: أول صورة بنستنى نعرف الريسيفر بيعرض صور بأنهي طريقة قبل ما نكمّل
+  Future<void> start() async {
+    if (files.isEmpty) return;
+    final my = ++_run;
+    setState(() => running = true);
+    var i = at < 0 ? 0 : at;
+    while (mounted && running && my == _run) {
+      await show(i);
+      if (!running || my != _run) return;
+      var wait = seconds;
+      if (cs.dlnaImagesOk == null) wait = max(wait, 15);
+      for (var k = 0; k < wait * 4 && running && my == _run; k++) {
+        await Future.delayed(const Duration(milliseconds: 250));
+      }
+      i = at + 1;
+      if (i >= order.length && !loop) return stop();
+    }
+  }
+
+  void stop() {
+    _run++;
+    if (mounted) setState(() => running = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('عرض صور على التلفزيون')),
+      body: ListenableBuilder(
+        listenable: cs,
+        builder: (c, _) => ListView(padding: const EdgeInsets.all(12), children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('الشاشة: ${cs.current?.name ?? (cs.gm != null ? 'الريسيفر (G-MScreen)' : 'مش متحددة — اختارها من تبويب الكاست')}'),
+                if (cs.note.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 6), child: Text(cs.note, style: const TextStyle(fontSize: 12, color: kGold))),
+                const SizedBox(height: 4),
+                const Text('الصور بتتحوّل JPEG مقاس 1920 قبل ما تتبعت (أسرع وأي ريسيفر يفتحها).', style: TextStyle(fontSize: 11, color: kMuted)),
+              ]),
+            ),
+          ),
+          FilledButton.icon(onPressed: pick, icon: const Icon(Icons.photo_library_rounded), label: Text(files.isEmpty ? 'اختار صور' : '${files.length} صورة — غيّر')),
+          const SizedBox(height: 10),
+          Row(children: [
+            const Text('كل'),
+            Expanded(
+              child: Slider(
+                value: seconds.toDouble(),
+                min: 3,
+                max: 30,
+                divisions: 27,
+                label: '$seconds ث',
+                onChanged: (v) => setState(() => seconds = v.round()),
+                onChangeEnd: (v) => Store.p.setInt('slide_sec', seconds),
+              ),
+            ),
+            Text('$seconds ثانية'),
+          ]),
+          SwitchListTile(
+            title: const Text('ترتيب عشوائي'),
+            value: shuffle,
+            onChanged: (v) {
+              setState(() {
+                shuffle = v;
+                order = slideOrder(files.length, shuffle: v);
+              });
+              Store.p.setBool('slide_shuffle', v);
+            },
+          ),
+          SwitchListTile(title: const Text('يعيد من الأول لما يخلص'), value: loop, onChanged: (v) => setState(() => loop = v)),
+          const SizedBox(height: 8),
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+              IconButton.filledTonal(icon: const Icon(Icons.skip_previous_rounded), onPressed: files.isEmpty ? null : () => show(at - 1)),
+              IconButton.filled(iconSize: 36, icon: Icon(running ? Icons.pause_rounded : Icons.play_arrow_rounded), onPressed: files.isEmpty ? null : (running ? stop : start)),
+              IconButton.filledTonal(icon: const Icon(Icons.skip_next_rounded), onPressed: files.isEmpty ? null : () => show(at + 1)),
+            ]),
+          ),
+          if (at >= 0 && files.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Column(children: [
+                Text('${at + 1} / ${files.length}', style: const TextStyle(color: kMuted)),
+                const SizedBox(height: 6),
+                ClipRRect(borderRadius: BorderRadius.circular(12), child: Image.file(files[order[at]], height: 220, fit: BoxFit.contain, cacheHeight: 440)),
+              ]),
+            ),
+        ]),
+      ),
+    );
+  }
+}
+
+// ======== v4_pc.dart ========
+// تبويب الكمبيوتر: ماوس وكيبورد + شاشة الكمبيوتر + ملفات — مع برنامج A2R-PC.exe على ويندوز
+
+const int kPcHttpPort = 47800, kPcUdpPort = 47801;
+
+class PcInfo {
+  final String host, name;
+  final int port;
+  const PcInfo(this.host, this.name, [this.port = kPcHttpPort]);
+}
+
+/// رد البرنامج على البحث: {"a2r":"pc","name":"..","port":47800}
+PcInfo? parsePcReply(String host, String text) {
+  try {
+    final m = jsonDecode(text);
+    if (m is! Map || m['a2r'] != 'pc') return null;
+    return PcInfo(host, '${m['name'] ?? host}', (m['port'] as num?)?.toInt() ?? kPcHttpPort);
+  } catch (_) {
+    return null;
+  }
+}
+
+/// حركة الماوس من التاتش: سرعة أعلى للحركة السريعة (تسارع بسيط)
+({int dx, int dy}) touchToMouse(double dx, double dy, double speed) {
+  final v = sqrt(dx * dx + dy * dy);
+  final acc = v > 18 ? 2.2 : (v > 8 ? 1.5 : 1.0);
+  return (dx: (dx * speed * acc).round(), dy: (dy * speed * acc).round());
+}
+
+/// مكان اللمسة على صورة الشاشة (BoxFit.contain) → نسبة 0..1 من شاشة الكمبيوتر، أو null لو برة الصورة
+Offset? tapToScreen(Offset p, Size box, Size img) {
+  if (img.width <= 0 || img.height <= 0) return null;
+  final s = min(box.width / img.width, box.height / img.height);
+  final w = img.width * s, h = img.height * s;
+  final ox = (box.width - w) / 2, oy = (box.height - h) / 2;
+  final x = (p.dx - ox) / w, y = (p.dy - oy) / h;
+  if (x < 0 || y < 0 || x > 1 || y > 1) return null;
+  return Offset(x, y);
+}
+
+class PcClient {
+  final String host;
+  final int port;
+  String? token;
+  final HttpClient _h = HttpClient()..connectionTimeout = const Duration(seconds: 4);
+  PcClient(this.host, {this.port = kPcHttpPort, this.token});
+
+  Uri _u(String p, [Map<String, String>? q]) => Uri(scheme: 'http', host: host, port: port, path: p, queryParameters: q);
+
+  Future<HttpClientResponse> _req(String method, String p, {Map<String, String>? q, Object? json, Duration timeout = const Duration(seconds: 8)}) async {
+    final r = await _h.openUrl(method, _u(p, q)).timeout(timeout);
+    if (token != null) r.headers.set('X-A2R-Token', token!);
+    if (json != null) {
+      final b = utf8.encode(jsonEncode(json));
+      r.headers.contentType = ContentType.json;
+      r.contentLength = b.length;
+      r.add(b);
+    }
+    return r.close().timeout(timeout);
+  }
+
+  Future<Map<String, dynamic>> _json(String method, String p, {Map<String, String>? q, Object? json}) async {
+    final res = await _req(method, p, q: q, json: json);
+    final t = await utf8.decoder.bind(res).join();
+    final m = t.isEmpty ? <String, dynamic>{} : Map<String, dynamic>.from(jsonDecode(t) as Map);
+    if (res.statusCode == 401) throw const PcAuthError();
+    if (res.statusCode >= 400) throw StateError(pcErrAr('${m['error'] ?? res.statusCode}'));
+    return m;
+  }
+
+  Future<String> pair(String code) async {
+    final m = await _json('POST', '/pair', json: {'code': code.trim(), 'device': 'A2R Home'});
+    token = '${m['token']}';
+    return '${m['name'] ?? host}';
+  }
+
+  Future<Map<String, dynamic>> info() => _json('GET', '/info');
+  Future<void> input(List<Map<String, dynamic>> cmds) => _json('POST', '/input', json: cmds);
+  Future<void> power(String a) => _json('POST', '/power', json: {'a': a, 'confirm': true});
+  Future<Map<String, dynamic>> files([String? path]) => _json('GET', '/files', q: path == null ? null : {'path': path});
+
+  Future<Uint8List?> frame({int width = 1280, int quality = 60}) async {
+    final res = await _req('GET', '/frame.jpg', q: {'w': '$width', 'q': '$quality'}, timeout: const Duration(seconds: 6));
+    if (res.statusCode == 401) throw const PcAuthError();
+    if (res.statusCode != 200) {
+      await res.drain();
+      return null;
+    }
+    final b = BytesBuilder(copy: false);
+    await for (final c in res) {
+      b.add(c);
+    }
+    return b.takeBytes();
+  }
+
+  Future<void> upload(File f, void Function(double) progress) async {
+    final len = await f.length();
+    final r = await _h.openUrl('POST', _u('/upload', {'name': f.uri.pathSegments.last}));
+    r.headers.set('X-A2R-Token', token ?? '');
+    r.contentLength = len;
+    var sent = 0;
+    await r.addStream(f.openRead().map((c) {
+      sent += c.length;
+      progress(sent / max(1, len));
+      return c;
+    }));
+    final res = await r.close();
+    final t = await utf8.decoder.bind(res).join();
+    if (res.statusCode == 401) throw const PcAuthError();
+    if (res.statusCode != 200) throw StateError('الرفع فشل: $t');
+  }
+
+  Future<File> download(String path, String name, void Function(double) progress) async {
+    final res = await _req('GET', '/file', q: {'path': path}, timeout: const Duration(seconds: 20));
+    if (res.statusCode != 200) {
+      await res.drain();
+      throw StateError('مقدرتش أنزّل الملف');
+    }
+    final dir = Directory('${(await getExternalStorageDirectory() ?? await getTemporaryDirectory()).path}/A2R-PC');
+    await dir.create(recursive: true);
+    final out = File('${dir.path}/${name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')}');
+    final sink = out.openWrite();
+    var got = 0;
+    final total = res.contentLength;
+    await for (final c in res) {
+      sink.add(c);
+      got += c.length;
+      if (total > 0) progress(got / total);
+    }
+    await sink.close();
+    return out;
+  }
+
+  void close() => _h.close(force: true);
+
+  /// يدوّر على الكمبيوتر في الشبكة (broadcast)
+  static Future<List<PcInfo>> discover({Duration wait = const Duration(seconds: 3)}) async {
+    final out = <String, PcInfo>{};
+    await Native.multicastLock(true);
+    RawDatagramSocket? s;
+    try {
+      s = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      s.broadcastEnabled = true;
+      s.listen((e) {
+        if (e != RawSocketEvent.read) return;
+        final d = s!.receive();
+        if (d == null) return;
+        final p = parsePcReply(d.address.address, utf8.decode(d.data, allowMalformed: true));
+        if (p != null) out[p.host] = p;
+      });
+      final msg = utf8.encode('A2R-PC?');
+      for (var i = 0; i < 3; i++) {
+        s.send(msg, InternetAddress('255.255.255.255'), kPcUdpPort);
+        await Future.delayed(wait ~/ 3);
+      }
+    } catch (e) {
+      AppLog.add('PC', 'discover $e');
+    } finally {
+      s?.close();
+      await Native.multicastLock(false);
+    }
+    return out.values.toList();
+  }
+}
+
+class PcAuthError implements Exception {
+  const PcAuthError();
+  @override
+  String toString() => 'الكمبيوتر لغى الربط — اربط تاني بالكود';
+}
+
+String pcErrAr(String e) {
+  if (e == 'bad_code') return 'الكود غلط';
+  if (e.startsWith('locked')) return 'محاولات غلط كتير — استنى دقيقة (الكود هيتغير)';
+  if (e == 'not_lan') return 'لازم تكون على نفس الشبكة';
+  if (e == 'outside_home') return 'الفولدر ده برة ملفات المستخدم';
+  return e;
+}
+
+class PcSaved {
+  static ({String host, String name, String token})? get() {
+    final s = Store.p.getString('pc_saved');
+    if (s == null) return null;
+    try {
+      final m = jsonDecode(s) as Map;
+      return (host: '${m['h']}', name: '${m['n']}', token: '${m['t']}');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> put(String host, String name, String token) => Store.p.setString('pc_saved', jsonEncode({'h': host, 'n': name, 't': token}));
+  static Future<void> clear() => Store.p.remove('pc_saved');
+}
+
+class PcPage extends StatefulWidget {
+  const PcPage({super.key});
+  @override
+  State<PcPage> createState() => _PcPageState();
+}
+
+class _PcPageState extends State<PcPage> with AutomaticKeepAliveClientMixin {
+  PcClient? pc;
+  String name = '';
+  String msg = '';
+  bool busy = false;
+  List<PcInfo> found = [];
+  int view = 0; // 0 ماوس/كيبورد ، 1 الشاشة ، 2 الملفات
+
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  void initState() {
+    super.initState();
+    final s = PcSaved.get();
+    if (s != null) {
+      pc = PcClient(s.host, token: s.token);
+      name = s.name;
+      _check();
+    }
+  }
+
+  @override
+  void dispose() {
+    pc?.close();
+    super.dispose();
+  }
+
+  Future<void> _check() async {
+    try {
+      final i = await pc!.info();
+      setState(() => msg = '${i['name']} • ${pc!.host}');
+    } on PcAuthError {
+      await PcSaved.clear();
+      setState(() {
+        pc = null;
+        msg = 'الكمبيوتر لغى الربط — اربط تاني';
+      });
+    } catch (e) {
+      setState(() => msg = 'الكمبيوتر مش بيرد — شغّل A2R PC عليه (${pc!.host})');
+    }
+  }
+
+  Future<void> discover() async {
+    setState(() {
+      busy = true;
+      msg = 'بدوّر على الكمبيوتر…';
+    });
+    found = await PcClient.discover();
+    setState(() {
+      busy = false;
+      msg = found.isEmpty ? 'ملقتش — اتأكد إن A2R PC شغال وإن الكمبيوتر على نفس الواي فاي (أو اكتب العنوان اللي ظاهر في الشباك)' : 'دوس على الكمبيوتر واكتب الكود';
+    });
+  }
+
+  Future<void> pairWith(String host) async {
+    final code = await askText(context, 'كود الربط (6 أرقام ظاهرين على الكمبيوتر)', type: TextInputType.number);
+    if (code == null || code.trim().isEmpty) return;
+    final c = PcClient(host);
+    setState(() => busy = true);
+    try {
+      final n = await c.pair(code);
+      await PcSaved.put(host, n, c.token!);
+      pc?.close();
+      setState(() {
+        pc = c;
+        name = n;
+        msg = '$n • $host';
+        found = [];
+      });
+      AppLog.add('PC', 'paired $host');
+    } catch (e) {
+      c.close();
+      if (mounted) toast(context, '$e'.replaceFirst('Bad state: ', ''));
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  Future<void> manual() async {
+    final ip = await askText(context, 'عنوان الكمبيوتر', hint: '192.168.x.x', type: TextInputType.number);
+    if (ip != null && ip.trim().isNotEmpty) await pairWith(ip.trim());
+  }
+
+  Future<void> unpair() async {
+    if (!await confirm(context, 'تلغي الربط مع $name؟')) return;
+    await PcSaved.clear();
+    pc?.close();
+    setState(() {
+      pc = null;
+      msg = '';
+    });
+  }
+
+  void onErr(Object e) {
+    if (e is PcAuthError) {
+      PcSaved.clear();
+      setState(() => pc = null);
+    }
+    if (mounted) toast(context, '$e'.replaceFirst('Bad state: ', ''));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    if (pc == null) return _pairView();
+    return Column(children: [
+      Card(
+        margin: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+        child: ListTile(
+          leading: const Icon(Icons.desktop_windows_rounded, color: kGold),
+          title: Text(name),
+          subtitle: Text(msg.isEmpty ? pc!.host : msg, style: const TextStyle(fontSize: 12, color: kMuted)),
+          trailing: PopupMenuButton<String>(
+            onSelected: (v) {
+              if (v == 'check') _check();
+              if (v == 'unpair') unpair();
+            },
+            itemBuilder: (c) => const [
+              PopupMenuItem(value: 'check', child: Text('اتأكد من الاتصال')),
+              PopupMenuItem(value: 'unpair', child: Text('الغي الربط')),
+            ],
+          ),
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: SegmentedButton<int>(
+          segments: const [
+            ButtonSegment(value: 0, icon: Icon(Icons.mouse_rounded), label: Text('ماوس')),
+            ButtonSegment(value: 1, icon: Icon(Icons.screenshot_monitor_rounded), label: Text('الشاشة')),
+            ButtonSegment(value: 2, icon: Icon(Icons.folder_rounded), label: Text('ملفات')),
+          ],
+          selected: {view},
+          onSelectionChanged: (s) => setState(() => view = s.first),
+        ),
+      ),
+      const SizedBox(height: 6),
+      Expanded(
+        child: switch (view) {
+          0 => PcMousePad(pc: pc!, onErr: onErr),
+          1 => PcScreenView(pc: pc!, onErr: onErr),
+          _ => PcFilesView(pc: pc!, onErr: onErr),
+        },
+      ),
+    ]);
+  }
+
+  Widget _pairView() {
+    return ListView(padding: const EdgeInsets.all(12), children: [
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('تحكم في الكمبيوتر من الموبايل', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+            const SizedBox(height: 6),
+            const Text(
+                '1) نزّل A2R-PC.exe على الكمبيوتر (من صفحة Releases في GitHub) وشغّله.\n'
+                '2) لو ويندوز سأل عن الجدار الناري (Firewall) اختار "Private networks" ووافق.\n'
+                '3) الكمبيوتر والموبايل على نفس الراوتر — دوّر واكتب الكود اللي ظاهر في الشباك.',
+                style: TextStyle(fontSize: 13, color: kMuted, height: 1.6)),
+            const SizedBox(height: 10),
+            Row(children: [
+              FilledButton.icon(onPressed: busy ? null : discover, icon: const Icon(Icons.search_rounded), label: const Text('دوّر')),
+              const SizedBox(width: 8),
+              OutlinedButton.icon(onPressed: busy ? null : manual, icon: const Icon(Icons.edit_rounded), label: const Text('عنوان يدوي')),
+            ]),
+          ]),
+        ),
+      ),
+      if (busy) const LinearProgressIndicator(),
+      if (msg.isNotEmpty) Padding(padding: const EdgeInsets.all(8), child: Text(msg, style: const TextStyle(color: kMuted))),
+      for (final p in found)
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.desktop_windows_rounded, color: kGold),
+            title: Text(p.name),
+            subtitle: Text(p.host),
+            trailing: const Icon(Icons.link_rounded),
+            onTap: () => pairWith(p.host),
+          ),
+        ),
+    ]);
+  }
+}
+
+/// بيجمع حركات الماوس ويبعتها كل 35ms (بدل طلب لكل حركة)
+class _InputBatcher {
+  final PcClient pc;
+  final void Function(Object) onErr;
+  double _dx = 0, _dy = 0, _sc = 0;
+  final List<Map<String, dynamic>> _q = [];
+  Timer? _t;
+  bool _sending = false;
+  _InputBatcher(this.pc, this.onErr);
+
+  void move(double dx, double dy) {
+    _dx += dx;
+    _dy += dy;
+    _kick();
+  }
+
+  void scroll(double dy) {
+    _sc += dy;
+    _kick();
+  }
+
+  void cmd(Map<String, dynamic> c) {
+    _flushMove();
+    _q.add(c);
+    _kick();
+  }
+
+  void _flushMove() {
+    if (_dx.abs() >= 1 || _dy.abs() >= 1) {
+      _q.add({'t': 'move', 'dx': _dx.round(), 'dy': _dy.round()});
+      _dx = _dy = 0;
+    }
+    if (_sc.abs() >= 1) {
+      _q.add({'t': 'scroll', 'dy': _sc.round().clamp(-50, 50)});
+      _sc = 0;
+    }
+  }
+
+  void _kick() => _t ??= Timer(const Duration(milliseconds: 35), _send);
+
+  Future<void> _send() async {
+    _t = null;
+    if (_sending) return _kick();
+    _flushMove();
+    if (_q.isEmpty) return;
+    final batch = List<Map<String, dynamic>>.from(_q);
+    _q.clear();
+    _sending = true;
+    try {
+      await pc.input(batch);
+    } catch (e) {
+      onErr(e);
+    } finally {
+      _sending = false;
+    }
+  }
+
+  void dispose() => _t?.cancel();
+}
+
+class PcMousePad extends StatefulWidget {
+  final PcClient pc;
+  final void Function(Object) onErr;
+  const PcMousePad({super.key, required this.pc, required this.onErr});
+  @override
+  State<PcMousePad> createState() => _PcMousePadState();
+}
+
+class _PcMousePadState extends State<PcMousePad> {
+  late final _InputBatcher b = _InputBatcher(widget.pc, widget.onErr);
+  final txt = TextEditingController();
+  double speed = Store.p.getDouble('pc_speed') ?? 1.6;
+  bool dragging = false;
+  int _fingers = 0;
+  Offset _lp = Offset.zero;
+
+  @override
+  void dispose() {
+    b.dispose();
+    txt.dispose();
+    super.dispose();
+  }
+
+  void key(String k, [List<String> mods = const []]) {
+    HapticFeedback.selectionClick();
+    b.cmd({'t': 'key', 'k': k, 'mods': mods});
+  }
+
+  Future<void> power(String a, String label) async {
+    if (a != 'lock' && !await confirm(context, '$label الكمبيوتر؟')) return;
+    try {
+      await widget.pc.power(a);
+      if (mounted) toast(context, a == 'shutdown' || a == 'restart' ? '$label خلال 5 ثواني (إلغاء ← من القايمة)' : '$label ✓');
+    } catch (e) {
+      widget.onErr(e);
+    }
+  }
+
+  Widget _k(String label, VoidCallback f, {IconData? icon}) => Padding(
+        padding: const EdgeInsets.all(3),
+        child: ActionChip(avatar: icon == null ? null : Icon(icon, size: 16), label: Text(label, style: const TextStyle(fontSize: 12)), onPressed: f),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(padding: const EdgeInsets.fromLTRB(12, 0, 12, 12), children: [
+      SizedBox(
+        height: 300,
+        child: Row(children: [
+          Expanded(
+            child: Listener(
+              onPointerDown: (_) => _fingers++,
+              onPointerUp: (_) => _fingers = max(0, _fingers - 1),
+              onPointerCancel: (_) => _fingers = max(0, _fingers - 1),
+              child: GestureDetector(
+                onTap: () {
+                  HapticFeedback.lightImpact();
+                  b.cmd({'t': 'click', 'b': 'left'});
+                },
+                onDoubleTap: () => b.cmd({'t': 'click', 'b': 'left', 'n': 2}),
+                onLongPressStart: (_) {
+                  _lp = Offset.zero;
+                  HapticFeedback.heavyImpact();
+                  setState(() => dragging = true);
+                  b.cmd({'t': 'down', 'b': 'left'});
+                },
+                onLongPressMoveUpdate: (d) {
+                  final delta = d.offsetFromOrigin - _lp;
+                  _lp = d.offsetFromOrigin;
+                  final m = touchToMouse(delta.dx, delta.dy, speed);
+                  b.move(m.dx.toDouble(), m.dy.toDouble());
+                },
+                onLongPressEnd: (_) {
+                  setState(() => dragging = false);
+                  b.cmd({'t': 'up', 'b': 'left'});
+                },
+                onPanUpdate: (d) {
+                  if (_fingers >= 2) {
+                    b.scroll(d.delta.dy / 6);
+                    return;
+                  }
+                  final m = touchToMouse(d.delta.dx, d.delta.dy, speed);
+                  b.move(m.dx.toDouble(), m.dy.toDouble());
+                },
+                child: Container(
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(colors: [Color(0xFF1E222A), Color(0xFF14171D)], begin: Alignment.topCenter, end: Alignment.bottomCenter),
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(color: dragging ? kGold : kLine),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(dragging ? 'بتسحب… ارفع صباعك علشان تسيب' : 'حرّك صباعك = ماوس\nدوسة = كليك • دوستين = دبل كليك\nضغطة طويلة = سحب • صباعين = سكرول',
+                      textAlign: TextAlign.center, style: const TextStyle(color: kMuted, fontSize: 12, height: 1.7)),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          // شريط السكرول
+          GestureDetector(
+            onVerticalDragUpdate: (d) => b.scroll(d.delta.dy / 4),
+            child: Container(
+              width: 44,
+              decoration: BoxDecoration(color: kSurface, borderRadius: BorderRadius.circular(18), border: Border.all(color: kLine)),
+              child: const Column(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                Padding(padding: EdgeInsets.all(6), child: Icon(Icons.keyboard_arrow_up_rounded, color: kMuted)),
+                Icon(Icons.unfold_more_rounded, color: kGold),
+                Padding(padding: EdgeInsets.all(6), child: Icon(Icons.keyboard_arrow_down_rounded, color: kMuted)),
+              ]),
+            ),
+          ),
+        ]),
+      ),
+      const SizedBox(height: 8),
+      Row(children: [
+        Expanded(child: FilledButton.tonal(onPressed: () => b.cmd({'t': 'click', 'b': 'left'}), child: const Text('كليك شمال'))),
+        const SizedBox(width: 8),
+        Expanded(child: FilledButton.tonal(onPressed: () => b.cmd({'t': 'click', 'b': 'right'}), child: const Text('كليك يمين'))),
+      ]),
+      Row(children: [
+        const Text('السرعة', style: TextStyle(color: kMuted, fontSize: 12)),
+        Expanded(
+          child: Slider(value: speed, min: 0.6, max: 4, onChanged: (v) => setState(() => speed = v), onChangeEnd: (v) => Store.p.setDouble('pc_speed', v)),
+        ),
+      ]),
+      TextField(
+        controller: txt,
+        decoration: InputDecoration(
+          labelText: 'اكتب على الكمبيوتر (عربي أو إنجليزي)',
+          suffixIcon: IconButton(
+            icon: const Icon(Icons.send_rounded, color: kGold),
+            onPressed: () {
+              if (txt.text.isEmpty) return;
+              b.cmd({'t': 'text', 's': txt.text});
+              txt.clear();
+            },
+          ),
+        ),
+        onSubmitted: (v) {
+          if (v.isNotEmpty) b.cmd({'t': 'text', 's': v});
+          b.cmd({'t': 'key', 'k': 'enter', 'mods': <String>[]});
+          txt.clear();
+        },
+      ),
+      const SizedBox(height: 6),
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: Wrap(children: [
+          _k('Enter', () => key('enter')),
+          _k('⌫', () => key('backspace')),
+          _k('Esc', () => key('esc')),
+          _k('Tab', () => key('tab')),
+          _k('←', () => key('left')),
+          _k('↑', () => key('up')),
+          _k('↓', () => key('down')),
+          _k('→', () => key('right')),
+          _k('Win', () => key('win')),
+          _k('Alt+Tab', () => key('tab', ['alt'])),
+          _k('Ctrl+C', () => key('c', ['ctrl'])),
+          _k('Ctrl+V', () => key('v', ['ctrl'])),
+          _k('Ctrl+Z', () => key('z', ['ctrl'])),
+          _k('Space', () => key('space')),
+          _k('F5', () => key('f5')),
+          _k('F11', () => key('f11')),
+          _k('Alt+F4', () => key('f4', ['alt'])),
+        ]),
+      ),
+      const SectionTitle('صوت وميديا', icon: Icons.music_note_rounded),
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+          for (final e in const [
+            ('prev', Icons.skip_previous_rounded),
+            ('play', Icons.play_arrow_rounded),
+            ('next', Icons.skip_next_rounded),
+            ('voldown', Icons.volume_down_rounded),
+            ('volup', Icons.volume_up_rounded),
+            ('mute', Icons.volume_off_rounded),
+          ])
+            IconButton.filledTonal(icon: Icon(e.$2), onPressed: () => b.cmd({'t': 'media', 'k': e.$1})),
+        ]),
+      ),
+      const SectionTitle('الكمبيوتر', icon: Icons.power_settings_new_rounded),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        OutlinedButton.icon(onPressed: () => power('lock', 'قفل'), icon: const Icon(Icons.lock_rounded), label: const Text('قفل')),
+        OutlinedButton.icon(onPressed: () => power('sleep', 'نوّم'), icon: const Icon(Icons.bedtime_rounded), label: const Text('سليب')),
+        OutlinedButton.icon(onPressed: () => power('restart', 'ريستارت'), icon: const Icon(Icons.restart_alt_rounded), label: const Text('ريستارت')),
+        OutlinedButton.icon(
+          onPressed: () => power('shutdown', 'اطفي'),
+          icon: const Icon(Icons.power_settings_new_rounded, color: kBad),
+          label: const Text('اطفي', style: TextStyle(color: kBad)),
+        ),
+        TextButton(onPressed: () => widget.pc.power('cancel').catchError(widget.onErr), child: const Text('إلغاء الإطفاء')),
+      ]),
+    ]);
+  }
+}
+
+class PcScreenView extends StatefulWidget {
+  final PcClient pc;
+  final void Function(Object) onErr;
+  const PcScreenView({super.key, required this.pc, required this.onErr});
+  @override
+  State<PcScreenView> createState() => _PcScreenViewState();
+}
+
+class _PcScreenViewState extends State<PcScreenView> {
+  Uint8List? img;
+  Size imgSize = Size.zero;
+  bool running = true, control = true;
+  int quality = Store.p.getInt('pc_q') ?? 55;
+  int width = Store.p.getInt('pc_w') ?? 1280;
+  int fps = 0, _frames = 0;
+  DateTime _t0 = DateTime.now();
+  int _gen = 0;
+  late final _InputBatcher b = _InputBatcher(widget.pc, widget.onErr);
+  final tc = TransformationController();
+
+  @override
+  void initState() {
+    super.initState();
+    _loop();
+  }
+
+  @override
+  void dispose() {
+    _gen++;
+    b.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loop() async {
+    final my = ++_gen;
+    var fails = 0;
+    while (mounted && running && my == _gen) {
+      try {
+        final f = await widget.pc.frame(width: width, quality: quality);
+        if (f != null && mounted) {
+          if (imgSize == Size.zero || _frames % 30 == 0) {
+            final im = await decodeImageFromList(f);
+            imgSize = Size(im.width.toDouble(), im.height.toDouble());
+            im.dispose();
+          }
+          _frames++;
+          final el = DateTime.now().difference(_t0).inMilliseconds;
+          if (el > 1000) {
+            fps = (_frames * 1000 / el).round();
+            _frames = 0;
+            _t0 = DateTime.now();
+          }
+          setState(() => img = f);
+          fails = 0;
+        }
+      } catch (e) {
+        fails++;
+        if (e is PcAuthError || fails >= 5) {
+          widget.onErr(e);
+          if (mounted) setState(() => running = false);
+          return;
+        }
+        await Future.delayed(const Duration(milliseconds: 600));
+      }
+    }
+  }
+
+  void _at(Offset local, Size box, Map<String, dynamic> then) {
+    final p = tapToScreen(local, box, imgSize);
+    if (p == null) return;
+    b.cmd({'t': 'abs', 'x': p.dx, 'y': p.dy});
+    b.cmd(then);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: Row(children: [
+          IconButton(
+            icon: Icon(running ? Icons.pause_rounded : Icons.play_arrow_rounded, color: kGold),
+            onPressed: () {
+              setState(() => running = !running);
+              if (running) _loop();
+            },
+          ),
+          Expanded(
+            child: DropdownButton<int>(
+              isExpanded: true,
+              value: quality <= 40 ? 35 : (quality <= 60 ? 55 : 80),
+              items: const [
+                DropdownMenuItem(value: 35, child: Text('جودة واطية (أسرع)')),
+                DropdownMenuItem(value: 55, child: Text('جودة متوسطة')),
+                DropdownMenuItem(value: 80, child: Text('جودة عالية')),
+              ],
+              onChanged: (v) {
+                setState(() {
+                  quality = v!;
+                  width = v == 35 ? 960 : (v == 55 ? 1280 : 1920);
+                });
+                Store.p.setInt('pc_q', quality);
+                Store.p.setInt('pc_w', width);
+              },
+            ),
+          ),
+          Text('$fps fps', style: const TextStyle(fontSize: 11, color: kMuted)),
+          IconButton(
+            tooltip: control ? 'تحكم (دوس = كليك)' : 'تكبير/تحريك بس',
+            icon: Icon(control ? Icons.touch_app_rounded : Icons.zoom_in_rounded, color: control ? kGold : kMuted),
+            onPressed: () => setState(() => control = !control),
+          ),
+        ]),
+      ),
+      Expanded(
+        child: img == null
+            ? Center(child: running ? const CircularProgressIndicator() : const Text('متوقف', style: TextStyle(color: kMuted)))
+            : LayoutBuilder(
+                builder: (c, cons) {
+                  final box = Size(cons.maxWidth, cons.maxHeight);
+                  return InteractiveViewer(
+                    transformationController: tc,
+                    maxScale: 5,
+                    panEnabled: !control,
+                    child: GestureDetector(
+                      onTapUp: control ? (d) => _at(d.localPosition, box, {'t': 'click', 'b': 'left'}) : null,
+                      onDoubleTapDown: control ? (d) => _at(d.localPosition, box, {'t': 'click', 'b': 'left', 'n': 2}) : null,
+                      onDoubleTap: control ? () {} : null,
+                      onLongPressStart: control ? (d) => _at(d.localPosition, box, {'t': 'click', 'b': 'right'}) : null,
+                      onPanStart: control ? (d) => _at(d.localPosition, box, {'t': 'down', 'b': 'left'}) : null,
+                      onPanUpdate: control
+                          ? (d) {
+                              final p = tapToScreen(d.localPosition, box, imgSize);
+                              if (p != null) b.cmd({'t': 'abs', 'x': p.dx, 'y': p.dy});
+                            }
+                          : null,
+                      onPanEnd: control ? (_) => b.cmd({'t': 'up', 'b': 'left'}) : null,
+                      child: SizedBox(width: box.width, height: box.height, child: Image.memory(img!, fit: BoxFit.contain, gaplessPlayback: true)),
+                    ),
+                  );
+                },
+              ),
+      ),
+      const Padding(
+        padding: EdgeInsets.all(6),
+        child: Text('دوسة = كليك • دوستين = دبل كليك • ضغطة طويلة = كليك يمين • اسحب = سحب • لتكبير الصورة اقفل وضع التحكم', style: TextStyle(fontSize: 11, color: kMuted)),
+      ),
+    ]);
+  }
+}
+
+class PcFilesView extends StatefulWidget {
+  final PcClient pc;
+  final void Function(Object) onErr;
+  const PcFilesView({super.key, required this.pc, required this.onErr});
+  @override
+  State<PcFilesView> createState() => _PcFilesViewState();
+}
+
+class _PcFilesViewState extends State<PcFilesView> {
+  String? path, up;
+  List<Map<String, dynamic>> items = [];
+  bool loading = false;
+  String progress = '';
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load([String? p]) async {
+    setState(() => loading = true);
+    try {
+      final r = await widget.pc.files(p);
+      path = '${r['path']}';
+      up = r['up'] == null ? null : '${r['up']}';
+      items = List<Map<String, dynamic>>.from((r['items'] as List).map((e) => Map<String, dynamic>.from(e as Map)));
+    } catch (e) {
+      widget.onErr(e);
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  String _join(String dir, String n) => dir.endsWith('\\') || dir.endsWith('/') ? '$dir$n' : '$dir${dir.contains('\\') ? '\\' : '/'}$n';
+
+  Future<void> send() async {
+    final r = await FilePicker.pickFiles();
+    if (r.isEmpty) return;
+    for (final f in r) {
+      final file = await pickedToFile(f);
+      if (file == null) continue;
+      try {
+        await widget.pc.upload(file, (p) {
+          if (mounted) setState(() => progress = '${f.name}: ${(p * 100).toStringAsFixed(0)}%');
+        });
+        AppLog.add('PC', 'upload ${f.name} ${fmtBytes(await file.length())}');
+      } catch (e) {
+        widget.onErr(e);
+        break;
+      }
+    }
+    if (mounted) {
+      setState(() => progress = 'اتبعتوا لـ Downloads\\A2R على الكمبيوتر ✓');
+      load(path);
+    }
+  }
+
+  Future<void> get(Map<String, dynamic> it) async {
+    try {
+      final f = await widget.pc.download(_join(path!, '${it['n']}'), '${it['n']}', (p) {
+        if (mounted) setState(() => progress = '${it['n']}: ${(p * 100).toStringAsFixed(0)}%');
+      });
+      if (!mounted) return;
+      setState(() => progress = 'اتنزل ✓');
+      await SharePlus.instance.share(ShareParams(files: [XFile(f.path)]));
+    } catch (e) {
+      widget.onErr(e);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        child: Row(children: [
+          FilledButton.icon(onPressed: send, icon: const Icon(Icons.upload_rounded), label: const Text('ابعت للكمبيوتر')),
+          const SizedBox(width: 8),
+          IconButton(onPressed: up == null ? null : () => load(up), icon: const Icon(Icons.arrow_upward_rounded)),
+          IconButton(onPressed: () => load(), icon: const Icon(Icons.home_rounded), tooltip: 'Downloads\\A2R'),
+          IconButton(onPressed: () => load(path), icon: const Icon(Icons.refresh_rounded)),
+        ]),
+      ),
+      if (progress.isNotEmpty) Padding(padding: const EdgeInsets.all(4), child: Text(progress, style: const TextStyle(fontSize: 12, color: kGold))),
+      if (path != null) Padding(padding: const EdgeInsets.symmetric(horizontal: 12), child: Text(path!, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 11, color: kMuted))),
+      if (loading) const LinearProgressIndicator(),
+      Expanded(
+        child: items.isEmpty
+            ? const EmptyState(icon: Icons.folder_open_rounded, title: 'الفولدر فاضي', hint: 'اللي بتبعته من الموبايل بيتحفظ هنا')
+            : ListView(children: [
+                for (final it in items)
+                  ListTile(
+                    leading: Icon(it['d'] == true ? Icons.folder_rounded : Icons.insert_drive_file_outlined, color: it['d'] == true ? kGold : kMuted),
+                    title: Text('${it['n']}', textDirection: TextDirection.ltr),
+                    subtitle: it['d'] == true ? null : Text(fmtBytes((it['s'] as num?) ?? 0)),
+                    trailing: it['d'] == true ? null : const Icon(Icons.download_rounded),
+                    onTap: () => it['d'] == true ? load(_join(path!, '${it['n']}')) : get(it),
+                  ),
+              ]),
+      ),
+    ]);
   }
 }
