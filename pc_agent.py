@@ -24,7 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, quote
 
-VERSION = "1.2"
+VERSION = "1.3"
 HTTP_PORT = 47800
 UDP_PORT = 47801
 IS_WIN = sys.platform == "win32"
@@ -135,6 +135,7 @@ class Pairing:
 
 
 DISCOVER_MAGIC = b"A2R-PC?"
+SHOW_MAGIC = b"A2R-PC-SHOW"
 
 
 def discovery_reply(name, port=HTTP_PORT):
@@ -150,7 +151,10 @@ def parse_input(d):
     if t == "move":
         return {"t": t, "dx": int(num("dx", -5000, 5000)), "dy": int(num("dy", -5000, 5000))}
     if t == "abs":
-        return {"t": t, "x": num("x", 0, 1), "y": num("y", 0, 1)}
+        r = {"t": t, "x": num("x", 0, 1), "y": num("y", 0, 1)}
+        if d.get("m") is not None:
+            r["m"] = int(num("m", 1, 16, 1))  # رقم الشاشة (v1.3)؛ من غيره = الشاشة الأساسية
+        return r
     if t in ("click", "down", "up"):
         b = d.get("b", "left")
         if b not in ("left", "right", "middle"):
@@ -163,7 +167,10 @@ def parse_input(d):
         return {"t": t, "s": s}
     if t == "key":
         k = str(d.get("k", "")).lower()
-        if k not in VK and not (len(k) == 1 and k.isalnum()):
+        if len(k) == 1 and not k.isascii() and k.isprintable():
+            # حرف عربي (أو أي حرف مش إنجليزي): مالوش زرار VK — بنكتبه كنص يونيكود
+            return {"t": "text", "s": k}
+        if k not in VK and not (len(k) == 1 and k.isascii() and k.isalnum()):
             raise ValueError("key")
         mods = [m for m in d.get("mods", []) if m in ("ctrl", "alt", "shift", "win")]
         return {"t": t, "k": k, "mods": mods}
@@ -173,6 +180,47 @@ def parse_input(d):
             raise ValueError("media")
         return {"t": t, "k": k}
     raise ValueError("type")
+
+
+def abs_to_virtual(x, y, mon, vs):
+    """نسبة 0..1 جوه شاشة معيّنة → إحداثيات SendInput المطلقة (0..65535) على سطح المكتب الافتراضي كله.
+    mon و vs = (left, top, width, height) بالبكسل الحقيقي."""
+    ml, mt, mw, mh = mon
+    vl, vt, vw, vh = vs
+    px = ml + x * (mw - 1)
+    py = mt + y * (mh - 1)
+    nx = int(round((px - vl) * 65535.0 / max(1, vw - 1)))
+    ny = int(round((py - vt) * 65535.0 / max(1, vh - 1)))
+    return max(0, min(65535, nx)), max(0, min(65535, ny)), int(round(px)), int(round(py))
+
+
+def pick_monitor(mons, m=None):
+    """mons = قايمة {"i","x","y","w","h","primary"}. m = رقم الشاشة (1..)؛ من غيره = الأساسية."""
+    if not mons:
+        return None
+    if m is not None:
+        for d in mons:
+            if d["i"] == m:
+                return d
+    for d in mons:
+        if d.get("primary"):
+            return d
+    return mons[0]
+
+
+def mons_from_mss(raw):
+    """mss.monitors (أول عنصر = كل الشاشات) → قايمة شاشات؛ الأساسية هي اللي عند (0,0)."""
+    out = []
+    for i, d in enumerate(raw[1:], start=1):
+        out.append({"i": i, "x": d["left"], "y": d["top"], "w": d["width"], "h": d["height"],
+                    "primary": d["left"] == 0 and d["top"] == 0})
+    if out and not any(d["primary"] for d in out):
+        out[0]["primary"] = True
+    return out
+
+
+class InputBlocked(Exception):
+    """ويندوز رفض الإدخال (شباك أدمن / شاشة القفل / UAC)."""
 
 
 VK = {
@@ -219,6 +267,21 @@ def validate_open_url(u):
     if pu.scheme not in ("http", "https") or not pu.netloc:
         raise ValueError("only_http")
     return u
+
+
+def run_shutdown(args, cancel_only=False, runner=None):
+    """أوامر shutdown.exe: بنلغي أي إطفاء متجدول الأول (لو في واحد ويندوز بيرفض الجديد — خطأ 1190)
+    وبنتأكد إن الأمر اتقبل. cancel_only: إلغاء بس (1116 = مفيش حاجة متجدولة = تمام)."""
+    run = runner or (lambda a: subprocess.run(["shutdown"] + a, capture_output=True, timeout=15,
+                                              creationflags=0x08000000 if IS_WIN else 0).returncode)
+    rc = run(["/a"])
+    if cancel_only:
+        if rc not in (0, 1116):
+            raise RuntimeError("shutdown_failed")
+        return
+    rc = run(list(args))
+    if rc != 0:
+        raise RuntimeError("shutdown_failed")
 
 
 def clamp_minutes(m):
@@ -295,9 +358,14 @@ if IS_WIN:
     M_MOVE, M_LD, M_LU, M_RD, M_RU, M_MD, M_MU, M_WHEEL, M_HWHEEL = 0x1, 0x2, 0x4, 0x8, 0x10, 0x20, 0x40, 0x800, 0x1000
     K_EXT, K_UP, K_UNI = 0x1, 0x2, 0x4
 
+    M_ABS, M_VDESK = 0x8000, 0x4000
+
     def _send(*inputs):
         arr = (INPUT * len(inputs))(*inputs)
-        user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+        n = user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+        if n != len(inputs):
+            # ويندوز رفض (UIPI: شباك أدمن، شاشة القفل، UAC)
+            raise InputBlocked("blocked")
 
     def _mouse(flags, dx=0, dy=0, data=0):
         i = INPUT(type=0)
@@ -315,13 +383,76 @@ if IS_WIN:
         # الشاشة الأساسية
         return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
+    def virtual_rect():
+        # كل الشاشات مع بعض (SM_XVIRTUALSCREEN.. SM_CYVIRTUALSCREEN)
+        return (user32.GetSystemMetrics(76), user32.GetSystemMetrics(77),
+                max(1, user32.GetSystemMetrics(78)), max(1, user32.GetSystemMetrics(79)))
+
+    _k32w = ctypes.windll.kernel32
+    _adv = ctypes.windll.advapi32
+    _k32w.OpenProcess.restype = wintypes.HANDLE
+    _k32w.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _adv.OpenProcessToken.argtypes = (wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE))
+    _adv.GetTokenInformation.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+    user32.GetForegroundWindow.restype = wintypes.HWND
+
+    def _elevated_pid(pid):
+        """True = البرنامج ده شغال أدمن (أو مقدرناش نقراه = غالبًا أدمن)."""
+        h = _k32w.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return True
+        try:
+            tok = wintypes.HANDLE()
+            if not _adv.OpenProcessToken(h, 0x0008, ctypes.byref(tok)):  # TOKEN_QUERY
+                return True
+            try:
+                el = wintypes.DWORD()
+                ln = wintypes.DWORD()
+                if not _adv.GetTokenInformation(tok, 20, ctypes.byref(el), 4, ctypes.byref(ln)):  # TokenElevation
+                    return False
+                return bool(el.value)
+            finally:
+                _k32w.CloseHandle(tok)
+        finally:
+            _k32w.CloseHandle(h)
+
+    try:
+        SELF_ADMIN = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        SELF_ADMIN = False
+
+    def input_warning():
+        """قبل ما ننفّذ: الشباك اللي قدام شغال أدمن واحنا لأ؟ (ويندوز هيتجاهل الماوس والكيبورد فيه بصمت)"""
+        if SELF_ADMIN:
+            return None
+        try:
+            hw = user32.GetForegroundWindow()
+            if not hw:
+                return "locked"  # شاشة القفل / UAC
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hw, ctypes.byref(pid))
+            if pid.value and pid.value != os.getpid() and _elevated_pid(pid.value):
+                return "admin"
+        except Exception:
+            pass
+        return None
+
     def do_input(c):
         t = c["t"]
         if t == "move":
             _send(_mouse(M_MOVE, c["dx"], c["dy"]))
         elif t == "abs":
-            x0, y0, w, h = screen_rect()
-            user32.SetCursorPos(int(x0 + c["x"] * (w - 1)), int(y0 + c["y"] * (h - 1)))
+            mon = pick_monitor(GRAB.monitors(), c.get("m"))
+            if mon is None:
+                x0, y0, w, h = screen_rect()
+                mon = {"x": x0, "y": y0, "w": w, "h": h}
+            nx, ny, px, py = abs_to_virtual(c["x"], c["y"], (mon["x"], mon["y"], mon["w"], mon["h"]), virtual_rect())
+            # حركة ماوس حقيقية (مش SetCursorPos) علشان كل البرامج تحس بيها
+            try:
+                _send(_mouse(M_MOVE | M_ABS | M_VDESK, nx, ny))
+            except InputBlocked:
+                user32.SetCursorPos(px, py)
+                raise
         elif t in ("click", "down", "up"):
             dn, up = {"left": (M_LD, M_LU), "right": (M_RD, M_RU), "middle": (M_MD, M_MU)}[c["b"]]
             if t == "down":
@@ -370,11 +501,11 @@ if IS_WIN:
             # Sleep (مش Hibernate لو Hibernate مقفول)
             ctypes.windll.powrprof.SetSuspendState(0, 1, 0)
         elif a == "shutdown":
-            subprocess.Popen(["shutdown", "/s", "/t", "5"], creationflags=0x08000000)
+            run_shutdown(["/s", "/t", "5"])
         elif a == "restart":
-            subprocess.Popen(["shutdown", "/r", "/t", "5"], creationflags=0x08000000)
+            run_shutdown(["/r", "/t", "5"])
         elif a == "cancel":
-            subprocess.Popen(["shutdown", "/a"], creationflags=0x08000000)
+            run_shutdown(["/a"], cancel_only=True)
 
     def downloads_dir():
         try:
@@ -391,8 +522,16 @@ if IS_WIN:
             pass
         return os.path.join(os.path.expanduser("~"), "Downloads")
 else:  # للاختبارات على لينكس بس
+    SELF_ADMIN = False
+
     def do_input(c):
         pass
+
+    def input_warning():
+        return None
+
+    def virtual_rect():
+        return 0, 0, 1920, 1080
 
     def do_power(a):
         pass
@@ -492,7 +631,7 @@ if IS_WIN:
         os.startfile(u)
 
     def shutdown_in(minutes):
-        subprocess.Popen(["shutdown", "/s", "/t", str(minutes * 60)], creationflags=0x08000000)
+        run_shutdown(["/s", "/t", str(minutes * 60)])
 else:  # للاختبارات
     _CLIP = {"t": ""}
 
@@ -530,9 +669,30 @@ PROTECTED = {"system", "system idle process", "registry", "smss.exe", "csrss.exe
              "services.exe", "lsass.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "memory compression"}
 
 
-def parse_tasklist(out):
+WARN_KILL = {"explorer.exe"}  # مش محمية بس لازم تحذير (شريط المهام وسطح المكتب)
+
+
+def self_pids():
+    """البرنامج نفسه: الـ exe بتاع PyInstaller بيشتغل كعمليتين (الأب بيفك الملفات والابن هو البرنامج)."""
+    pids = {os.getpid()}
+    try:
+        pids.add(os.getppid())
+    except Exception:
+        pass
+    return pids
+
+
+def self_names():
+    if getattr(sys, "frozen", False):
+        return {os.path.basename(sys.executable).lower()}
+    return set()
+
+
+def parse_tasklist(out, extra_pids=(), extra_names=()):
     """يحوّل ناتج tasklist /fo csv /nh لقايمة {name,pid,mem_mb} مرتبة بالرامات."""
     import csv
+    extra_pids = set(extra_pids)
+    extra_names = {n.lower() for n in extra_names}
     rows = []
     for r in csv.reader(io.StringIO(out)):
         if len(r) < 5:
@@ -542,21 +702,70 @@ def parse_tasklist(out):
             mem = int(re.sub(r"[^0-9]", "", r[4]) or 0) / 1024.0
         except ValueError:
             continue
-        rows.append({"name": r[0], "pid": pid, "mem_mb": round(mem, 1), "protected": r[0].lower() in PROTECTED or pid <= 4})
+        low = r[0].lower()
+        rows.append({"name": r[0], "pid": pid, "mem_mb": round(mem, 1),
+                     "protected": low in PROTECTED or pid <= 4 or pid in extra_pids or low in extra_names,
+                     "self": pid in extra_pids or low in extra_names,
+                     "warn": low in WARN_KILL})
     rows.sort(key=lambda x: -x["mem_mb"])
     return rows
+
+
+def decode_console(b):
+    """tasklist بيطبع بصفحة الـ OEM (مش ANSI) — علشان الأسامي العربي متطلعش رموز."""
+    for enc in ("oem", "mbcs", "utf-8"):
+        try:
+            return b.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return b.decode("utf-8", "replace")
+
+
+def unicode_names():
+    """pid → اسم البرنامج بيونيكود كامل (Toolhelp32) — أدق من tasklist للأسامي العربي."""
+    names = {}
+    if not IS_WIN:
+        return names
+    try:
+        class PE(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", ctypes.c_wchar * 260)]
+        k = ctypes.windll.kernel32
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        snap = k.CreateToolhelp32Snapshot(0x2, 0)
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return names
+        try:
+            e = PE()
+            e.dwSize = ctypes.sizeof(PE)
+            ok = k.Process32FirstW(snap, ctypes.byref(e))
+            while ok:
+                names[int(e.th32ProcessID)] = e.szExeFile
+                ok = k.Process32NextW(snap, ctypes.byref(e))
+        finally:
+            k.CloseHandle(snap)
+    except Exception:
+        pass
+    return names
 
 
 def list_procs():
     if not IS_WIN:
         return []
     out = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, creationflags=0x08000000, timeout=15).stdout
-    return parse_tasklist(out.decode("mbcs", "replace") if hasattr(out, "decode") else out)
+    rows = parse_tasklist(decode_console(out) if hasattr(out, "decode") else out, self_pids(), self_names())
+    un = unicode_names()
+    for r in rows:
+        if r["pid"] in un and un[r["pid"]]:
+            r["name"] = un[r["pid"]]
+    return rows
 
 
 def kill_proc(pid):
     pid = int(pid)
-    if pid == os.getpid() or pid <= 4:
+    if pid in self_pids() or pid <= 4:
         raise ValueError("protected")
     for p in list_procs():
         if p["pid"] == pid:
@@ -571,27 +780,128 @@ def kill_proc(pid):
             raise ValueError("kill_failed")
 
 
+def frame_key(raw, cursor):
+    """بصمة سريعة للصورة + مكان الماوس — لو متغيرتش منبعتش الصورة تاني (توفير نت ومعالج)."""
+    import zlib
+    return "%08x" % (zlib.crc32(bytes(raw[::61])) ^ (hash(cursor) & 0xFFFFFFFF))
+
+
+class Grabber:
+    """تصوير الشاشة من thread واحد ثابت بنفس أداة mss (mss على ويندوز لازم يتصوّر من نفس الـ thread اللي فتحه)
+    بدل ما نفتح أداة جديدة مع كل صورة."""
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self._t = None
+        self._start = threading.Lock()
+        self._mss = None
+        self._mons = None
+        self._mons_t = 0.0
+
+    def _ensure(self):
+        with self._start:
+            if self._t is None or not self._t.is_alive():
+                self._t = threading.Thread(target=self._run, daemon=True, name="a2r-grab")
+                self._t.start()
+
+    def _run(self):
+        while True:
+            fn, args, box, ev = self.q.get()
+            try:
+                box["r"] = fn(*args)
+            except Exception as e:  # noqa
+                box["e"] = e
+            finally:
+                ev.set()
+
+    def _call(self, fn, *args, timeout=10):
+        self._ensure()
+        ev, box = threading.Event(), {}
+        self.q.put((fn, args, box, ev))
+        if not ev.wait(timeout):
+            raise RuntimeError("grab_timeout")
+        if "e" in box:
+            raise box["e"]
+        return box["r"]
+
+    def _get(self):
+        if self._mss is None:
+            import mss
+            self._mss = mss.mss()
+        return self._mss
+
+    def _reset(self):
+        try:
+            if self._mss is not None:
+                self._mss.close()
+        except Exception:
+            pass
+        self._mss = None
+        self._mons = None
+
+    def _monitors_w(self):
+        now = time.time()
+        if self._mons is not None and now - self._mons_t < 5:
+            return self._mons
+        try:
+            self._mons = mons_from_mss(self._get().monitors)
+        except Exception:
+            x0, y0, w, h = screen_rect()
+            self._mons = [{"i": 1, "x": x0, "y": y0, "w": w, "h": h, "primary": True}]
+        self._mons_t = now
+        return self._mons
+
+    def monitors(self):
+        try:
+            return self._call(self._monitors_w, timeout=5)
+        except Exception:
+            x0, y0, w, h = screen_rect()
+            return [{"i": 1, "x": x0, "y": y0, "w": w, "h": h, "primary": True}]
+
+    def _grab_w(self, width, quality, m, draw_cursor, last):
+        from PIL import Image, ImageDraw
+        mon = pick_monitor(self._monitors_w(), m)
+        try:
+            raw = self._get().grab({"left": mon["x"], "top": mon["y"], "width": mon["w"], "height": mon["h"]})
+        except Exception:
+            # الشاشة اتغيرت (اتفصلت / دقة جديدة / قفل) — نبدأ من جديد مرة واحدة
+            self._reset()
+            mon = pick_monitor(self._monitors_w(), m)
+            raw = self._get().grab({"left": mon["x"], "top": mon["y"], "width": mon["w"], "height": mon["h"]})
+        cx, cy = cursor_pos()
+        cx -= mon["x"]
+        cy -= mon["y"]
+        inside_ = 0 <= cx < raw.size[0] and 0 <= cy < raw.size[1]
+        cur = (cx / max(1, mon["w"] - 1), cy / max(1, mon["h"] - 1)) if inside_ else None
+        key = frame_key(raw.bgra, (cx, cy, bool(draw_cursor), int(width), int(quality), mon["i"]))
+        if last and last == key:
+            return None, mon["w"], mon["h"], 0, 0, key, cur, mon["i"]
+        img = Image.frombuffer("RGB", raw.size, raw.bgra, "raw", "BGRX", 0, 1)
+        width = max(320, min(int(width), img.width))
+        if width < img.width:
+            img = img.resize((width, max(1, int(img.height * width / img.width))), Image.BILINEAR, reducing_gap=2.0)
+        if draw_cursor and inside_:
+            sx = img.width / float(raw.size[0])
+            px, py = cx * sx, cy * sx
+            d = ImageDraw.Draw(img)
+            r = max(5, img.width // 200)
+            d.polygon([(px, py), (px, py + 3 * r), (px + 2 * r, py + 2 * r)], fill=(255, 255, 255), outline=(0, 0, 0))
+        b = io.BytesIO()
+        img.save(b, "JPEG", quality=max(20, min(95, int(quality))))
+        return b.getvalue(), mon["w"], mon["h"], img.width, img.height, key, cur, mon["i"]
+
+    def grab(self, width=1280, quality=60, m=None, draw_cursor=True, last=None):
+        """بيرجع (jpeg أو None لو زي اللي قبلها, شاشة w, h, صورة w, h, key, مكان الماوس 0..1 أو None, رقم الشاشة)"""
+        return self._call(self._grab_w, width, quality, m, draw_cursor, last)
+
+
+GRAB = Grabber()
+
+
 def grab_jpeg(width=1280, quality=60):
-    import mss
-    from PIL import Image, ImageDraw
-    with mss.mss() as s:
-        mon = s.monitors[1]
-        shot = s.grab(mon)
-    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-    # نرسم مكان الماوس (الصورة مفيهاش الماوس)
-    cx, cy = cursor_pos()
-    cx -= mon["left"]
-    cy -= mon["top"]
-    if 0 <= cx < img.width and 0 <= cy < img.height:
-        d = ImageDraw.Draw(img)
-        r = max(6, img.width // 220)
-        d.polygon([(cx, cy), (cx, cy + 3 * r), (cx + 2 * r, cy + 2 * r)], fill=(255, 255, 255), outline=(0, 0, 0))
-    width = max(320, min(int(width), img.width))
-    if width < img.width:
-        img = img.resize((width, int(img.height * width / img.width)), Image.BILINEAR)
-    b = io.BytesIO()
-    img.save(b, "JPEG", quality=max(20, min(95, int(quality))))
-    return b.getvalue(), mon["width"], mon["height"]
+    """للتوافق مع الاختبارات/النسخ القديمة."""
+    r = GRAB.grab(width, quality)
+    return r[0], r[1], r[2]
 
 
 # ---------------------------------------------------------------- السيرفر
@@ -626,6 +936,7 @@ class State:
     pairing = None
     events = queue.Queue()  # رسايل للشباك
     shutdown_at = None  # وقت الإطفاء المتجدول (epoch)
+    show_req = False
     opened = []  # للاختبارات
 
 
@@ -646,6 +957,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
         self.send_header("Cache-Control", "no-store")
+        if code >= 400:
+            # ممكن جسم الطلب لسه متقراش (رفض بدري) — نقفل الاتصال علشان باقيه ميتقريش كأنه طلب جديد
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(b)
 
@@ -676,7 +991,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"a2r": "pc", "name": socket.gethostname(), "v": VERSION})
             if u.path == "/info":
                 x0, y0, w, h = screen_rect()
-                return self._json(200, {"name": socket.gethostname(), "w": w, "h": h, "v": VERSION, "recv": RECV_DIR, "home": HOME, "macs": pc_macs()})
+                return self._json(200, {"name": socket.gethostname(), "w": w, "h": h, "v": VERSION, "recv": RECV_DIR, "home": HOME, "macs": pc_macs(),
+                                        "mons": GRAB.monitors(), "admin": SELF_ADMIN})
             if u.path == "/sysinfo":
                 return self._json(200, sysinfo())
             if u.path == "/clip":
@@ -684,14 +1000,22 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/procs":
                 return self._json(200, {"procs": list_procs()[:300], "self": os.getpid()})
             if u.path == "/frame.jpg":
-                data, w, h = grab_jpeg(int(q.get("w", 1280)), int(q.get("q", 60)))
-                self.send_response(200)
+                m = int(q["m"]) if q.get("m", "").isdigit() else None
+                data, w, h, iw, ih, key, cur, mi = GRAB.grab(int(q.get("w", 1280)), int(q.get("q", 60)), m,
+                                                             q.get("c", "1") != "0", q.get("h") or None)
+                self.send_response(200 if data is not None else 204)
                 self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Length", str(len(data) if data is not None else 0))
                 self.send_header("X-Screen", "%dx%d" % (w, h))
+                if data is not None:
+                    self.send_header("X-Img", "%dx%d" % (iw, ih))
+                self.send_header("X-Hash", key)
+                self.send_header("X-Mon", str(mi))
+                self.send_header("X-Cursor", "%.5f,%.5f" % cur if cur else "-")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(data)
+                if data is not None:
+                    self.wfile.write(data)
                 return
             if u.path == "/files":
                 p = q.get("path") or RECV_DIR
@@ -745,9 +1069,14 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/input":
                 d = json.loads(self._body(64 * 1024) or b"{}")
                 cmds = d if isinstance(d, list) else [d]
-                for c in cmds[:50]:
-                    do_input(parse_input(c))
-                return self._json(200, {"ok": True})
+                parsed = [parse_input(c) for c in cmds[:50]]
+                warn = input_warning()
+                try:
+                    for c in parsed:
+                        do_input(c)
+                except InputBlocked:
+                    return self._json(409, {"error": "blocked", "why": warn or "blocked"})
+                return self._json(200, {"ok": True, "warn": warn} if warn else {"ok": True})
             if u.path == "/power":
                 d = json.loads(self._body(4096) or b"{}")
                 a = d.get("a")
@@ -760,12 +1089,22 @@ class Handler(BaseHTTPRequestHandler):
                         m = clamp_minutes(d.get("minutes"))
                     except (TypeError, ValueError):
                         return self._json(400, {"error": "bad_minutes"})
+                    try:
+                        shutdown_in(m)
+                    except RuntimeError:
+                        return self._json(400, {"error": "shutdown_failed"})
                     log("إطفاء بعد %d دقيقة" % m)
-                    shutdown_in(m)
                     State.shutdown_at = int(time.time()) + m * 60
                     return self._json(200, {"ok": True, "at": State.shutdown_at})
-                if a == "cancel":
-                    State.shutdown_at = None
+                if a in ("shutdown", "restart", "cancel"):
+                    # بننفّذ هنا علشان نعرف لو ويندوز رفض (قبل كده كان بيقول تمام على طول)
+                    try:
+                        do_power(a)
+                    except RuntimeError:
+                        return self._json(400, {"error": "shutdown_failed"})
+                    State.shutdown_at = None if a == "cancel" else int(time.time()) + 5
+                    log("أمر: " + a)
+                    return self._json(200, {"ok": True})
                 log("أمر: " + a)
                 self._json(200, {"ok": True})
                 threading.Timer(0.3, do_power, args=(a,)).start()
@@ -839,6 +1178,8 @@ def udp_loop():
             data, addr = s.recvfrom(256)
             if data.strip() == DISCOVER_MAGIC and is_lan(addr[0]):
                 s.sendto(discovery_reply(socket.gethostname()), addr)
+            elif data.strip() == SHOW_MAGIC and addr[0] == "127.0.0.1":
+                State.show_req = True  # حد فتح البرنامج تاني وهو شغال → نظهر الشباك
         except Exception:
             time.sleep(0.5)
 
@@ -860,6 +1201,87 @@ def local_ips():
     return sorted(ip for ip in ips if not ip.startswith("127."))
 
 
+# ---------------------------------------------------------------- الجدار الناري + التشغيل مع ويندوز (v1.3)
+FW_RULE = "A2R PC"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "A2R PC"
+
+
+def exe_path():
+    return sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+
+
+def firewall_cmd(exe):
+    """أمر واحد (cmd /c) بيمسح قواعد A2R القديمة ويضيف قاعدتين للبرنامج ده بس وللشبكة الداخلية بس
+    (remoteip=localsubnet) — TCP 47800 و UDP 47801. بيشتغل في أي نوع شبكة (Private/Public)."""
+    q = '"%s"' % exe
+    parts = ['netsh advfirewall firewall delete rule name="%s"' % FW_RULE]
+    for proto, port in (("TCP", HTTP_PORT), ("UDP", UDP_PORT)):
+        parts.append('netsh advfirewall firewall add rule name="%s" dir=in action=allow program=%s protocol=%s localport=%d '
+                     'remoteip=localsubnet profile=any enable=yes' % (FW_RULE, q, proto, port))
+    return " & ".join(parts)
+
+
+def firewall_ok():
+    if not IS_WIN:
+        return None
+    try:
+        r = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", "name=" + FW_RULE], capture_output=True,
+                           timeout=10, creationflags=0x08000000)
+        return r.returncode == 0
+    except Exception:
+        return None
+
+
+def firewall_allow():
+    """بيطلب صلاحية أدمن (رسالة UAC) مرة واحدة ويضيف القاعدة."""
+    if not IS_WIN:
+        return False
+    r = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", "/c " + firewall_cmd(exe_path()), None, 0)
+    return r > 32
+
+
+def startup_value(exe):
+    return '"%s" --tray' % exe
+
+
+def startup_get():
+    if not IS_WIN:
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            v, _ = winreg.QueryValueEx(k, RUN_NAME)
+            return bool(v)
+    except OSError:
+        return False
+
+
+def startup_set(on):
+    if not IS_WIN:
+        return
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, startup_value(exe_path()))
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_NAME)
+            except OSError:
+                pass
+
+
+def tray_image():
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((2, 2, 62, 62), 14, fill=(20, 23, 29, 255))
+    d.rectangle((14, 18, 50, 40), outline=(233, 185, 73, 255), width=4)
+    d.rectangle((28, 42, 36, 48), fill=(233, 185, 73, 255))
+    d.rectangle((20, 48, 44, 52), fill=(233, 185, 73, 255))
+    return img
+
+
 def single_instance():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -875,9 +1297,18 @@ def main():
     from tkinter import messagebox
 
     if not single_instance():
-        r = tk.Tk()
-        r.withdraw()
-        messagebox.showinfo("A2R PC", "البرنامج شغال بالفعل (أو البورت 47800 مستخدم).")
+        # شغال بالفعل (يمكن مستخبي جنب الساعة) — نقوله يظهر الشباك
+        try:
+            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            u.sendto(SHOW_MAGIC, ("127.0.0.1", UDP_PORT))
+            u.close()
+        except Exception:
+            pass
+        if "--tray" not in sys.argv:
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showinfo("A2R PC", "البرنامج شغال بالفعل — شباكه هيظهر (أو دوّر على أيقونته جنب الساعة).\n"
+                                          "لو مظهرش: البورت 47800 مستخدم من برنامج تاني.")
         return
     State.pairing = Pairing(load_tokens())
     srv = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
@@ -887,10 +1318,10 @@ def main():
 
     root = tk.Tk()
     root.title("A2R PC")
-    root.geometry("360x330")
+    root.geometry("380x470")
     root.configure(bg="#14171D")
-    gold, fg, muted = "#E9B949", "#F2F2F2", "#9AA0A6"
-    tk.Label(root, text="A2R PC", fg=gold, bg="#14171D", font=("Segoe UI", 18, "bold")).pack(pady=(14, 2))
+    gold, fg, muted, bad = "#E9B949", "#F2F2F2", "#9AA0A6", "#E5735A"
+    tk.Label(root, text="A2R PC  v" + VERSION, fg=gold, bg="#14171D", font=("Segoe UI", 18, "bold")).pack(pady=(14, 2))
     ip_l = tk.Label(root, text="", fg=fg, bg="#14171D", font=("Segoe UI", 11))
     ip_l.pack()
     tk.Label(root, text="كود الربط", fg=muted, bg="#14171D", font=("Segoe UI", 10)).pack(pady=(12, 0))
@@ -898,8 +1329,8 @@ def main():
     code_l.pack()
     info_l = tk.Label(root, text="", fg=muted, bg="#14171D", font=("Segoe UI", 9))
     info_l.pack()
-    log_l = tk.Label(root, text="مستني الموبايل…", fg=fg, bg="#14171D", font=("Segoe UI", 9), wraplength=330, justify="center")
-    log_l.pack(pady=8)
+    log_l = tk.Label(root, text="مستني الموبايل…", fg=fg, bg="#14171D", font=("Segoe UI", 9), wraplength=350, justify="center")
+    log_l.pack(pady=6)
 
     def forget():
         if messagebox.askyesno("A2R PC", "تلغي ربط كل الموبايلات؟ هيحتاجوا الكود تاني."):
@@ -917,6 +1348,111 @@ def main():
     tk.Button(bar, text="فولدر الملفات", command=open_recv).pack(side="left", padx=4)
     tk.Button(bar, text="إلغاء ربط الكل", command=forget).pack(side="left", padx=4)
 
+    # ---- الجدار الناري
+    fw_box = tk.Frame(root, bg="#1C2028")
+    fw_box.pack(fill="x", padx=12, pady=(8, 2))
+    fw_l = tk.Label(fw_box, text="", fg=muted, bg="#1C2028", font=("Segoe UI", 9), wraplength=340, justify="center")
+    fw_l.pack(pady=(6, 2))
+
+    def fw_refresh():
+        ok = firewall_ok()
+        if ok:
+            fw_l.config(text="الجدار الناري: مسموح للموبايل يوصل ✓", fg="#7BC67E")
+            fw_b.config(text="ظبّطه تاني")
+        else:
+            fw_l.config(text="لو الموبايل مش لاقي الكمبيوتر: غالبًا الجدار الناري (Firewall) مانعه.\n"
+                             "دوس الزرار ووافق على رسالة ويندوز — بيسمح للبرنامج ده بس ومن شبكة البيت بس.", fg=muted)
+            fw_b.config(text="اسمح في الجدار الناري")
+
+    def fw_do():
+        if firewall_allow():
+            log("اتطلبت صلاحية الجدار الناري — وافق على رسالة ويندوز")
+            root.after(4000, fw_refresh)
+            root.after(12000, fw_refresh)
+        else:
+            log("الجدار الناري: اتلغت أو ويندوز رفض")
+
+    fw_b = tk.Button(fw_box, text="اسمح في الجدار الناري", command=fw_do)
+    fw_b.pack(pady=(0, 6))
+    if IS_WIN:
+        fw_refresh()
+    else:
+        fw_box.pack_forget()
+
+    # ---- التشغيل مع ويندوز
+    start_v = tk.BooleanVar(value=startup_get())
+
+    def start_toggle():
+        try:
+            startup_set(start_v.get())
+            log("هيشتغل لوحده مع ويندوز ✓" if start_v.get() else "مش هيشتغل مع ويندوز")
+        except Exception as e:
+            start_v.set(startup_get())
+            log("مقدرتش أغيّر التشغيل مع ويندوز: %s" % e)
+
+    tk.Checkbutton(root, text="يشتغل لوحده مع ويندوز (مستخبي جنب الساعة)", variable=start_v, command=start_toggle,
+                   fg=fg, bg="#14171D", selectcolor="#14171D", activebackground="#14171D", activeforeground=fg,
+                   font=("Segoe UI", 9)).pack(pady=(6, 0))
+
+    # ---- أيقونة جنب الساعة: قفل الشباك = يستخبى، والبرنامج يفضل شغال
+    tray = {"icon": None}
+
+    def really_quit():
+        try:
+            if tray["icon"] is not None:
+                tray["icon"].stop()
+        except Exception:
+            pass
+        root.destroy()
+
+    def show_window():
+        root.deiconify()
+        root.lift()
+        try:
+            root.focus_force()
+        except Exception:
+            pass
+
+    try:
+        import pystray
+
+        icon = pystray.Icon("A2R PC", tray_image(), "A2R PC — شغال", menu=pystray.Menu(
+            pystray.MenuItem("افتح الشباك", lambda: root.after(0, show_window), default=True),
+            pystray.MenuItem("اقفل البرنامج خالص", lambda: root.after(0, really_quit)),
+        ))
+        threading.Thread(target=icon.run, daemon=True).start()
+        tray["icon"] = icon
+    except Exception:
+        tray["icon"] = None
+
+    told = {"v": False}
+
+    def on_close():
+        if tray["icon"] is not None:
+            root.withdraw()
+            if not told["v"]:
+                told["v"] = True
+                try:
+                    tray["icon"].notify("البرنامج لسه شغال جنب الساعة — الموبايل يقدر يتحكم. علشان تقفله خالص: كليك يمين على الأيقونة.", "A2R PC")
+                except Exception:
+                    pass
+        else:
+            # من غير أيقونة: نصغّر بس، والقفل الحقيقي من الزرار
+            root.iconify()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    tk.Button(root, text="اقفل البرنامج خالص", command=lambda: messagebox.askyesno(
+        "A2R PC", "تقفل البرنامج؟ الموبايل مش هيقدر يتحكم لحد ما تفتحه تاني.") and really_quit(),
+              fg=bad).pack(pady=(8, 4))
+    tk.Label(root, text="قفل الشباك (X) بيخبيه بس — البرنامج يفضل شغال", fg=muted, bg="#14171D",
+             font=("Segoe UI", 8)).pack()
+
+    if "--tray" in sys.argv:
+        if tray["icon"] is not None:
+            root.withdraw()
+        else:
+            root.iconify()
+
     def tick():
         ip_l.config(text="  •  ".join(local_ips()) or "مش متصل بشبكة")
         p = State.pairing
@@ -931,6 +1467,9 @@ def main():
                 log_l.config(text=State.events.get_nowait())
         except queue.Empty:
             pass
+        if State.show_req:
+            State.show_req = False
+            show_window()
         root.after(700, tick)
 
     tick()
