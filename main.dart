@@ -2007,6 +2007,19 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
               onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SlideshowPage())),
             ),
             FilledButton.tonalIcon(
+              icon: const Icon(Icons.download_rounded),
+              label: const Text('التنزيلات'),
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const DownloadsPage())),
+            ),
+            FilledButton.tonalIcon(
+              icon: const Icon(Icons.queue_music_rounded),
+              label: const Text('قوايم محفوظة'),
+              onPressed: () async {
+                await Navigator.push(context, MaterialPageRoute(builder: (_) => const PlaylistsPage()));
+                if (mounted) setState(() {});
+              },
+            ),
+            FilledButton.tonalIcon(
               icon: const Icon(Icons.history_rounded),
               label: const Text('اللي اتعرض قبل كده'),
               onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const CastHistoryPage())),
@@ -2574,6 +2587,8 @@ class _BrowserPageState extends State<BrowserPage> {
         await _list(true);
       case 'hist':
         await _list(false);
+      case 'dl':
+        await Navigator.push(context, MaterialPageRoute(builder: (_) => const DownloadsPage()));
       case 'home':
         Store.homePage = url;
         toast(context, 'اتحفظت كصفحة رئيسية');
@@ -2609,6 +2624,12 @@ class _BrowserPageState extends State<BrowserPage> {
     );
   }
 
+  void download(String u) {
+    final name = title.isNotEmpty ? title : (Uri.parse(u).pathSegments.lastOrNull ?? 'video');
+    DownloadMgr.I.add(u, name, headers: {if (url.startsWith('http')) 'Referer': url});
+    toast(context, 'بدأ التنزيل — شوفه من الكاست > التنزيلات');
+  }
+
   void _foundSheet() => showModalBottomSheet(
         context: context,
         backgroundColor: kSurface,
@@ -2623,7 +2644,10 @@ class _BrowserPageState extends State<BrowserPage> {
                   Navigator.pop(c);
                   cast(u);
                 },
-                trailing: IconButton(icon: const Icon(Icons.copy, size: 18), onPressed: () => Clipboard.setData(ClipboardData(text: u))),
+                trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                  IconButton(icon: const Icon(Icons.download_rounded, size: 18), tooltip: 'نزّل على الموبايل', onPressed: () => download(u)),
+                  IconButton(icon: const Icon(Icons.copy, size: 18), onPressed: () => Clipboard.setData(ClipboardData(text: u))),
+                ]),
               ),
           ]),
         ),
@@ -2665,6 +2689,7 @@ class _BrowserPageState extends State<BrowserPage> {
               itemBuilder: (_) => [
                 const PopupMenuItem(value: 'bm', child: ListTile(leading: Icon(Icons.star_rounded), title: Text('المفضلة'))),
                 const PopupMenuItem(value: 'hist', child: ListTile(leading: Icon(Icons.history_rounded), title: Text('السجل'))),
+                const PopupMenuItem(value: 'dl', child: ListTile(leading: Icon(Icons.download_rounded), title: Text('التنزيلات'))),
                 const PopupMenuItem(value: 'home', child: ListTile(leading: Icon(Icons.home_outlined), title: Text('خليها الصفحة الرئيسية'))),
                 PopupMenuItem(
                   value: 'ad',
@@ -3224,6 +3249,8 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               if (v == 'ip') manual();
               if (v == 'info') showInfo();
               if (v == 'reload') loadChannels();
+              if (v == 'sort') sortChannels();
+              if (v == 'security' && gm != null) Navigator.push(context, MaterialPageRoute(builder: (_) => ReceiverSecurityPage(gm: gm!)));
               if (v == 'notif') setNotifRemote(!notifRemote);
               if (v == 'timers' && gm != null) {
                 Navigator.push(context, MaterialPageRoute(builder: (_) => TimersPage(gm: gm!, channels: channels, playingId: playingId)));
@@ -3241,6 +3268,8 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               const PopupMenuItem(value: 'ip', child: ListTile(leading: Icon(Icons.edit_rounded), title: Text('عنوان يدوي'))),
               if (on) const PopupMenuItem(value: 'info', child: ListTile(leading: Icon(Icons.info_outline_rounded), title: Text('معلومات الريسيفر'))),
               if (on) const PopupMenuItem(value: 'timers', child: ListTile(leading: Icon(Icons.alarm_rounded), title: Text('المؤقتات (تسجيل/تشغيل)'))),
+              if (on) const PopupMenuItem(value: 'sort', child: ListTile(leading: Icon(Icons.sort_rounded), title: Text('رتّب القنوات (تجريبي)'))),
+              if (on) const PopupMenuItem(value: 'security', child: ListTile(leading: Icon(Icons.admin_panel_settings_rounded), title: Text('الأمان والرقابة والمسح (تجريبي)'))),
               if (on) const PopupMenuItem(value: 'reload', child: ListTile(leading: Icon(Icons.refresh_rounded), title: Text('حدّث القنوات'))),
               PopupMenuItem(value: 'notif', child: ListTile(leading: const Icon(Icons.notifications_active_rounded), title: Text(notifRemote ? 'شيل الريموت من الإشعارات' : 'ريموت في الإشعارات'))),
               if (on) const PopupMenuItem(value: 'off', child: ListTile(leading: Icon(Icons.link_off_rounded), title: Text('اقفل الاتصال'))),
@@ -3492,6 +3521,22 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                 label: const Text('غيّر الاسم'),
               ),
               OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.pop(c);
+                  moveCh(ch);
+                },
+                icon: const Icon(Icons.drive_file_move_rounded),
+                label: const Text('انقلها (تجريبي)'),
+              ),
+              OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.pop(c);
+                  lockCh(ch);
+                },
+                icon: Icon(ch.locked ? Icons.lock_open_rounded : Icons.lock_rounded),
+                label: Text(ch.locked ? 'افتح القفل (تجريبي)' : 'اقفلها (تجريبي)'),
+              ),
+              OutlinedButton.icon(
                 style: OutlinedButton.styleFrom(foregroundColor: kBad),
                 onPressed: () {
                   Navigator.pop(c);
@@ -3532,6 +3577,82 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       if (mounted) toast(context, 'اتمسحت — بحدّث القايمة');
       await Future.delayed(const Duration(milliseconds: 800));
       await loadChannels();
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
+  }
+
+  Future<void> moveCh(StbChannel ch) async {
+    if (gm == null) return;
+    final same = channels.where((c) => c.radio == ch.radio && c.id != ch.id).toList();
+    final target = await showModalBottomSheet<StbChannel>(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (c) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.7,
+        builder: (c, sc) => ListView(controller: sc, children: [
+          SectionTitle('انقل «${ch.name}» لمكان أي قناة؟', icon: Icons.drive_file_move_rounded),
+          for (final t in same) ListTile(dense: true, title: Text(t.name), onTap: () => Navigator.pop(c, t)),
+        ]),
+      ),
+    );
+    if (target == null || !mounted) return;
+    try {
+      await gm!.moveChannel(ch, target);
+      if (mounted) toast(context, 'اتبعت — بحدّث القايمة وبص على الترتيب');
+      await Future.delayed(const Duration(milliseconds: 900));
+      await loadChannels();
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
+  }
+
+  Future<void> sortChannels() async {
+    if (gm == null) return;
+    try {
+      final (types, cur) = await gm!.sortTypes();
+      if (types.isEmpty) {
+        if (mounted) toast(context, 'الريسيفر مرجّعش أنواع ترتيب');
+        return;
+      }
+      if (!mounted) return;
+      final i = await showModalBottomSheet<int>(
+        context: context,
+        backgroundColor: kSurface,
+        showDragHandle: true,
+        builder: (c) => ListView(shrinkWrap: true, children: [
+          SectionTitle(radio ? 'ترتيب قنوات الراديو' : 'ترتيب قنوات التلفزيون', icon: Icons.sort_rounded),
+          for (var k = 0; k < types.length; k++) ListTile(title: Text(types[k]), trailing: k == cur ? const Icon(Icons.check_rounded) : null, onTap: () => Navigator.pop(c, k)),
+        ]),
+      );
+      if (i == null || !mounted) return;
+      if (!await confirm(context, 'الترتيب هيتغير على الريسيفر نفسه (${types[i]}). تكمل؟')) return;
+      await gm!.sortBy(i, radio);
+      if (mounted) toast(context, 'اتبعت — بحدّث القايمة');
+      await Future.delayed(const Duration(milliseconds: 900));
+      await loadChannels();
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
+  }
+
+  Future<void> lockCh(StbChannel ch) async {
+    if (gm == null) return;
+    final p = await askText(context, 'باسورد الريسيفر', obscure: true, type: TextInputType.number);
+    if (p == null || p.isEmpty) return;
+    try {
+      if (!await gm!.passwordOk(p)) {
+        if (mounted) toast(context, 'الباسورد غلط');
+        return;
+      }
+      await gm!.lockChannels([ch]);
+      await Future.delayed(const Duration(milliseconds: 900));
+      await loadChannels();
+      final n = channels.where((c) => c.id == ch.id && c.radio == ch.radio).firstOrNull;
+      if (mounted) toast(context, n == null ? 'اتبعت' : (n.locked == ch.locked ? 'الحالة متغيرتش — شوف السجل' : (n.locked ? 'القناة اتقفلت ✓' : 'القفل اتشال ✓')));
     } catch (e) {
       if (mounted) toast(context, 'خطأ: $e');
     }
@@ -4070,6 +4191,16 @@ class _DishPageState extends State<DishPage> {
     if (mounted) setState(() => running = false);
   }
 
+  Future<void> pickFromDb() async {
+    final r = await showModalBottomSheet<(SatRec, (int, int, int))>(context: context, backgroundColor: kSurface, isScrollControlled: true, showDragHandle: true, builder: (c) => const SatTpSheet());
+    if (r == null || !mounted) return;
+    final (s, t) = r;
+    freqC.text = '${t.$1}';
+    symC.text = '${t.$2}';
+    _save(cfg.copyWith(satName: s.name, angle: s.angle, dir: s.west ? 1 : 0, freq: t.$1, sym: t.$2, pol: t.$3));
+    toast(context, '${s.label}: ${t.$1} ${t.$3 == 0 ? 'H' : 'V'} ${t.$2}');
+  }
+
   void fromChannel(StbChannel c) {
     final n = finderFromChannel(cfg, c.raw);
     if (n == null) {
@@ -4126,6 +4257,8 @@ class _DishPageState extends State<DishPage> {
               items: [for (var i = 0; i < kSatPresets.length; i++) DropdownMenuItem(value: i, child: Text(kSatPresets[i].$1))],
               onChanged: running ? null : (i) => i == null ? null : _save(cfg.copyWith(satName: kSatPresets[i].$1, angle: kSatPresets[i].$2, dir: kSatPresets[i].$3)),
             ),
+            const SizedBox(height: 6),
+            OutlinedButton.icon(onPressed: running ? null : pickFromDb, icon: const Icon(Icons.travel_explore_rounded), label: const Text('اختار قمر وترددة من القاعدة (تجريبي)')),
             const SizedBox(height: 10),
             Row(children: [
               Expanded(child: TextField(controller: freqC, enabled: !running, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'الترددة MHz', hintText: '11013', isDense: true))),
@@ -4217,6 +4350,945 @@ class _DishPageState extends State<DishPage> {
         ),
       ),
     ]);
+  }
+}
+
+
+// ======== receiver_security.dart (تجريبي) ========
+/// الرقابة الأبوية + قفل الشاشة + تغيير الباسورد + مسح الإعدادات — بنفس طلبات G-MScreen
+class ReceiverSecurityPage extends StatefulWidget {
+  final GmClient gm;
+  const ReceiverSecurityPage({super.key, required this.gm});
+  @override
+  State<ReceiverSecurityPage> createState() => _ReceiverSecurityPageState();
+}
+
+class _ReceiverSecurityPageState extends State<ReceiverSecurityPage> {
+  Map<String, dynamic> st = {};
+  bool busy = false, loaded = false;
+  String err = '';
+  static const _locks = [
+    ('PasswordLock', 'قفل بالباسورد'),
+    ('ServiceLock', 'قفل القنوات'),
+    ('InstallationLock', 'قفل التركيب (البحث)'),
+    ('EditChannelLock', 'قفل تعديل القنوات'),
+    ('SettingsLock', 'قفل الإعدادات'),
+    ('NetworkLock', 'قفل الشبكة'),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    setState(() {
+      busy = true;
+      err = '';
+    });
+    try {
+      st = await widget.gm.controlState();
+      loaded = true;
+    } catch (e) {
+      err = 'مقدرتش أقرا الحالة: $e';
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  bool _on(String k) {
+    final v = '${st[k] ?? ''}'.trim();
+    return v.isNotEmpty && v != '0' && v.toLowerCase() != 'false';
+  }
+
+  Future<String?> _pwd([String t = 'باسورد الريسيفر']) async {
+    final p = await askText(context, t, obscure: true, type: TextInputType.number);
+    if (p == null || p.isEmpty) return null;
+    if (!await widget.gm.passwordOk(p)) {
+      if (mounted) toast(context, 'الباسورد غلط');
+      return null;
+    }
+    return p;
+  }
+
+  Future<void> _run(Future<void> Function() f, String ok) async {
+    setState(() => busy = true);
+    try {
+      await f();
+      if (mounted) toast(context, ok);
+      await Future.delayed(const Duration(milliseconds: 600));
+      await load();
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  Future<void> toggle(String k, bool v) async {
+    final p = await _pwd();
+    if (p == null) return;
+    final n = Map<String, dynamic>.from(st)..[k] = v ? '1' : '0';
+    await _run(() => widget.gm.saveLocks(n), 'اتبعت — بقرا الحالة تاني');
+  }
+
+  Future<void> screenLock(bool on) async {
+    String p = '';
+    if (!on) {
+      final x = await _pwd('باسورد فتح الشاشة');
+      if (x == null) return;
+      p = x;
+    }
+    await _run(() => widget.gm.screenLock(on, pwd: p), on ? 'قفلت شاشة الريسيفر' : 'فتحت الشاشة');
+  }
+
+  Future<void> changePwd() async {
+    final o = await _pwd('الباسورد الحالي');
+    if (o == null) return;
+    if (!mounted) return;
+    final n = await askText(context, 'الباسورد الجديد (أرقام)', obscure: true, type: TextInputType.number);
+    if (n == null || n.isEmpty || !mounted) return;
+    final n2 = await askText(context, 'اكتب الجديد تاني للتأكيد', obscure: true, type: TextInputType.number);
+    if (n2 != n) {
+      if (mounted) toast(context, 'مش متطابقين — اتلغى');
+      return;
+    }
+    await _run(() => widget.gm.changePassword(o, n), 'اتبعت طلب تغيير الباسورد — جرّب الباسورد الجديد');
+  }
+
+  Future<void> reset(int req, String what) async {
+    final p = await _pwd();
+    if (p == null || !mounted) return;
+    if (!await confirm(context, 'هتمسح $what من الريسيفر نهائي ومفيش رجوع.\n\nمتأكد؟')) return;
+    if (!mounted) return;
+    final w = await askText(context, 'تأكيد أخير: اكتب كلمة مسح علشان تكمل', hint: 'مسح');
+    if (w?.trim() != 'مسح') {
+      if (mounted) toast(context, 'اتلغى — مفيش حاجة اتمسحت');
+      return;
+    }
+    await _run(() => widget.gm.factoryReset(req), 'اتبعت أمر المسح — الريسيفر ممكن يعيد التشغيل');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('الأمان والرقابة (تجريبي)'), actions: [IconButton(onPressed: busy ? null : load, icon: const Icon(Icons.refresh_rounded))]),
+      body: ListView(padding: const EdgeInsets.only(bottom: 24), children: [
+        Card(
+          color: kGold.withValues(alpha: 0.10),
+          child: const Padding(
+            padding: EdgeInsets.all(12),
+            child: Text('كل الصفحة دي تجريبي — متبنية على طلبات G-MScreen لكن مش متجربة على ريسيفرك. كل تغيير بيطلب باسورد الريسيفر، وبعدها بنقرا الحالة تاني علشان تتأكد إنه اتنفذ.', style: TextStyle(fontSize: 12)),
+          ),
+        ),
+        if (busy) const LinearProgressIndicator(),
+        if (err.isNotEmpty) Padding(padding: const EdgeInsets.all(12), child: Text(err, style: const TextStyle(color: kBad))),
+        if (loaded) ...[
+          const SectionTitle('الرقابة الأبوية', icon: Icons.family_restroom_rounded),
+          for (final l in _locks) SwitchListTile(title: Text(l.$2), value: _on(l.$1), onChanged: busy ? null : (v) => toggle(l.$1, v)),
+          const SectionTitle('شاشة الريسيفر', icon: Icons.lock_rounded),
+          ListTile(
+            title: Text('قفل الشاشة: ${_on('ScreenLock') ? 'مقفولة' : 'مفتوحة'}'),
+            subtitle: const Text('القفل مش بيطلب باسورد، الفتح بيطلب'),
+            trailing: FilledButton.tonal(onPressed: busy ? null : () => screenLock(!_on('ScreenLock')), child: Text(_on('ScreenLock') ? 'افتح' : 'اقفل')),
+          ),
+        ],
+        const SectionTitle('الباسورد', icon: Icons.password_rounded),
+        ListTile(leading: const Icon(Icons.key_rounded), title: const Text('غيّر باسورد الريسيفر'), onTap: busy ? null : changePwd),
+        const SectionTitle('مسح (خطر)', icon: Icons.warning_amber_rounded),
+        for (final r in [(1031, 'قنوات التلفزيون'), (1032, 'قنوات الراديو'), (1033, 'القنوات المشفرة'), (1030, 'كل القنوات والإعدادات (ريسيت كامل)')])
+          ListTile(
+            leading: const Icon(Icons.delete_forever_rounded, color: kBad),
+            title: Text('امسح ${r.$2}', style: const TextStyle(color: kBad)),
+            subtitle: const Text('باسورد + تأكيدين'),
+            onTap: busy ? null : () => reset(r.$1, r.$2),
+          ),
+      ]),
+    );
+  }
+}
+
+// ======== satdb picker (تجريبي) ========
+class SatRec {
+  final String name;
+  final double angle;
+  final bool west;
+  final List<(int, int, int)> tps; // تردد، SR، قطبية (0 H / 1 V)
+  SatRec(this.name, this.angle, this.west, this.tps);
+  String get label => '$name  ${angle.toStringAsFixed(1)}°${west ? 'W' : 'E'}';
+}
+
+List<SatRec>? _satCache;
+List<SatRec> satDb() => _satCache ??= [
+      for (final s in kSatDb)
+        () {
+          final p = s.split('|');
+          return SatRec(p[0], (int.tryParse(p[1]) ?? 0) / 10, p[2] == '1', [
+            for (final t in p[3].split(','))
+              () {
+                final x = t.split('/');
+                return (int.parse(x[0]), int.parse(x[1]), x[2] == 'V' ? 1 : 0);
+              }()
+          ]);
+        }()
+    ];
+
+class SatTpSheet extends StatefulWidget {
+  const SatTpSheet({super.key});
+  @override
+  State<SatTpSheet> createState() => _SatTpSheetState();
+}
+
+class _SatTpSheetState extends State<SatTpSheet> {
+  SatRec? sat;
+  String q = '';
+  @override
+  Widget build(BuildContext context) {
+    final all = satDb();
+    return SafeArea(
+      child: SizedBox(
+        height: MediaQuery.of(context).size.height * 0.75,
+        child: Column(children: [
+          if (sat == null) ...[
+            const SectionTitle('اختار القمر', icon: Icons.satellite_alt_rounded),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: TextField(decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'ابحث (nile / hot / astra)', isDense: true), onChanged: (v) => setState(() => q = v.toLowerCase())),
+            ),
+            Expanded(
+              child: ListView(children: [
+                for (final s in all.where((s) => q.isEmpty || s.name.toLowerCase().contains(q)))
+                  ListTile(dense: true, title: Text(s.label), trailing: Text('${s.tps.length}', style: const TextStyle(color: kMuted)), onTap: () => setState(() => sat = s)),
+              ]),
+            ),
+          ] else ...[
+            ListTile(leading: IconButton(icon: const Icon(Icons.arrow_back_rounded), onPressed: () => setState(() => sat = null)), title: Text(sat!.label, style: const TextStyle(fontWeight: FontWeight.w700))),
+            Expanded(
+              child: ListView(children: [
+                for (final t in sat!.tps)
+                  ListTile(dense: true, title: Text('${t.$1} ${t.$3 == 0 ? 'H' : 'V'} ${t.$2}'), onTap: () => Navigator.pop(context, (sat!, t))),
+              ]),
+            ),
+          ],
+        ]),
+      ),
+    );
+  }
+}
+
+// قاعدة بيانات الأقمار والترددات — مستخرجة من assets/MeterGlobalSatTp.bin في G-MScreen
+// الصيغة: اسم|الزاوية×10|غرب(1)/شرق(0)|تردد/SR/قطبية،...  (القطبية من bit 8 — تجريبي)
+const List<String> kSatDb = [
+  'Eutelsat 3C|30|0|11050/17054/V,11087/17054/H,11320/1700/H,11380/3655/H,11460/2640/H,11462/1146/H,11476/1830/H,11481/45000/H,11499/2228/H,11604/9720/H,11642/1111/H,11645/2220/H,11651/1482/H,11669/1500/V,11671/1500/V,11673/1850/V,11676/2850/V,11682/1667/V,11694/3000/V,11697/1500/V,12510/2417/H,12526/4444/H,12531/2115/H,12551/1500/V,12560/1500/V,12562/1500/V,12571/1667/V,12574/1447/V,12576/1515/V,12702/13960/H,12720/13960/H,12734/16750/V,12737/2930/H',
+  'Astra 4A|49|0|11265/30000/H,11265/30000/V,11305/30000/H,11305/30000/V,11345/30000/H,11345/30000/V,11385/30000/H,11385/30000/V,11727/27500/H,11747/27500/V,11747/30000/V,11766/27500/H,11785/27500/V,11804/27500/H,11823/27500/V,11843/27500/H,11862/27500/V,11881/27500/H,11881/28000/H,11900/27500/V,11919/27500/H,11919/28000/H,11938/27500/V,11958/27500/H,11977/27500/V,11996/27500/H,12015/27500/V,12015/29950/V,12034/27500/H,12054/27500/V,12054/30000/V,12073/27500/H,12092/30000/V,12130/27500/V,12149/27500/H,12188/30000/H,12207/30000/V,12245/27500/V,12265/27500/H,12265/30000/H,12284/27500/V,12303/25546/H,12303/27500/H,12322/27500/V,12341/27500/H,12341/30000/H,12360/27500/V,12380/27500/H,12399/27500/V,12418/27500/H,12437/27500/V,12565/30000/V,12608/27500/H,12621/3660/V,12637/14468/H,12676/15000/V,12699/12934/H,12735/3333/H',
+  'Eutelsat 7A|70|0|10721/22000/H,10721/27500/V,10721/29985/H,10762/29985/H,10762/30000/V,10804/30000/H,10845/29985/H,10845/30000/H,10845/30000/V,10887/30000/H,10887/30000/V,10928/30000/H,10928/30000/V,11046/8335/H,11192/3210/H,11221/27500/H,11262/27500/H,11304/29700/H,11324/29700/V,11345/27500/H,11356/45000/H,11387/27500/H,11419/45000/H,11471/30000/H,11492/30000/V,11513/29900/H,11534/30000/V,11554/30000/H,11575/30000/V,11596/30000/H,11617/30000/V,11637/30000/H,11678/30000/H,12530/1480/H,12549/2222/V,12556/4035/V,12604/30000/H,12645/30000/H,12728/30000/H',
+  'Eutelsat 9A|90|0|11747/30000/H,11766/27500/V,11785/27500/H,11804/27500/V,11823/27500/H,11843/27500/V,11861/27500/H,11881/27500/V,11900/27500/H,11919/27500/V,11938/27500/H,11958/27500/V,11977/27500/H,11996/27500/V,12015/27500/H,12034/27500/V,12054/27500/H,12074/30000/V,12092/27500/H,12111/27500/V,12111/31400/V,12130/27500/H,12149/27500/V,12169/27500/H,12188/27500/V,12207/27500/H,12245/27500/H,12284/27500/H,12322/27500/H,12341/31400/V,12360/27500/H,12399/27500/H,12437/27500/H,12475/27500/H',
+  'Eutelsat 10A|100|0|10733/2025/V,10747/4000/V,10756/2480/V,10836/3000/V,10840/3255/V,10961/1333/H,10963/2417/H,10970/4167/V,11007/4800/V,11113/2500/V,11164/4000/V,11221/30000/V,11346/27500/H,11419/11814/H,11483/4000/V,11568/2500/V,11572/1667/V,11624/3800/V,11630/3800/V,11638/5300/H,11639/3650/V,11645/4800/H,11663/3830/H,11676/11153/H,11681/3200/H,12509/2667/H,12520/1100/H,12637/18400/V',
+  'Hotbird|130|0|10719/27500/V,10727/30000/H,10758/27500/V,10775/27500/H,10796/27500/V,10815/27500/H,10834/27500/V,10853/29900/H,10873/27500/V,10892/27500/H,10911/27500/V,10930/30000/H,10949/27500/V,10971/29700/H,10992/27500/V,11013/29900/H,11034/27500/V,11054/27500/H,11137/27500/H,11158/27500/V,11179/27500/H,11200/27500/V,11219/29900/H,11240/27500/V,11278/27500/V,11296/27500/H,11317/27500/V,11334/27500/H,11355/29900/V,11373/27500/H,11393/27500/V,11411/27500/H,11432/29900/V,11449/27500/H,11471/27500/V,11488/27500/H,11508/27500/V,11526/29700/H,11541/22000/V,11566/29900/H,11585/27500/V,11604/27500/H,11623/27500/V,11642/27500/H,11662/27500/V,11681/27500/H,11727/27500/V,11747/27500/H,11766/29900/V,11785/29900/H,11804/27500/V,11823/27500/H,11843/29900/V,11862/29900/H,11881/27500/V,11900/29900/H,11919/29900/V,11938/27500/H,11958/27500/V,11977/29900/H,11996/29900/V,12015/27500/H,12034/29900/V,12054/29900/H,12073/29900/V,12092/29900/H,12111/27500/V,12130/27500/H,12149/27500/V,12169/27500/H,12188/27500/V,12207/29900/H,12226/27500/V,12245/29900/H,12265/27500/V,12284/27500/H,12322/27500/H,12341/29900/V,12360/29900/H,12380/27500/V,12399/29700/H,12418/29900/V,12437/29900/H,12466/29900/V,12476/29900/H,12520/27500/V,12539/30000/H,12558/27500/V,12597/27500/V,12616/29900/H,12635/29900/V,12654/27500/H,12673/29900/V,12692/27500/H,12713/29900/V,12731/29900/H',
+  'Eutelsat 16A|160|0|10721/27500/H,10762/30000/H,10804/29950/H,10804/30000/H,10845/30000/H,10887/30000/H,10928/30000/H,10972/27500/V,10977/30000/H,11004/8332/H,11011/27500/V,11016/1500/H,11019/1795/H,11024/3333/H,11055/27500/V,11094/27500/V,11131/16593/V,11151/13268/V,11178/30000/V,11221/30000/H,11231/42000/V,11262/30000/H,11283/30000/V,11294/45000/H,11303/30000/H,11345/30000/H,11387/30000/H,11400/13846/V,11427/27500/V,11470/30000/V,11471/30000/H,11512/29950/V,11512/30000/H,11554/30000/H,11554/30000/V,11595/30000/H,11595/30000/V,11596/29980/H,11637/30000/H,11678/30000/H,12521/30000/H,12541/19970/V,12562/30000/H,12564/3617/V,12570/3703/H,12574/6500/V,12593/2500/V,12597/2848/V,12604/30000/H,12640/10833/H,12643/12500/V,12654/11111/H,12660/2222/H,12699/9880/H,12717/6403/H,12738/4500/H',
+  'Astra1|192|0|10714/22000/H,10729/22000/V,10744/22000/H,10758/22000/V,10773/22000/H,10788/22000/V,10803/22000/H,10818/22000/V,10832/22000/H,10847/22000/V,10862/23500/H,10876/22000/V,10891/22000/H,10906/22000/V,10921/22000/H,10936/22000/V,10964/22000/H,10979/22000/V,10994/22000/H,11023/23500/H,11038/22000/V,11053/22000/H,11068/22000/V,11082/22000/H,11097/22000/V,11112/22000/H,11127/22000/V,11156/22000/V,11171/22000/H,11186/22000/V,11229/22000/V,11244/22000/H,11259/22000/V,11273/22000/H,11288/22000/V,11303/22000/H,11318/22000/V,11332/22000/H,11347/22000/V,11362/22000/H,11377/22000/V,11391/22000/H,11421/22000/H,11436/22000/V,11464/22000/H,11494/22000/H,11509/22000/V,11538/22000/V,11553/22000/H,11582/22000/H,11597/22000/V,11612/22000/H,11627/22000/V,11656/22000/V,11671/22000/H,11686/22000/V,11720/27500/H,11739/27500/V,11758/27500/H,11798/27500/H,11817/29700/V,11836/27500/H,11856/29700/V,11876/27500/H,11895/29700/V,11914/27500/H,11934/29700/V,11954/27500/H,11973/27500/V,11992/27500/H,12012/29700/V,12032/27500/H,12051/27500/V,12070/27500/H,12090/29700/V,12110/27500/H,12129/29700/V,12148/27500/H,12168/29700/V,12188/27500/H,12207/29700/V,12226/27500/H,12246/29700/V,12266/27500/H,12285/29700/V,12304/27500/H,12324/29700/V,12344/30000/H,12363/27500/V,12382/27500/H,12402/29700/V,12422/27500/H,12441/29700/V,12460/27500/H,12480/27500/V,12515/22000/H,12545/22000/H,12552/22000/V,12574/22000/H,12604/22000/H,12633/22000/H,12663/22000/H,12692/22000/H,12728/22000/V',
+  'C_Arabsat 5C|200|0|3710/1600/V,3719/2220/H,3730/1203/H,3733/400/H,3796/1850/H,3884/27500/V,3934/27500/H,3974/27500/H',
+  'Eutelsat 21A|216|0|10919/33707/H,11175/2067/V,11358/7500/V,11394/2690/H,11480/2222/V,11484/1480/H,11486/1497/H,11488/2150/V,11489/1953/H,11491/2210/V,11496/2500/H,11499/2170/H,11510/1306/V,11520/2220/H,11543/1600/V,11547/2000/V,11560/5000/V,11569/7220/H,11578/512/H,11582/2850/V,11599/255/H,11610/6200/H,11665/1481/V,11667/1481/V,11674/1813/H,11678/2850/V,11681/1481/V,11681/3220/H,11683/1480/V,11685/1479/V,11688/2220/V,11693/1660/V,12537/2222/V',
+  'Astra 3A/3B|235|0|11644/5500/H,11675/750/V,11676/1410/V,11678/1024/V,11679/1024/V,11680/1024/V,11720/28200/H,11739/29900/V,11758/30000/H,11778/27500/V,11798/29500/H,11856/29900/V,11876/29900/H,11934/27500/V,11973/29900/V,12032/27500/H,12070/27500/H,12090/29900/V,12110/27500/H,12129/29900/V,12148/27500/H,12168/27500/V,12188/29900/H,12304/27500/H,12344/29900/H,12363/29500/V,12382/30000/H,12517/16872/V,12535/12320/V',
+  'Eutelsat 25B|260|0|10730/27500/V,10770/27500/V,10810/27500/V,10890/27500/H,10890/27500/V,10930/27500/V,10970/27500/V,11010/27500/V,11045/27500/H,11065/27500/V,11084/27500/H,11103/27500/V,11123/27500/H,11142/27500/V,11180/27500/V,11230/27500/H,11270/27500/V,11390/27500/V,11547/27500/V,11563/1500/H,11566/27500/H,11585/27500/V,11604/27500/H,11623/27500/V,11642/27500/H,11669/27500/V,11678/27500/H,11727/27500/H,11747/27500/V,11766/27500/H,11785/27500/V,11804/27500/H,11823/27500/V,11843/27500/H,11862/27500/V,11881/27500/H,11900/27500/V,11938/27500/V,11958/27500/H,11977/27500/V,11996/27500/H,12015/27500/V,12034/27500/H,12054/27500/V,12073/27500/H,12092/27500/V,12111/27500/H,12130/27500/V,12149/27500/H,12169/22000/V,12182/16200/H,12226/27500/H,12245/27500/V,12265/27500/H,12284/27500/V,12303/27500/H,12303/32000/H,12322/27500/V,12341/27500/H,12360/27500/V,12380/27500/H,12399/27500/V,12418/27500/H,12437/27500/V,12456/27500/H,12476/27500/V,12523/27500/H,12523/27500/V,12563/27500/V,12601/3600/H,12643/27500/H,12667/3200/H,12683/27500/V',
+  'Astra 2|282|0|10714/22000/H,10729/22000/V,10758/22000/V,10773/22000/H,10788/22000/V,10803/22000/H,10818/22000/V,10847/23000/V,10891/22000/H,10906/22000/V,10964/22000/H,10994/22000/H,11023/23000/H,11038/22000/V,11053/23000/H,11068/23000/V,11082/22000/H,11095/30000/V,11097/23000/V,11112/22000/H,11126/22000/V,11141/22000/H,11171/22000/H,11224/23000/V,11224/27500/H,11264/27500/V,11306/27500/H,11306/27500/V,11344/27500/H,11344/27500/V,11386/29500/H,11386/29500/V,11426/27500/H,11426/27500/V,11464/22000/H,11479/22000/V,11494/22000/H,11509/23000/V,11523/22000/H,11538/22000/V,11553/22000/H,11568/22000/V,11582/22000/H,11595/30000/V,11597/22000/V,11612/23000/H,11618/1562/V,11627/22000/V,11656/22000/V,11671/22000/H,11675/30000/H,11686/23000/V,11739/29500/V,11758/29500/H,11836/27500/H,11856/29500/V,11895/27500/V,11914/27500/H,11934/27500/V,11954/27500/H,11973/27500/V,12012/29500/V,12070/27500/H,12090/29500/V,12110/27500/H,12129/27500/V,12148/27500/H,12168/29500/V,12188/27500/H,12207/27500/V,12226/29500/H,12246/29500/V,12266/29500/H,12304/27500/H,12324/29500/V,12344/29500/H,12363/29500/V,12382/27500/H,12422/27500/H,12441/29500/V,12460/29500/H,12522/30000/V,12565/30000/H,12603/3095/V',
+  'Arabsat 5A|305|0|10757/2600/H,10796/8000/H,10805/3885/H,10827/5800/H,10924/17000/H,12512/8000/H,12521/2100/V,12529/2000/V,12566/2960/H,12618/2230/H,12624/2220/V,12632/2650/V,12713/3750/V,12719/3000/V,12722/2220/V,12725/2220/V',
+  'Astra 1G|315|0|11758/27500/H,11817/27500/V,11954/27500/H,11973/27500/V,12012/30000/V,12070/30000/H,12090/30000/V,12110/27500/H,12168/30000/V,12207/27500/V,12246/30000/V,12266/27500/H,12324/30000/V,12402/30000/V,12480/30000/V',
+  'Eutelsat 33A|330|0|10975/30000/H,11350/15710/V,12598/10057/V,12657/2597/H,12722/16730/V',
+  'Eutelsat36A/B|360|0|11212/14400/H,11221/30000/V,11230/15000/H,11254/15000/H,11263/30000/V,11304/30000/V,11346/30000/V,11387/30000/V,11429/30000/V,11474/30000/V,11491/2200/V,11510/30000/V,11557/30000/V,11586/2170/H,11592/5426/V,11727/27500/H,11727/27500/V,11747/27500/H,11747/27500/V,11766/27500/H,11766/27500/V,11785/27500/H,11785/27500/V,11804/27500/H,11804/27500/V,11823/27500/H,11823/27500/V,11843/27500/H,11843/27500/V,11862/27500/H,11862/27500/V,11881/27500/H,11881/27500/V,11900/27500/H,11900/27500/V,11919/27500/H,11919/27500/V,11938/27500/H,11938/27500/V,11958/27500/H,11958/27500/V,11977/27500/H,11977/27500/V,11996/27500/H,11996/27500/V,12015/27500/H,12015/27500/V,12034/27500/H,12034/27500/V,12054/27500/H,12054/27500/V,12073/27500/H,12073/27500/V,12092/27500/V,12111/27500/H,12130/27500/H,12130/27500/V,12149/27500/H,12169/27500/H,12174/4340/H,12190/22500/H,12207/27500/H,12207/27500/V,12226/27500/H,12245/27500/H,12245/27500/V,12265/27500/H,12284/27500/H,12284/27500/V,12303/27500/H,12303/27500/V,12322/27500/V,12341/27500/H,12360/26480/H,12360/27500/V,12380/27500/H,12399/27500/V,12418/27500/H,12437/27500/V,12440/27500/H,12456/27500/H,12476/27500/H,12476/27500/V,12507/1667/H,12520/1428/V,12540/2220/V,12572/2000/V,12712/2500/V,12715/2200/V',
+  'C_Paksat 1R|380|0|3728/29720/V,3755/7500/V,3762/4340/V,3770/7700/V,3776/1004/V,3778/2893/V,3782/2170/V,3785/2950/V,3786/29500/H,3793/4444/V,3800/7200/V,3818/6200/V,3824/2800/V,3831/2600/V,3844/14400/V,3847/1081/H,3856/2894/V,3952/2950/V,3959/7234/V,3966/2800/V,3972/6504/V,3979/3255/V,3992/2170/V,4004/15555/V,4017/3555/V,4023/5700/V,4029/3600/H,4032/3100/V,4033/2400/H,4037/4800/V,4038/6151/H,4042/2800/V,4047/3255/V,4054/7000/V,4064/2170/V,4074/6150/V,4081/3255/V,4085/2960/V,4089/2963/V,4093/2527/V,4097/2963/V,4101/2800/V,4102/4340/H,4105/1600/V,4107/1003/V,4114/5700/V,4120/2140/V,4125/5000/V,4130/2500/V,4137/3000/V,4141/2800/V,4144/2170/V,4165/22400/V,4180/2170/V,4184/2800/V',
+  'Hellas Sat 2|390|0|10971/30000/V,11012/30000/V,11053/30000/V,11135/30000/V,11474/4444/H,11478/1197/H,11512/2100/H,11516/1500/H,11556/2500/H,12190/4444/V,12194/30000/H,12214/30000/V,12252/28330/V,12271/30000/H,12290/30000/V,12441/23670/V,12464/30000/H,12483/30000/V,12524/30000/V,12565/30000/V,12594/9416/H,12606/30000/V,12647/30000/V,12688/30000/V,12729/30000/V',
+  'Turksat2/3/4A|420|0|10964/14170/V,10980/12500/V,10987/1666/H,11012/30000/V,11021/2220/H,11039/4800/H,11045/4800/H,11053/8000/H,11054/30000/V,11062/4820/H,11096/30000/H,11096/30000/V,11180/30000/H,11509/30000/H,11558/30000/V,11573/1800/H,11594/25000/V,11650/13600/V,11676/24444/V,11775/27500/V,11794/27500/H,11802/17500/V,11821/17000/H,11824/8000/V,11833/6250/V,11853/25000/H,11855/30000/V,11880/20000/H,11883/4800/V,11916/30000/V,11958/27500/V,11977/27500/H,11999/11666/V,12009/4444/V,12015/27500/H,12034/27500/V,12054/27500/H,12073/27500/V,12079/6400/H,12089/4400/H,12095/4800/H,12103/8333/H,12188/27500/V,12196/9600/H,12209/10000/H,12213/5833/V,12219/6500/H,12220/4800/V,12228/8400/V,12236/4000/V,12245/27500/H,12265/27500/V,12294/12000/V,12310/15000/V,12329/6666/H,12336/5520/H,12344/30000/V,12346/9600/H,12356/7100/H,12379/30000/H,12380/27500/V,12422/27500/V,12422/30000/H,12446/2400/H,12458/30000/V,12461/20800/H,12514/11670/H,12524/22500/V,12531/15000/H,12559/27500/V,12588/22500/V,12605/27500/V,12610/20830/H,12641/30000/H,12685/30000/H,12685/30000/V,12729/27500/H,12729/30000/V',
+  'Intelsat 12|450|0|11155/45000/V,11477/30000/V,11495/45000/V,11513/30000/V,11555/27689/V,11555/30000/V,11591/27689/V,11595/30000/V,11635/27689/V,11635/30000/V,11675/27689/V,11675/30000/V,12518/14236/H',
+  'AzerSpace 1|460|0|11015/13000/H,11024/12700/V,11027/7500/H,11095/30000/H,11095/30000/V,11134/27500/H,11175/27500/H',
+  'C_AzerSpace 1|460|0|0/300/H,0/3700/H,3730/30000/V,3753/1437/V,3775/1250/H,3810/1777/V,3833/1077/V,4021/1180/V,4024/1190/V,4026/1200/V,4028/1166/V,4050/30000/V,4073/1200/H,4074/1010/V,4079/1000/H,4080/1025/V,4092/1000/V,4105/1320/H,4120/2270/V,4122/2381/V',
+  'C_Yamal 202|490|0|3520/8000/H,3589/3235/H,3635/3230/H,3640/3215/H,3644/3230/H,3660/3333/H,3714/8888/H,3735/3219/V,3743/34075/H,3752/3230/V,3793/1800/H,3832/1500/V,3908/1356/H,3936/3230/H,3941/4000/H,3950/1500/H,3961/8570/H,3970/4275/H,3976/4285/H,4071/28107/H',
+  'Yahsat 1A|525|0|11747/27500/H,11766/27500/V,11785/27500/H,11843/27500/V,11862/27500/H,11881/27500/V,11900/27500/H,11938/27500/H,11958/27500/V,11977/27500/H,11996/27500/V,12015/27500/H,12034/27500/V,12054/27500/H,12073/27500/V,12092/27500/H,12111/27500/V,12130/27500/H,12169/27500/H',
+  'Express AM22|530|0|10974/4850/H,11021/5000/H,11044/44950/V,11161/2122/V,11468/1250/V,11518/1600/V,11532/2205/H,11544/1666/H,12508/1100/V,12535/7233/H,12552/8000/H,12594/27500/V,12608/2830/H,12617/8122/H,12631/3000/V,12657/7500/V,12657/44100/H,12671/2277/V',
+  'Insat 3E|550|0|10845/32727/V,10962/5926/V,10968/10852/V,10998/2200/V,11045/40000/V,11186/8495/V,11215/13000/H,11225/30000/V,11232/17000/H,11265/30000/V,11340/5000/H,11345/30000/V,11385/30000/V,11425/30000/V,11486/8000/V,11550/15600/V,12522/27500/V,12531/2500/H,12691/5000/H,12720/30000/H',
+  'Bonum 1|560|0|11881/27500/H,11919/27500/H,11958/27500/H,11996/27500/H,12034/27500/H,12054/27500/V,12073/27500/H,12092/27500/V,12111/27500/H,12130/27500/V,12149/27500/H,12169/27500/V,12188/27500/H,12207/27500/V,12226/27500/H,12245/27500/V,12265/27500/H,12284/27500/V,12303/27500/H,12322/27500/V,12341/27500/H,12399/27500/V,12437/27500/V,12476/27500/V',
+  'NSS 12|570|0|11042/1210/V,11044/1775/V,11105/45000/H,11566/10750/H,11588/16532/H,11613/4800/H',
+  'C_NSS 12|570|0|3632/2625/V,3641/2324/H,3645/2590/H,3648/3255/H,3654/4550/H,3665/3690/H,3679/3879/H,3800/20000/V,3900/6666/V,3973/18392/H,4055/26000/V,4060/7043/H,4095/30000/V',
+  'Intelsat 904|600|0|11491/3700/H,11498/7270/H,11504/3330/V,11522/3700/V,11558/10000/V,11672/4960/H',
+  'C_Intelsat 904|600|0|3737/1653/V,3751/18315/V,3764/2604/V,3767/2315/V,3772/5000/V,3778/5720/V,3785/5757/V,4045/16913/V',
+  'Intelsat 902|620|0|10989/1600/V,10991/1580/V,10993/1560/V,10995/1540/V,10997/1520/V,10999/1500/V,11002/3500/V,11006/2300/V,11009/3500/V,11012/2300/V,11016/3500/V,11020/2300/V,11023/3500/V,11026/2300/V,11030/3500/V,11194/1600/H,11555/28900/H,11555/30000/V,11595/31003/H',
+  'C_Intelsat 902|620|0|3727/34286/V,3763/34286/V,3807/34286/V,3814/4213/H,3843/34286/V,3853/1445/H,3857/2465/H,3860/3100/H,3992/26000/H,4055/34286/V',
+  'C_Intelsat 906|642|0|3644/8545/V,3654/5632/V,3775/1438/V,3884/4900/H,3893/3072/H,3900/3800/H,4039/2034/H,4044/2848/H,4066/2848/H,4094/11000/H',
+  'C_Intelsat 17|660|0|3845/28800/V,3845/30000/H,3876/14300/H,3885/30000/V,3894/13840/H,3914/11200/H,3925/30000/V,3932/18330/H,3966/14400/H,3968/8800/V,3980/7200/V,3984/14400/H,4006/14400/H,4015/30000/V,4024/14400/H',
+  'Intelsat 20|685|0|10970/30000/H,10970/30000/V,11010/30000/H,11010/30000/V,11050/30000/H,11050/30000/V,11078/1000/H,11090/30000/H,11090/30000/V,11130/30000/H,11130/30000/V,11170/28750/V,11170/30000/H,11474/28750/V,11474/30000/H,11514/28750/V,11514/30000/H,11521/9922/V,11554/30000/H,11554/30000/V,11594/27500/V,11594/30000/H,11634/30000/H,11634/30000/V,11674/30000/H,11674/30000/V,12522/27500/V,12561/2866/V,12562/27500/H,12574/9700/V,12602/26657/V,12634/16170/V,12638/3700/H,12657/4883/V,12682/27500/H,12682/30000/V,12722/26657/V,12722/28750/H',
+  'C_Intelsat 20|685|0|3713/2800/V,3723/9600/V,3732/7200/V,3740/30000/H,3742/7000/V,3752/9300/V,3766/7200/V,3768/7500/H,3774/2944/V,3777/2940/V,3780/7500/H,3782/2965/V,3788/4400/V,3791/7200/H,3795/5580/V,3802/10800/H,3809/15000/V,3828/7200/V,3841/29910/H,3850/14400/V,3868/14400/V,3869/14454/H,3887/2960/V,3891/1954/V,3893/2500/V,3900/10370/V,3900/22222/H,3913/6510/V,3922/7000/V,3930/25000/H,3936/14400/V,3974/19500/H,3993/4000/H,3996/6666/V,4000/7250/H,4003/7200/V,4013/7200/H,4013/7200/V,4034/20500/H,4034/21600/V,4054/4400/V,4059/3529/V,4064/4400/V,4064/19850/H,4070/4340/V,4076/3906/V,4083/3550/V,4090/14368/H,4092/2963/V,4103/5720/H,4104/7200/V,4116/8800/V,4126/17500/H,4130/12800/V,4150/15000/H,4155/22500/V,4163/7500/H,4182/16296/H,4184/21600/V,4195/4000/H',
+  'Eutelsat 70B|705|0|11057/30000/V,11097/23627/H,11490/2150/V,11520/3332/V,11555/3034/H,11565/11401/H,11600/18333/H,12508/2400/V,12516/1600/V,12524/1600/V,12529/2220/V,12682/16046/V',
+  'ABS 1|750|0|10985/35007/H,11045/44922/H,11471/22500/V,11489/7500/V,11508/3100/V,11531/22000/V,11559/22000/V,11605/43200/V,11665/44922/V,11740/43000/V,11800/45000/V,11860/45000/V,11920/45000/V,11980/45000/V,12040/45000/V,12100/45000/V,12133/12684/H,12160/45000/V,12287/44000/V,12347/45000/V,12407/45000/V,12467/45000/V,12524/30000/H,12533/44950/V,12533/45000/H,12587/45000/H,12653/43000/V',
+  'C_ABS 1|750|0|3496/26583/V,3522/2750/V,3618/29000/V,3632/25715/H,3642/8552/V,3658/25715/H,3672/1583/V,3700/33000/V,3740/33000/V,3770/2142/V,3800/30000/V,3818/3333/V,3821/2400/V,3836/1500/V,3942/30000/V,3978/29000/V,4005/4000/H,4029/2583/V,4123/2800/V',
+  'C_Apstar 2R|765|0|3638/1600/H,3648/7857/V,3664/2400/H,3720/29620/H,3740/30000/V,3753/2400/H,3757/4440/H,3769/13333/H,3780/30000/V,3787/4600/H,3793/4443/H,3799/4280/H,3805/4800/H,3811/3460/H,3815/3333/H,3842/2860/H,3848/7857/V,3856/5925/V,3871/10000/V,3880/30000/H,3920/28340/H,3960/30000/H,3985/3700/H,3990/4300/H,3998/3200/H,4003/4340/H,4009/4300/H,4016/4340/H,4019/2222/V,4022/2961/V,4026/4800/H,4029/1610/H,4034/4610/H,4035/4610/V,4040/4610/H,4043/1600/H,4050/4300/H,4056/3600/H,4064/4000/H,4070/4000/H,4075/4610/H,4079/1600/H,4082/2857/H,4087/4650/H,4088/4650/V,4092/3850/H,4104/5000/H,4110/4600/H,4117/4285/H,4122/1920/H,4125/4441/H,4131/3600/H,4135/3333/H,4155/7200/H',
+  'Thaicom 5|785|0|11009/30000/H,11170/30000/H,11480/30000/H,11560/30000/H,11600/30000/H,11640/30000/H,11680/30000/H,12272/30000/H,12313/30000/H,12313/30000/V,12355/30000/H,12355/30000/V,12396/30000/H,12405/45000/V,12438/30000/H,12467/45000/V,12479/30000/H,12521/12500/V,12521/30000/H,12562/25776/H,12562/30000/V,12604/30000/H,12604/30000/V,12645/30000/V,12657/45000/H,12687/30000/V,12720/45000/H,12728/30000/V',
+  'C_Thaicom 5|785|0|3408/2916/V,3410/1500/V,3414/2916/V,3418/3750/V,3425/2592/V,3438/2915/V,3440/26666/H,3448/1555/V,3454/3750/V,3457/2857/V,3465/2916/V,3468/2916/V,3471/3333/V,3482/5416/V,3505/30000/V,3520/28125/H,3545/30000/V,3550/12500/H,3563/5555/H,3569/1852/H,3585/30000/V,3600/26667/H,3625/30000/V,3640/28066/H,3665/3704/H,3688/2000/H,3696/4167/H,3711/15000/H,3715/1481/V,3718/1600/V,3722/2078/H,3731/12500/H,3748/2005/H,3764/4551/H,3800/30000/H,3800/32727/V,3826/4700/H,3834/8000/H,3840/12500/V,3841/2900/H,3916/4340/H,3920/30000/H,3920/32727/V,3949/2550/V,3980/1500/V,4002/2020/V,4006/1250/V,4008/15000/H,4013/8333/V,4016/1800/H,4036/4688/H,4040/30000/V,4064/5000/V,4069/2915/V,4080/30000/H,4091/2000/V,4094/2915/V,4113/13333/H,4120/30000/H,4120/32727/V,4132/15000/H,4147/8333/H,4154/3333/H,4160/32727/V,4168/15000/H,4169/14400/H',
+  'Insat 2E/4A|830|0|10970/32720/H,10970/32720/V,11010/27500/H,11010/32720/V,11050/32720/H,11050/32720/V,11090/32720/H,11090/32720/V,11130/32720/H,11130/32720/V,11170/32720/H,11170/32720/V,11470/32720/H,11470/32720/V,11510/32720/H,11510/32720/V,11550/32720/H,11550/32720/V,11590/32720/H,11590/32720/V,11630/32720/H,11630/32720/V,11670/32720/H,11670/32720/V',
+  'C_Insat 2E/4A|830|0|3756/13333/H,3767/3000/H,3774/4250/V,3805/28500/H,3833/7200/V,3841/6920/H,3860/6920/H,3861/3974/V,3874/3400/H,3884/1500/H,3885/27500/V,3892/3300/H,3898/6800/H,3949/3673/H,3958/9500/H,4005/26666/H,4030/4440/H,4034/2400/H,4040/7500/H,4054/13230/H,4072/6500/H,4078/3500/H,4090/7500/H,4096/2170/H,4100/4750/H,4114/8000/H,4133/11888/H,4156/15000/H,4170/4650/H,4175/3250/H,4181/3232/H',
+  'Intelsat 15|852|0|10995/10000/H,11466/2000/H,11720/28800/H,11758/45000/V,11760/28800/H,11800/28800/H,11838/45000/V,11840/28800/H,11880/28800/H,11920/28800/H,11960/28800/H,12000/28000/H,12040/28800/H,12080/28800/H,12120/28800/H,12160/28800/H,12536/3353/V,12560/30000/V,12600/30000/V,12640/30000/V',
+  'ST 2|880|0|10972/1915/V,11050/30000/H,11050/30000/V,11164/44995/H,11164/44995/V,11483/44995/H,11483/44995/V,11546/44995/H,11546/44995/V,11609/43975/V,11609/44995/H,11633/30000/H,11669/30000/H,11672/44995/H,11672/44995/V,12702/20000/H',
+  'Yamal 201|900|0|10972/11200/H,11057/22222/H,11165/25000/H,11241/2740/V,11265/30000/H,11290/5000/V,11299/20000/H,11385/30000/H,11425/32730/V,11471/11160/V,11482/4027/H,11487/11850/V,11490/7243/H,11504/2080/H,11512/6160/H,11524/1250/V,11565/1980/V,11573/2500/V,11580/30000/H,11649/2170/H,11652/3000/H,11668/14400/H,11674/5000/V,12505/2020/V,12538/16317/V,12718/27500/V',
+  'C_Yamal 201|900|0|3582/2850/H,3588/4285/H,3594/2850/H,3600/5925/H,3603/3300/V,3605/2626/H,3617/1850/V,3618/3038/H,3645/28000/H,3646/34170/V,3675/17500/H,3781/10000/V,3806/9000/H,3820/13330/H,3837/14814/H,3870/3600/H,3908/2850/H,3920/3000/H,3924/2850/H,3942/12150/H,3969/22000/H,3981/3600/V,3986/3610/V,3991/3600/V,4000/3610/V,4019/3600/V,4023/3610/V,4026/14990/H,4029/3600/V,4033/3610/V,4038/3600/V,4043/3610/V,4046/15284/H,4052/3610/V,4059/3600/H,4069/3610/H,4074/3600/H,4106/14990/V,4124/14990/H,4126/15284/V,4144/14990/H',
+  'Measat 3/3a|915|0|10732/30000/V,10772/30000/V,10812/30000/V,10852/30000/V,10892/30000/V,10932/30000/V,10982/30000/V,11022/30000/V,11062/30000/V,11102/30000/V,11142/30000/V,11182/30000/V,11522/30000/V,11602/30000/V,11642/30000/V,11682/30000/V,12276/30000/V,12316/30000/H,12316/30000/V,12356/30000/V,12396/30000/V,12396/31000/H,12436/31000/H,12476/30000/V,12523/30000/H,12523/32700/V,12563/30000/H,12563/30000/V,12563/32000/H,12603/30000/H,12603/30000/V,12603/32000/H,12643/30000/H,12643/30000/V,12643/32000/H,12683/27500/H,12683/30000/H,12683/30000/V,12723/30000/V,12723/32700/H',
+  'C_Measat 3/3a|915|0|3423/1556/H,3425/1333/H,3652/9783/H,3705/4290/H,3708/2090/V,3710/2860/H,3717/7500/H,3720/2170/V,3724/3030/V,3727/9833/H,3736/1833/H,3760/29700/H,3760/29700/V,3805/5064/V,3814/6660/V,3840/29720/V,3840/30000/H,3880/29720/V,3889/15000/H,3904/2916/H,3918/18385/H,3920/30000/V,3932/2916/H,3960/29700/H,4000/29700/H,4004/5000/V,4012/10000/V,4025/5000/V,4040/28600/H,4120/29720/V,4120/30000/H,4147/7200/H,4164/20640/H',
+  'ChinaSat 9|922|0|11880/28800/H,11920/28800/H,11940/28800/V,11960/28800/H,11980/28800/V,12020/28800/V,12060/28800/V,12100/28800/V,12140/28800/V,12180/28800/V',
+  'Insat 3A/4B|935|0|11050/29500/V,11090/29500/V,11130/29500/V,11170/29500/V,11470/29500/V,11470/30000/H,11510/29500/V,11510/30000/H,11550/29500/H,11550/29500/V,11590/29500/H,11590/29500/V,11630/30000/V,11630/32000/H,11670/29500/V,11670/32000/H',
+  'C_Insat 3A/4B|935|0|3711/6250/H,3721/6250/H,3728/4250/H,3734/4250/H,3740/4250/H,3750/4250/H,3774/4250/H,3797/4250/H,3802/4250/H,3832/6250/H,3840/6250/H,3848/4250/H,3925/27500/H,3952/6250/H,3960/6250/H,3970/6250/H,3978/6250/H,3992/6250/H,4000/6250/H,4011/8600/H,4020/4250/H,4032/6250/H,4040/6250/H,4051/8600/H,4060/4250/H,4072/6250/H,4080/6250/H,4085/30000/V,4090/6250/H,4098/6250/H,4116/4250/H,4122/4250/H,4128/4250/H,4140/4250/H,4150/4000/H,4154/2000/H',
+  'NSS 6|950|0|11090/30000/H,11090/30000/V,11605/3340/H,11619/5000/H,11635/27500/H,11990/43000/H,12050/45000/H,12110/40700/H,12170/40700/H,12535/43200/V,12595/43200/H,12595/43200/V,12647/30000/H,12647/32700/V,12688/27500/V,12688/32000/H,12729/26400/H,12729/32700/V',
+  'Express AM33|965|0|10980/3200/H,11000/3375/H,11028/1666/V,11053/1570/V,11055/1666/V,11116/34000/V,11117/4444/H',
+  'AsiaSat 5|1005|0|12273/3300/H,12323/12000/V,12354/3300/H,12427/2916/V,12458/4000/H,12522/40700/V,12582/40700/V,12623/4296/H,12642/40700/V,12693/5000/H,12702/40700/V',
+  'C_AsiaSat 5|1005|0|3660/27500/V,3678/3600/H,3700/30000/V,3726/6666/V,3760/27500/H,3765/4640/V,3770/2644/V,3784/3255/H,3820/27500/V,3840/29720/H,3960/30000/H,3980/29720/V,4000/28125/H,4020/28100/V,4040/29720/H,4114/18400/H,4132/10587/H',
+  'AsiaSat 7|1055|0|12316/2083/H,12579/4000/H,12596/30000/V,12720/30000/V',
+  'C_AsiaSat 7|1055|0|3652/14100/V,3664/2815/V,3690/11393/V,3705/3555/V,3715/8167/H,3725/4833/V,3725/8165/H,3732/7250/V,3734/6500/H,3739/2333/V,3745/6520/V,3750/2333/V,3755/4418/V,3760/26000/H,3780/29720/V,3800/28100/H,3820/27500/V,3840/29720/H,3860/28100/V,3880/27500/H,3890/11840/V,3902/2963/V,3906/2814/V,3915/7260/V,3920/29720/H,3940/28100/V,3960/27500/H,3980/28100/V,4000/29720/H,4020/28100/V,4040/26500/H,4060/26666/V,4065/4296/H,4070/2963/H,4076/6500/H,4082/3185/H,4087/3178/H,4100/29720/V,4120/27500/H,4140/27500/V,4146/5317/H,4165/5040/H,4172/2480/H,4176/2815/H,4180/30000/V',
+  'C_NSS 11|1080|0|2535/22500/H,2535/22500/V,2565/22500/H,2565/22500/V,2595/20000/H,2595/22500/V,2625/22500/H,2625/22500/V,2655/22500/H,2655/22500/V',
+  'NSS 11|1082|0|11024/15675/V,11101/45000/V,11480/28800/V,11481/18750/H,11483/26600/H,11510/20000/H,11520/30000/H,11520/30000/V,11539/20000/H,11560/30000/H,11560/30000/V,11568/20000/H,11598/20000/H,11600/30000/H,11600/30000/V,11627/20000/H,11640/24000/H,11640/30000/V,11656/18750/H,11680/30000/V,11685/18750/H,12401/45000/H,12461/45000/H,12531/30000/V,12571/30000/V,12711/45000/H,12731/30000/V',
+  'C_NSS 11|1082|0|2535/22500/H,2535/22500/V,2565/22500/H,2565/22500/V,2595/20000/H,2595/22500/V,2625/22500/H,2625/22500/V,2655/22500/H,2655/22500/V',
+  'C_ChinaSat 10|1105|0|3520/30000/V,3560/30000/V,4076/22500/V',
+  'Koreasat 5|1130|0|12310/29976/V,12347/10740/V,12358/3700/V,12365/2400/H,12365/5063/V,12435/3564/H,12514/2500/H,12560/2300/H,12590/29900/H,12590/30000/V,12602/17500/H,12612/1070/V,12618/3900/V,12665/3818/H',
+  'C_Koreasat 5|1130|0|3429/1250/H,3600/31000/V,3627/17985/H,3746/4400/H,3750/2083/V,3752/4700/H,3762/3500/H,3767/4000/H,3774/6500/H,3780/29900/V,3786/5632/H,3815/1700/V,3819/1000/V,3835/7000/H,3863/4333/V,3880/29900/H,3908/1818/H,3910/1500/H,3922/1640/H,3925/2590/H,3932/15800/V,3934/7200/H,3946/7400/V,3960/30000/H,3984/3636/H,3988/2500/H,4007/4800/V,4014/7200/H,4044/2833/V,4052/3333/H,4055/2900/V,4057/2727/H,4080/28125/H,4100/29900/V,4110/11669/H,4120/663/H,4122/2244/H,4131/12250/H,4140/30000/V,4186/8800/V',
+  'C_ChinaSat 6B|1155|0|3600/27500/V,3640/27500/V,3680/27500/V,3709/10920/H,3740/27500/V,3750/10490/H,3770/12360/H,3796/6930/H,3807/6000/V,3808/8800/H,3815/4420/V,3825/6780/V,3834/5400/V,3840/27500/H,3846/5950/V,3854/4420/V,3861/4800/V,3871/9080/V,3880/27500/H,3885/4340/V,3892/4420/V,3903/9300/V,3913/6400/V,3929/8840/V,3940/5948/V,3950/11406/H,3951/9520/V,3960/3570/H,3971/10000/H,3980/27500/V,4000/27500/H,4020/27500/V,4040/27500/H,4060/27500/V,4067/9988/H,4100/27500/V,4116/21374/H,4135/4340/H,4140/27500/V,4147/6150/H,4158/8680/H,4171/9200/H,4175/18000/V,4192/6000/V',
+  'Koreasat 6|1160|0|11747/23800/H,11785/21300/H,11823/23800/H,11862/23800/H,11900/21300/H,11938/23800/H,12290/29500/H,12330/29500/H,12350/26700/V,12370/29500/H,12390/26700/V,12410/29500/H,12430/26700/V,12450/27489/H,12490/29500/H,12523/7900/V,12530/27489/H,12570/29500/H,12610/29500/H,12650/29500/H,12670/26700/V,12690/29500/H,12730/29500/H',
+  'AsiaSat 4|1222|0|12415/43200/V',
+  'C_AsiaSat 4|1222|0|4014/5037/H,4156/2170/H',
+  'JCSAT 4A|1240|0|12313/23303/H,12373/23303/H,12433/23303/H,12448/21096/V,12490/30000/H,12508/23303/V,12523/23303/H,12530/30000/H,12538/23303/V,12553/23303/H,12568/23303/V,12570/30000/H,12583/23303/H,12598/23303/V,12602/15000/H,12613/23303/H,12628/23303/V,12643/23303/H,12673/23303/H,12688/23303/V,12703/23303/H,12718/23303/V,12733/23303/H',
+  'JCSAT 3A|1280|0|12268/23303/V,12348/23303/V,12368/23303/H,12408/23303/H,12428/23303/V,12468/23303/V,12508/23303/V,12523/23303/H,12538/23303/V,12553/23303/H,12568/23303/V,12583/23303/H,12598/23303/V,12613/23303/H,12628/21096/V,12643/23303/H,12673/23303/H,12688/23303/V,12703/23303/H,12718/23303/V,12733/23303/H',
+  'Vinasat1/JCSAT5|1320|0|10968/28800/H,11008/28800/H,11048/28800/H,11088/28800/V,11472/23200/H,11549/28500/H,11589/28800/H,11629/28800/H,11669/30000/H,12257/3096/V,12323/13330/V,12746/3096/H',
+  'C_Vinasat1/JCSA|1320|0|3547/2000/V,3549/1200/V,3590/19200/V',
+  'Apstar 6|1340|0|12269/18000/V,12395/27500/V,12435/27500/V,12515/27500/V,12595/27500/V,12675/27500/V',
+  'C_Apstar 6|1340|0|3720/30000/H,3840/27500/H,3865/4100/V,3919/1200/V,4020/30000/V,4032/2688/H,4039/2800/H,4043/2800/H,4051/9628/H',
+  'Telstar 18|1380|0|12272/33333/H,12292/45000/V,12354/43000/V,12416/45000/V,12429/3330/H,12439/2500/H,12472/33500/V,12499/7200/V,12538/41250/V,12598/43000/V,12629/43200/H,12660/45000/V,12690/43200/H,12721/41250/V',
+  'C_Telstar 18|1380|0|3552/10000/V,3703/4444/V,3820/30000/V,3825/3333/H,3830/2222/H,3834/3600/H,3840/4444/H,3856/2500/H,3866/4290/H,3872/6660/H,3888/1850/H,3935/3000/V,3948/17600/V',
+  'Express AM3|1400|0|10981/44948/V,11082/2500/H,11124/4340/V,11387/30000/V,11429/22800/H,11530/22250/H,11557/22250/H,11665/38400/V,12207/27500/V,12226/27500/H,12245/27500/V,12303/27500/H,12322/27500/V,12380/27500/H,12399/27500/V,12456/27500/H,12476/27500/V',
+  'Superbird C2|1440|0|12508/21096/V,12558/3515/V,12598/21096/V,12658/21096/V',
+  'Optus D2|1520|0|12295/1644/V,12297/835/V,12519/22500/V,12546/22500/V,12581/22500/H,12608/22500/H,12706/22500/V,12734/22500/V',
+  'Optus C1/D3|1560|0|11720/29450/H,11762/27800/H,11804/29450/H,11804/30000/V,11845/27800/V,11845/29450/H,11886/27800/H,11886/30000/V,11928/27800/H,11928/30000/V,11970/27800/H,12011/29455/H,12052/29450/H,12094/27800/V,12094/29450/H,12136/27800/H,12136/27800/V,12177/27800/H,12177/27800/V,12278/27800/H,12358/27800/H,12369/30000/V,12398/27800/H,12438/27800/H,12478/27800/H,12487/30000/V,12518/27800/H,12558/27800/H,12567/30000/V,12598/27800/H,12638/27800/H,12647/30000/V,12689/27800/H,12707/22500/H,12712/45000/V',
+  'Optus D1|1600|0|12267/22500/H,12295/22500/H,12331/22500/H,12358/22500/H,12394/22500/H,12421/22500/H,12456/22500/H,12470/47300/H,12483/22500/H,12519/22500/H,12532/47300/H,12546/22500/H,12581/22500/H,12608/22500/H,12644/22500/H,12671/22500/H,12707/22500/H,12734/22500/H',
+  'Intelsat 19|1660|0|12286/30000/H,12485/4600/V,12526/30000/H,12569/26809/V,12595/2893/H,12613/2222/H,12646/28066/H,12686/28124/H,12726/28066/H',
+  'C_Intelsat 19|1660|0|3724/5185/V,3736/2963/V,3747/11200/H,3760/30000/V,3780/30000/H,3805/3960/V,3810/15000/H,3815/4400/V,3851/10800/V,3880/30000/V,3900/30000/H,3920/28800/V,3940/27690/H,3959/3555/V,3980/30000/H,4011/7500/H,4040/30000/V,4075/3921/H,4080/30000/V,4140/29910/H,4161/3448/V,4180/30000/H',
+  'GE 23|1720|0|11537/1500/V,11623/3500/V,11646/2200/V',
+  'C_GE 23|1720|0|3916/3330/H,3952/7500/H,4160/5000/V,4174/1000/V,4195/1415/H',
+  'Intelsat 18|1800|1|10995/45000/H,11075/45000/H,11075/45000/V,11155/28588/H,11155/28588/V,11513/3750/H',
+  'C_Intelsat 18|1800|1|3753/30000/V,4015/30000/H,4070/3443/V,4095/30000/H,4174/11000/H',
+  'Thor 5/6|8|1|10716/24500/H,10747/25000/H,10747/25000/V,10778/25000/H,10778/25000/V,10809/25000/H,10809/25000/V,10841/25000/H,10872/25000/H,10872/25000/V,10903/25000/H,10903/25000/V,10934/25000/H,10934/25000/V,11063/1000/H,11216/25000/V,11229/25000/H,11247/24500/V,11261/25000/H,11278/25000/V,11293/25000/H,11309/25000/V,11325/25000/H,11341/25000/V,11357/24500/H,11372/25000/V,11389/24500/H,11403/25000/V,11421/24500/H,11608/5655/H,11688/1110/H,11727/28000/V,11747/28000/H,11766/28000/V,11785/28000/H,11804/28000/V,11823/30000/H,11843/30000/V,11862/28000/H,11881/30000/V,11900/28000/H,11919/28000/V,11938/28000/H,11958/28000/V,11977/30000/H,11996/28000/V,12015/30000/H,12034/30000/V,12054/30000/H,12073/28000/V,12092/28000/H,12111/30000/V,12130/28000/H,12149/28000/V,12188/28000/V,12207/30000/H,12226/27500/V,12265/28000/V,12284/30000/H,12303/27500/V,12322/30000/H,12360/30000/H,12380/30000/V,12399/25000/H,12418/28000/V,12456/28000/V,12476/30000/H,12607/26667/V,12643/26660/V,12687/27500/H,12687/28800/V,12723/27500/H',
+  'Thor 5/6|10|1|10716/24500/H,10747/25000/H,10747/25000/V,10778/25000/H,10778/25000/V,10809/25000/H,10809/25000/V,10841/25000/H,10872/25000/H,10872/25000/V,10903/25000/H,10903/25000/V,10934/25000/H,10934/25000/V,11063/1000/H,11216/25000/V,11229/25000/H,11247/24500/V,11261/25000/H,11278/25000/V,11293/25000/H,11309/25000/V,11325/25000/H,11341/25000/V,11357/24500/H,11372/25000/V,11389/24500/H,11403/25000/V,11421/24500/H,11608/5655/H,11688/1110/H,11727/28000/V,11747/28000/H,11766/28000/V,11785/28000/H,11804/28000/V,11823/30000/H,11843/30000/V,11862/28000/H,11881/30000/V,11900/28000/H,11919/28000/V,11938/28000/H,11958/28000/V,11977/30000/H,11996/28000/V,12015/30000/H,12034/30000/V,12054/30000/H,12073/28000/V,12092/28000/H,12111/30000/V,12130/28000/H,12149/28000/V,12188/28000/V,12207/30000/H,12226/27500/V,12265/28000/V,12284/30000/H,12303/27500/V,12322/30000/H,12360/30000/H,12380/30000/V,12399/25000/H,12418/28000/V,12456/28000/V,12476/30000/H,12607/26667/V,12643/26660/V,12687/27500/H,12687/28800/V,12723/27500/H',
+  'Amos 2/3|40|1|10722/30000/V,10758/27500/V,10758/30000/V,10806/30000/V,10842/30000/V,10890/27500/V,10926/27500/V,10972/30000/V,11030/27500/V,11033/3000/H,11058/13750/V,11062/4500/H,11095/11480/H,11103/30000/V,11113/8518/H,11140/30000/H,11175/30000/H,11222/30000/H,11258/30000/H,11304/8889/H,11389/30000/H,11425/30000/H,11474/27500/V,11501/13750/V,11553/27500/V,11590/3700/H,11624/22500/H,12410/20833/H',
+  'Eutelsat 5|50|1|10972/29950/V,11013/30000/V,11054/29950/V,11096/29950/V,11179/30000/V,11456/2400/H,11471/29950/V,11480/3215/H,11509/29500/H,11512/29950/V,11554/29950/V,11596/29950/V,11637/30000/V,11675/30000/H,11679/29950/V,12522/29950/V,12564/29950/V,12585/35000/H,12606/35000/V,12627/35000/H,12648/29500/V,12669/35000/H,12690/29950/V,12711/35500/H,12732/29950/V',
+  'Nilesat|70|1|10719/22000/V,10727/27500/H,10758/27500/V,10777/27500/H,10796/27500/V,10815/27500/H,10834/30000/V,10853/27500/H,10873/27500/V,10892/27500/H,10922/27500/V,10930/27500/H,10992/5000/V,11059/23700/H,11158/5000/V,11219/27500/H,11227/27500/V,11258/27500/H,11277/27500/V,11296/27500/H,11315/27500/V,11334/27500/H,11354/27500/V,11373/27500/H,11392/27500/V,11411/30000/H,11430/27500/V,11449/27500/H,11475/27500/V,11488/27500/H,11514/27500/V,11526/27500/H,11559/27500/V,11603/27500/H,11641/27500/H,11658/27500/V,11680/27500/H,11682/4814/V,11727/30000/H,11747/27500/V,11766/27500/H,11785/27500/V,11804/30000/H,11823/27500/V,11843/27500/H,11862/27500/V,11881/30000/H,11900/27500/V,11919/27500/H,11938/27500/V,11958/27500/H,11977/27500/V,11996/30000/H,12015/27500/V,12034/27500/H,12054/27500/V,12073/30000/H,12092/27500/V,12111/27500/H,12130/27500/V,12149/27500/H,12169/27500/V,12188/27500/H,12207/27500/V,12226/27500/H,12245/27500/V,12265/27500/H,12284/27500/V,12322/30000/V,12341/27500/H,12360/27500/V,12380/27500/H,12399/27500/V,12418/27500/H,12437/27500/V,12467/27500/H,12476/27500/V',
+  'Eutelsat 8|80|1|10971/27500/H,10971/27500/V,11013/27500/H,11013/27500/V,11054/27500/H,11054/27500/V,11096/27500/H,11096/30000/V,11137/27500/H,11179/27500/H,11471/27500/V,11512/30000/V,11554/27500/V,11595/27500/V,11637/27500/V,11678/27500/V,12521/27500/H,12521/27500/V,12543/2222/V,12563/27500/V,12604/27500/H,12604/27500/V,12646/27500/H,12646/27500/V,12655/5000/V,12687/27500/H,12687/29980/V,12729/27500/V',
+  'Express AM44|110|1|10957/2300/V,10983/12110/V,11152/2860/V,11483/3470/V,11566/8000/H',
+  'Eutelsat 12|125|1|11008/2141/V,11390/27500/V,11645/2223/H,12556/8210/V,12577/2222/H,12638/13980/H,12718/36510/H,12752/2666/V',
+  'Telstar 12|150|1|10983/45000/H,11401/18350/V,11428/25720/V,11506/2894/V,11568/2678/H,11733/45000/H,11795/45000/H,11857/45000/H,11919/45000/H,12550/4411/H,12585/3198/H,12600/6420/H,12609/7552/H,12707/4054/H',
+  'C_Intelsat 901|180|1|3877/16195/H,3906/26500/H,4000/7636/V,4008/6730/V,4015/4445/V,4032/9037/V,4069/2500/V,4071/1600/V',
+  'NSS 7|200|1|11585/2200/H',
+  'SES 4|220|1|10986/30000/V,11126/17250/H,11551/40000/V,11671/30000/V,11777/4000/H,11861/35000/H,11921/35000/H,12530/30000/V,12570/30000/V,12610/30000/V,12650/30000/V,12674/20250/H,12690/30000/V,12730/30000/V',
+  'C_SES 4|220|1|3631/7200/H,3631/7200/V,3706/1000/V,3713/3254/V,3718/1267/H,3724/30000/H,3732/1000/H,3761/22650/V,3825/8950/H,3867/255/V,3966/2221/H,3970/3332/H,3976/1844/H,4016/3662/H,4033/3689/V,4039/3906/V,4043/3560/V,4048/3333/V,4053/3333/V,4056/2441/V,4061/3333/V,4065/3590/H,4071/3502/V,4097/23500/V',
+  'Intelsat 905|245|1|11132/14115/V,11555/30000/H,11626/13500/H,11675/30000/H,12160/30000/H,12240/30000/H',
+  'Intelsat 907|275|1|11050/17100/H,11495/44100/V',
+  'Hispasat|300|1|10730/27500/H,10770/30000/H,10890/27500/V,10917/7500/V,10922/1667/V,11262/30000/H,11302/30000/H,11342/34290/V,11382/30000/H,11422/5000/V,11491/7522/V,11496/7884/H,11502/700/V,11503/1667/H,11510/10000/V,11791/2500/V,11884/27500/V,11911/12000/V,11974/3030/V,11977/3255/V,11985/1080/V,12052/27500/H,12052/27500/V,12076/4000/V,12092/27500/V,12092/30000/H,12108/4190/V,12130/27500/H,12132/27500/H,12169/27500/H,12207/27500/H,12246/27500/H,12284/27500/H,12322/27500/H,12360/27500/H,12399/27500/H,12437/27500/H,12476/27500/H,12706/12000/H',
+  'Intelsat 25|315|1|12284/2200/V,12335/6427/V',
+  'Intelsat 903|345|1|11557/13500/H',
+  'NSS 10|375|1|10965/3300/V,11482/11970/H,11637/3885/V,11679/4090/V,12515/3460/H,12517/10800/V',
+  'C_NSS 10|375|1|3726/1290/H,3726/1290/V,3746/1229/H,3746/1229/V,3833/2893/H,3868/6666/V,3929/8882/H,3935/1250/H,3955/2400/H,3958/2222/H,4044/3250/V,4055/2700/V,4059/3214/V,4066/2893/V,4068/2540/V,4072/3150/V,4083/10000/H,4176/4411/V',
+  'SES 6|405|1|11480/30000/H,11480/30000/V,11520/30000/H,11520/30000/V,11560/30000/H,11560/30000/V,11600/30000/H,11600/30000/V,11640/30000/H,11640/30000/V,11680/30000/H,11680/30000/V,11736/22500/V,11764/22500/V,11796/22500/V,11824/22500/V,11856/22500/V,11884/22500/V,11916/22500/V,11944/22500/V,11976/22500/H,11976/22500/V,12004/22500/H,12004/22500/V,12036/22500/H,12036/22500/V,12064/22500/H,12064/22500/V,12096/22500/H,12096/22500/V,12124/22500/H,12124/22500/V,12156/22500/H,12156/22500/V,12184/22500/H,12184/22500/V',
+  'Intelsat 11|430|1|10722/30000/H,10722/30000/V,10802/28000/H,10802/30000/V,10882/30000/H,10882/30000/V,10970/28000/V,10970/29000/H,11050/29000/H,11050/29000/V,11130/28000/H,11130/29000/V,11222/30000/H,11222/30000/V,11262/30000/H,11302/30000/H,11302/30000/V,11342/30000/V,11382/30000/H,11382/30000/V,11422/30000/H',
+  'Intelsat 11|431|1|10722/30000/H,10722/30000/V,10802/28000/H,10802/30000/V,10882/30000/H,10882/30000/V,10970/28000/V,10970/29000/H,11050/29000/H,11050/29000/V,11130/28000/H,11130/29000/V,11222/30000/H,11222/30000/V,11262/30000/H,11302/30000/H,11302/30000/V,11342/30000/V,11382/30000/H,11382/30000/V,11422/30000/H',
+  'Intelsat 14|450|1|11600/1000/V,11605/990/H',
+  'Intelsat 707|530|1|11911/2821/V,12138/3111/H',
+  'C_Galaxy 11|555|1|3728/4200/H,3733/2580/H,3743/5000/H,3754/4232/H,3759/2963/H,3763/3000/H,3773/13332/H,3802/4580/H,3805/26666/V,3814/15000/H,3845/30000/V,3872/9333/H,3885/30000/V,3890/3333/H,3898/9583/H,3915/3300/H,3924/2080/H,3927/2000/H,3932/5625/H,3940/5422/H,3963/10000/V,3971/2550/V,3975/2500/V,4003/10000/V,4015/30000/H,4021/18400/V,4055/30000/H,4080/5000/V,4084/10560/H,4086/4074/V,4093/3617/V,4093/4447/H,4101/2222/V,4102/8400/H,4107/1300/H,4108/2963/V,4111/1850/V,4111/4000/H,4124/1667/H,4134/4444/H,4136/30000/V,4137/2000/H,4142/5000/H,4147/3750/H,4151/2500/H,4175/30000/H,4177/30000/V',
+  'Intelsat 21|580|1|11648/2520/V,11693/2970/V,11720/30000/H,11740/30000/V,11840/30000/H,11860/30000/V,11960/30000/H,11980/30000/V,12000/30000/H,12020/30000/V,12040/30000/H,12060/30000/V,12067/2522/V,12076/2964/V,12080/30000/H,12100/30000/V,12120/30000/H,12140/30000/V,12160/30000/H,12180/30000/V',
+  'Amazonas|610|1|10728/28888/H,10728/30000/V,10768/28888/H,10768/30000/V,10808/30000/H,10848/30000/H,10888/28888/V,10928/28888/H,11015/28880/H,11026/10805/V,11055/28880/H,11072/3001/H,11095/28880/H,11095/30000/V,11135/28880/H,11135/28880/V,11175/28888/H,11222/28888/H,11222/30000/V,11262/30000/H,11262/30000/V,11302/28888/H,11342/28888/H,11342/30000/V,11382/28888/H,11422/30000/H,11738/40000/V,11851/28880/H,11885/15000/H,11932/28888/H,11972/28888/H,11972/30000/V,12012/28888/H,12052/28888/H,12092/30000/V,12132/30000/H,12172/30000/H,12172/30000/V,12230/30000/H,12270/30000/H,12270/30000/V,12310/30000/H,12310/30000/V,12350/30000/H,12430/30000/V',
+  'EchoStar 12/15|615|1|12224/21500/V,12239/21500/H,12253/21500/V,12282/21500/V,12297/21500/H,12311/21500/V,12326/21500/H,12341/21500/V,12355/21500/H,12384/21500/H,12399/21500/V,12414/20000/H,12428/21500/V,12457/21500/V,12472/21500/H,12486/21500/V,12501/21500/H,12516/21500/V,12530/21500/H,12545/21500/V,12559/21500/H,12574/21500/V,12588/21500/H,12603/21500/V,12618/21500/H,12632/21500/V,12647/21500/H,12661/21500/V,12676/21500/H',
+  'Telstar 14R|630|1|11564/3320/H,11600/13744/V,11640/18100/V,11706/2278/V,11710/3200/V,11722/2963/V,11726/3333/V,11732/2222/V,11736/2963/V,11827/3200/V,11850/2280/V,11871/2000/V,11888/3330/V,11905/2362/V,12162/13021/H',
+  'Star One C1|650|1|11885/2000/H,11893/2034/H,11930/14400/H',
+  'Star One C2|700|1|10974/29890/H,11010/27902/V,11014/29890/H,11050/27902/V,11090/27902/V,11130/27902/V,11130/29890/V,11134/27902/H,11170/27902/V,11170/29890/V,11174/27902/H,11740/29890/H,11780/29890/H,11820/29890/H,11880/41500/H,11940/29890/H,11960/29900/V,12020/41500/V,12080/29890/V,12120/29890/V,12160/29890/V',
+  'C_Star One C2|700|1|3628/3000/H,3633/5000/H,3642/4583/H,3644/3214/V,3648/2170/V,3650/5000/H,3652/3330/V,3656/3750/H,3664/2980/V,3665/3818/H,3667/2500/V,3672/7500/H,3680/7500/H,3685/5000/V,3689/7500/H,3690/2220/V,3695/3599/H,3702/15000/V,3711/2170/V,3715/5000/V,3753/3333/H,3753/6220/V,3757/3333/H,3808/7500/V,3816/6666/V,3825/6666/V,3833/4073/V,3874/7500/V,3887/7500/V,3895/7500/V,3906/7500/V,3916/7500/V,3940/30000/V,3945/5000/H,3950/2800/H,3955/4400/H,3959/1875/H,3965/4069/V,3967/7500/H,3970/1852/V,3973/4166/V,3973/7500/H,3978/3617/V,3982/4573/V,3985/2170/H,3990/7400/V,3993/12416/H,3996/2520/V,4033/7900/V,4047/7500/V,4056/5833/V',
+  'AMC 6|720|1|11466/6600/V,11546/12000/V,11640/8500/V,11670/30000/V,11848/3333/V,11870/14089/H,12046/3900/V,12051/2200/V,12055/2150/V,12058/2223/V,12058/7400/H,12064/2200/V,12070/2000/H,12075/1660/H,12083/2850/V,12086/4170/V,12092/4000/H,12096/3333/V,12113/2920/V',
+  'Nimiq 5|727|1|12224/21500/V,12239/21500/H,12253/21500/V,12268/21500/H,12282/21500/V,12311/21500/V,12326/21500/H,12341/21500/V,12355/21500/H,12370/21500/V,12384/21500/H,12428/21500/V,12443/21500/H,12472/21500/H,12486/21500/V,12516/21500/V,12530/21500/H,12545/21500/V,12559/21500/H,12574/21500/V,12603/21500/V,12618/21500/H,12632/21500/V,12661/21500/V,12676/21500/H',
+  'EchoStar 8/1|770|1|12224/22500/V,12239/22500/H,12253/20000/V,12268/22500/H,12282/22500/V,12297/20000/H,12311/22500/V,12326/22500/H,12341/22500/V,12355/22500/H,12370/22500/V,12384/22500/H,12399/20000/V,12414/22500/H,12428/20000/V,12443/22500/H,12457/22500/V,12472/20000/H,12486/20000/V,12501/22500/H,12516/22500/V,12530/22500/H,12545/22500/V,12559/22500/H,12574/22500/V,12588/20000/H,12603/22500/V,12618/22500/H,12632/22500/V,12647/22500/H,12661/20000/V,12676/22500/H',
+  'Simon Bolivar|780|1|11323/3100/H,11380/42355/H,11410/29500/V,11509/2900/V,11512/3100/V,11520/4444/V,11535/4340/H',
+  'Nimiq 4|820|1|12224/21500/V,12239/21500/H,12253/21500/V,12268/21500/H,12282/21500/V,12297/21500/H,12311/21500/V,12326/21500/H,12341/21500/V,12355/21500/H,12370/21500/V,12384/21500/H,12399/21500/V,12414/21500/H,12443/20000/H,12457/21500/V,12472/21500/H,12486/21500/V,12501/21500/H,12516/21500/V,12530/21500/H,12545/21500/V,12559/21500/H,12574/21500/V,12588/21500/H,12603/21500/V,12618/21500/H,12632/21500/V,12647/21500/H,12661/21500/V,12676/20000/H',
+  'TKSat 1|870|1|11479/15000/V,11737/8333/V,11750/7320/V,11800/2686/H,11811/11150/H,11816/2600/V,11820/30000/V,11960/29270/H,12008/5000/V,12044/3200/V,12175/4342/H,12486/21702/V,12544/30000/V',
+  'Galaxy 28|890|1|11756/3345/H,11920/30000/V,11960/28800/H,12000/28800/H,12100/30000/H,12121/2676/H,12140/30000/H,12160/30000/V',
+  'Nimiq 1|910|1|11740/30000/V,12011/13333/V,12224/20000/V,12239/20000/H,12253/20000/V,12268/20000/H,12282/20000/V,12297/20000/H,12311/20000/V,12326/20000/H,12341/20000/V,12355/20000/H,12370/20000/V,12384/20000/H,12399/20000/V,12414/20000/H,12428/20000/V,12443/20000/H,12457/20000/V,12472/20000/H,12486/20000/V,12501/20000/H,12516/20000/V,12530/20000/H,12545/20000/V,12559/20000/H,12574/20000/V,12588/20000/H,12603/20000/V,12618/20000/H,12632/20000/V,12647/20000/H,12661/20000/V,12676/20000/H',
+  'Galaxy 3C|950|1|11720/20000/H,11780/20760/H,11840/20000/H,11900/20000/H,11930/20000/H,11960/20000/H,11990/20000/H,12050/20000/H,12080/20000/H,12140/20000/H',
+  'C_Galaxy 3C|950|1|4173/2221/V',
+  'Galaxy 19|970|1|11836/20770/V,11842/22000/H,11867/22000/V,11898/22000/V,11904/22000/H,11936/20000/H,11960/22000/V,11966/22000/H,12028/21991/H,12053/22000/V,12060/22000/H,12084/22000/V,12115/22425/V,12122/20000/H,12146/22000/V,12152/20000/H,12177/23000/V',
+  'C_Galaxy 19|970|1|3760/31456/V,3809/10890/H,3813/9560/V,3847/2200/V,3851/3532/V,3857/2940/V,3906/3703/V,3922/2980/V,3940/30000/H,3985/3600/V,3990/9700/H',
+  'Galaxy 16|992|1|11800/30000/H,11960/30000/H,11980/30000/V,12020/20000/V,12095/3676/H,12100/30000/V',
+  'C_Galaxy 16|992|1|0/30000/H,3768/7500/V,3777/2400/H,3806/2300/H,3811/8030/H,3824/4340/V,3845/8703/H,3852/3775/H,3900/27500/V,3912/10833/H,3931/1562/H,3938/1561/H,4000/26400/H,4006/5833/V,4025/11000/V,4178/4166/V',
+  'SES 1|1010|1|11705/3650/V,12224/20000/V,12239/20000/H,12253/20000/V,12268/20000/H,12282/20000/V,12297/20000/H,12311/20000/V,12326/20000/H,12341/20000/V,12355/20000/H,12370/20000/V,12384/20000/H,12399/20000/V,12414/20000/H,12428/20000/V,12443/20000/H,12457/20000/V,12472/20000/H,12486/20000/V,12501/20000/H,12516/20000/V,12530/20000/H,12545/20000/V,12559/20000/H,12574/20000/V,12588/20000/H,12603/20000/V,12618/20000/H,12632/20000/V,12647/20000/H,12661/20000/V,12676/20000/H',
+  'C_SES 1|1010|1|3716/4775/V,3725/10000/V,3740/30000/H,3754/726/V,3780/30000/H,3820/29724/H,3840/30000/V,3860/30000/H,3880/30000/V,3900/30000/H,3920/30000/V,3940/29270/H,3953/2734/V,3957/2734/V,3961/2734/V,3975/2734/V,3980/30000/H,4020/28000/H,4060/29270/H,4100/30000/H,4120/30000/V,4180/30000/H',
+  'AMC 1|1030|1|11760/30000/H,11880/30000/H,11940/20000/V,12145/20000/V,12182/25000/V',
+  'C_AMC 1|1030|1|3720/30000/H,3760/30000/H,3780/28800/V,3800/29270/H,3840/26681/H,3860/30000/V,3900/30000/V,3924/2734/H,3926/4444/V,3960/30000/H,3972/14800/V,3990/5300/V,3997/1900/V,4000/29270/H,4040/30000/H,4080/19510/H,4091/14029/V,4120/30000/H,4140/30000/V',
+  'AMC 15/18|1050|1|11856/3548/V,12037/1000/H',
+  'Anik F1|1073|1|11092/22000/H,11092/22000/V,11122/22000/H,11122/22000/V,11152/22000/H,11152/22000/V,11183/22000/H,11183/22000/V,11592/22000/H,11592/22000/V,11622/22000/H,11622/22000/V,11652/22000/H,11652/22000/V,11683/20500/H,11683/22000/V,11715/21000/V,11728/19510/H,11745/19510/V,11758/19510/H,11776/19510/V,11789/19510/H,11806/19510/V,11819/19510/H,11837/19510/V,11850/19510/H,11867/19510/V,11880/19510/H,11898/19510/V,11928/19510/V,11959/19510/V,11972/19510/H,11989/20500/V,12002/19510/H,12020/19510/V,12033/19510/H,12050/19510/V,12063/19510/H,12081/20500/V,12094/19510/H,12111/19510/V,12124/19510/H,12142/19510/V,12155/19510/H,12172/19510/V,12185/19510/H',
+  'C_Anik F1|1073|1|3789/13334/V,3807/6500/V,3825/6500/V,3834/4936/V,3860/30000/V,3913/7078/V,3948/14630/V,3962/9120/H,4020/30000/V,4060/28346/V,4100/28346/V',
+  'EchoStar10/11|1100|1|12224/21500/V,12239/21500/H,12253/21500/V,12268/20000/H,12268/21500/H,12282/21500/V,12297/21500/H,12311/21500/V,12326/21500/H,12341/21500/V,12355/21500/H,12370/21500/V,12384/20000/H,12399/21500/V,12414/21500/H,12443/21500/H,12472/20000/H,12472/21500/H,12486/21500/V,12501/20000/H,12501/21500/H,12516/21500/V,12530/21500/H,12545/20000/V,12545/21500/V,12559/21500/H,12574/20000/V,12574/21500/V,12588/20000/H,12603/20000/V,12618/20000/H,12632/20000/V,12632/21500/V,12661/20000/V,12661/21500/V',
+  'Anik F2|1111|1|11728/20500/H,11745/20500/V,11758/20500/H,11770/3270/V,11819/20500/H,11837/20500/V,11850/20500/H,11880/20500/H,11898/20500/V,11928/20500/V,11972/20500/H,11989/20500/V,12002/19510/H,12020/20500/V,12033/20500/H,12050/20500/V,12063/19510/H,12094/19510/H,12111/19510/V,12142/20500/V,12155/20500/H,12172/19510/V,12185/20500/H',
+  'SatMex 6|1130|1|11984/3600/H,11994/4340/V,12046/18900/H,12076/5787/H,12161/1480/H',
+  'SatMex 5|1168|1|11480/34826/H,11520/34826/H,11560/34826/H,12060/30000/V,12080/30000/H,12100/29000/V,12123/3078/V,12184/1680/H,12189/1660/H',
+  'Anik F3|1190|1|11715/20000/V,11728/20000/H,11745/20000/V,11758/20000/H,11776/20000/V,11789/20000/H,11806/20000/V,11819/20000/H,11837/20000/V,11850/20000/H,11867/20000/V,11880/20000/H,11898/20000/V,11911/20000/H,11928/20000/V,11959/20000/V,11972/20000/H,11989/20000/V,12002/20000/H,12020/20000/V,12033/20000/H,12050/20000/V,12063/20000/H,12081/20000/V,12094/20000/H,12111/20000/V,12124/20000/H,12142/20000/V,12155/20000/H,12185/20000/H,12224/20000/V,12224/21500/V,12239/20000/H,12239/21500/H,12253/20000/V,12253/21500/V,12268/20000/H,12268/21500/H,12282/20000/V,12282/21500/V,12297/21500/H,12311/21500/V,12326/21500/H,12355/21500/H,12370/21500/V,12384/21500/H,12399/21500/V,12414/21500/H,12428/21500/V,12443/21500/H,12457/21500/V,12472/21500/H,12486/21500/V,12501/21500/H,12516/21500/V,12530/20000/H,12545/20000/V,12559/20000/H,12574/20000/V,12588/20000/H,12603/20000/V,12618/20000/H,12632/20000/V,12647/20000/H,12661/20000/V,12676/20000/H',
+  'EchoStar 9|1210|1|11928/20000/V,11943/20000/H,11957/20000/V,11990/20000/H,12016/20000/V,12045/20000/V,12096/9500/H,12171/5800/V',
+  'C_EchoStar 9|1210|1|3732/14400/V,3780/29270/V,3800/19510/H,3840/30000/H,3864/2170/H,3877/4444/H,3910/14400/H,3926/6500/V,4000/19510/H,4011/15000/V,4115/18085/H,4140/30000/V,4192/11070/V',
+  'Galaxy 18|1230|1|11738/1680/V,12033/8200/H,12078/3680/V,12173/2894/H',
+  'Galaxy 14|1250|1|11916/2398/V,12180/30000/V',
+  'Galaxy 13|1270|1|12140/30000/V',
+  'C_Galaxy 13|1270|1|3760/28076/V,3780/30000/H,3820/30000/H,3840/30000/V,3880/30000/V,3900/27690/H,3920/28068/V,3960/30000/V,3980/30000/H,4000/30000/V,4052/17500/H,4066/3310/H,4070/3257/H,4080/28076/V,4120/30000/V,4140/30000/H,4160/30000/V',
+  'Ciel 2|1290|1|12224/21500/V,12239/20000/H,12239/21500/H,12253/20000/V,12253/21500/V,12268/20000/H,12268/21500/H,12282/21500/V,12297/20000/H,12297/21500/H,12311/21500/V,12326/20000/H,12326/21500/H,12341/20000/V,12341/21500/V,12355/21500/H,12370/21500/V,12384/20000/H,12384/21500/H,12399/20000/V,12399/21500/V,12414/20000/H,12414/21500/H,12428/20000/V,12428/21500/V,12443/21500/H,12457/21500/V,12472/21500/H,12501/21500/H,12516/21500/V,12530/21500/H,12545/21500/V,12559/21500/H,12574/21500/V,12588/21500/H,12603/21500/V,12618/21500/H,12632/21500/V,12647/21500/H,12676/21500/H',
+  'C_AMC 11|1310|1|3720/30000/V,3760/30000/V,3780/30000/H,3790/12400/V,3808/15800/V,3860/30000/H,3880/30000/V,3900/30000/H,3928/14323/V,3940/30000/H,3995/19510/V,4020/29270/H,4040/29270/V,4060/29270/H,4075/19510/V,4092/9760/V,4100/30000/H,4120/30000/V,4140/19510/H,4160/30000/V',
+  'C_Galaxy 15|1330|1|3720/29270/H,3740/31250/V,3780/31250/V,3790/11936/H,3808/16303/H,3828/14600/V,3860/30000/V,3900/31250/V,3980/30000/V,4000/30000/H,4020/29270/V,4025/4880/H,4044/22500/H,4060/29270/V,4080/30000/H,4100/31250/V,4120/31250/H,4140/31250/V,4160/29270/H,4180/29270/V',
+  'C_AMC 10|1350|1|3780/30000/H,3820/29270/H,4080/29270/V,4136/19510/H,4149/9760/H,4180/29270/H',
+  'C_AMC 8|1390|1|4056/13250/H',
+  'C_NSS 9|1770|1|3792/2048/V,3987/8950/V,3999/2960/V,4055/11000/H,4099/30000/V,4163/2644/V',
+];
+
+
+// ======== downloads.dart (تجريبي) ========
+/// تنزيل فيديو على الموبايل: روابط مباشرة (mp4 وغيره) + m3u8 غير مشفّر (بيتجمّع في ملف .ts)
+class DlTask {
+  final String id, url, name;
+  final Map<String, String> headers;
+  int got = 0, total = 0; // بايت (أو عدد القطع في m3u8)
+  bool hls = false;
+  String state = 'queued'; // queued, run, done, error, cancel
+  String err = '';
+  String? path;
+  bool cancelled = false;
+  DlTask(this.id, this.url, this.name, this.headers);
+  double? get frac => total > 0 ? got / total : null;
+}
+
+class DownloadMgr extends ChangeNotifier {
+  DownloadMgr._();
+  static final DownloadMgr I = DownloadMgr._();
+  final List<DlTask> tasks = [];
+
+  static Future<Directory> dir() async {
+    final base = await getExternalStorageDirectory() ?? await getApplicationDocumentsDirectory();
+    final d = Directory('${base.path}/A2R-Downloads');
+    if (!d.existsSync()) d.createSync(recursive: true);
+    return d;
+  }
+
+  static String _safe(String s) {
+    var n = s.replaceAll(RegExp(r'[\\/:*?"<>|\n\r\t]+'), '_').trim();
+    if (n.length > 80) n = n.substring(0, 80);
+    return n.isEmpty ? 'video' : n;
+  }
+
+  DlTask add(String url, String name, {Map<String, String> headers = const {}}) {
+    final t = DlTask('${DateTime.now().microsecondsSinceEpoch}', url, _safe(name), {'User-Agent': kChromeUa, ...headers});
+    tasks.insert(0, t);
+    notifyListeners();
+    _run(t);
+    return t;
+  }
+
+  void cancel(DlTask t) {
+    t.cancelled = true;
+    notifyListeners();
+  }
+
+  Future<void> remove(DlTask t, {bool deleteFile = false}) async {
+    t.cancelled = true;
+    tasks.remove(t);
+    if (deleteFile && t.path != null) {
+      try {
+        File(t.path!).deleteSync();
+      } catch (_) {}
+    }
+    notifyListeners();
+  }
+
+  Future<File> _target(DlTask t, String ext) async {
+    final d = await dir();
+    var base = t.name.replaceAll(RegExp(r'\.(mp4|mkv|webm|mov|ts|m3u8|avi)$', caseSensitive: false), '');
+    var f = File('${d.path}/$base.$ext');
+    var i = 1;
+    while (f.existsSync()) {
+      f = File('${d.path}/$base ($i).$ext');
+      i++;
+    }
+    return f;
+  }
+
+  Future<void> _run(DlTask t) async {
+    t.state = 'run';
+    notifyListeners();
+    final c = http.Client();
+    try {
+      final u = Uri.parse(t.url);
+      if (u.path.toLowerCase().endsWith('.m3u8') || t.url.toLowerCase().contains('.m3u8')) {
+        await _hls(t, c);
+      } else {
+        await _direct(t, c);
+      }
+      if (t.cancelled) {
+        t.state = 'cancel';
+        if (t.path != null) {
+          try {
+            File(t.path!).deleteSync();
+          } catch (_) {}
+        }
+      } else {
+        t.state = 'done';
+      }
+    } catch (e) {
+      t.state = t.cancelled ? 'cancel' : 'error';
+      t.err = '$e';
+      AppLog.add('DL', 'فشل ${t.url}: $e');
+    } finally {
+      c.close();
+      notifyListeners();
+    }
+  }
+
+  Future<void> _direct(DlTask t, http.Client c) async {
+    final req = http.Request('GET', Uri.parse(t.url))..headers.addAll(t.headers);
+    final r = await c.send(req).timeout(const Duration(seconds: 20));
+    if (r.statusCode >= 400) throw StateError('السيرفر رد ${r.statusCode}');
+    t.total = r.contentLength ?? 0;
+    final ct = (r.headers['content-type'] ?? '').toLowerCase();
+    if (ct.contains('mpegurl')) {
+      await _hls(t, c);
+      return;
+    }
+    var ext = 'mp4';
+    final seg = Uri.parse(t.url).path.split('.');
+    if (seg.length > 1 && seg.last.length <= 4 && RegExp(r'^[a-z0-9]+$', caseSensitive: false).hasMatch(seg.last)) ext = seg.last.toLowerCase();
+    if (ct.contains('webm')) ext = 'webm';
+    final f = await _target(t, ext);
+    t.path = f.path;
+    final sink = f.openWrite();
+    var last = 0;
+    try {
+      await for (final chunk in r.stream) {
+        if (t.cancelled) break;
+        sink.add(chunk);
+        t.got += chunk.length;
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - last > 400) {
+          last = now;
+          notifyListeners();
+        }
+      }
+    } finally {
+      await sink.close();
+    }
+  }
+
+  Future<String> _get(http.Client c, DlTask t, Uri u) async {
+    final r = await c.get(u, headers: t.headers).timeout(const Duration(seconds: 20));
+    if (r.statusCode >= 400) throw StateError('السيرفر رد ${r.statusCode}');
+    return utf8.decode(r.bodyBytes, allowMalformed: true);
+  }
+
+  Future<void> _hls(DlTask t, http.Client c) async {
+    t.hls = true;
+    var u = Uri.parse(t.url);
+    var txt = await _get(c, t, u);
+    for (var depth = 0; depth < 3 && txt.contains('#EXT-X-STREAM-INF'); depth++) {
+      // قايمة جودات: ناخد أعلى bandwidth
+      final lines = txt.split(RegExp(r'\r?\n'));
+      var best = -1;
+      String? bestUri;
+      for (var i = 0; i < lines.length - 1; i++) {
+        if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+        final bw = int.tryParse(RegExp(r'BANDWIDTH=(\d+)').firstMatch(lines[i])?.group(1) ?? '') ?? 0;
+        var j = i + 1;
+        while (j < lines.length && (lines[j].trim().isEmpty || lines[j].startsWith('#'))) {
+          j++;
+        }
+        if (j < lines.length && bw >= best) {
+          best = bw;
+          bestUri = lines[j].trim();
+        }
+      }
+      if (bestUri == null) break;
+      u = u.resolve(bestUri);
+      txt = await _get(c, t, u);
+    }
+    if (RegExp(r'#EXT-X-KEY:.*METHOD=(?!NONE)').hasMatch(txt)) throw StateError('البث مشفّر (DRM/AES) — مش هينفع يتنزّل');
+    final segs = <Uri>[];
+    for (final l in txt.split(RegExp(r'\r?\n'))) {
+      final s = l.trim();
+      if (s.isEmpty || s.startsWith('#')) continue;
+      segs.add(u.resolve(s));
+    }
+    if (segs.isEmpty) throw StateError('مفيش قطع فيديو في الرابط');
+    if (txt.contains('#EXT-X-ENDLIST') == false) throw StateError('ده بث مباشر مش فيديو — التنزيل للفيديوهات بس');
+    t.total = segs.length;
+    final f = await _target(t, 'ts');
+    t.path = f.path;
+    final sink = f.openWrite();
+    try {
+      for (final s in segs) {
+        if (t.cancelled) break;
+        Object? lastErr;
+        List<int>? body;
+        for (var k = 0; k < 3 && body == null; k++) {
+          try {
+            final r = await c.get(s, headers: t.headers).timeout(const Duration(seconds: 30));
+            if (r.statusCode >= 400) throw StateError('قطعة ${t.got + 1}: ${r.statusCode}');
+            body = r.bodyBytes;
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        if (body == null) throw lastErr ?? StateError('قطعة فشلت');
+        sink.add(body);
+        t.got++;
+        notifyListeners();
+      }
+    } finally {
+      await sink.close();
+    }
+  }
+}
+
+class DownloadsPage extends StatefulWidget {
+  const DownloadsPage({super.key});
+  @override
+  State<DownloadsPage> createState() => _DownloadsPageState();
+}
+
+class _DownloadsPageState extends State<DownloadsPage> {
+  final m = DownloadMgr.I;
+  List<File> files = [];
+  @override
+  void initState() {
+    super.initState();
+    _scan();
+  }
+
+  Future<void> _scan() async {
+    final d = await DownloadMgr.dir();
+    final l = d.listSync().whereType<File>().toList()..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+    if (mounted) setState(() => files = l);
+  }
+
+  String _mb(int b) => '${(b / 1048576).toStringAsFixed(1)} MB';
+
+  Future<void> _castFile(File f) async {
+    final name = f.path.split('/').last;
+    try {
+      await CastState.I.add(QueueItem(name, f.path, file: f));
+      if (mounted) toast(context, 'اتبعت للشاشة');
+    } catch (e) {
+      if (mounted) toast(context, '$e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('التنزيلات (تجريبي)'), actions: [IconButton(onPressed: _scan, icon: const Icon(Icons.refresh_rounded))]),
+      body: ListenableBuilder(
+        listenable: m,
+        builder: (c, _) {
+          final active = m.tasks.where((t) => t.state != 'done').toList();
+          final doneP = m.tasks.where((t) => t.state == 'done').map((t) => t.path).toSet();
+          return ListView(children: [
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: Text('الملفات بتتحفظ في مجلد التطبيق (Android/data/…/files/A2R-Downloads). m3u8 بيتنزل ملف .ts (VLC وأغلب المشغلات بتفتحه). المشفّر وبث الـLive مش بيتنزل.', style: TextStyle(fontSize: 12, color: kMuted)),
+            ),
+            for (final t in active)
+              ListTile(
+                leading: Icon(t.state == 'error' ? Icons.error_outline_rounded : (t.state == 'cancel' ? Icons.cancel_outlined : Icons.downloading_rounded), color: t.state == 'error' ? kBad : kGold),
+                title: Text(t.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: t.state == 'run' || t.state == 'queued'
+                    ? Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        LinearProgressIndicator(value: t.frac),
+                        Text(t.hls ? 'قطعة ${t.got}/${t.total}' : (t.total > 0 ? '${_mb(t.got)} / ${_mb(t.total)}' : _mb(t.got)), style: const TextStyle(fontSize: 11)),
+                      ])
+                    : Text(t.state == 'error' ? t.err : 'اتلغى', maxLines: 2, style: const TextStyle(fontSize: 11)),
+                trailing: IconButton(icon: const Icon(Icons.close_rounded), onPressed: () => t.state == 'run' || t.state == 'queued' ? m.cancel(t) : m.remove(t)),
+              ),
+            const SectionTitle('الملفات المتنزلة', icon: Icons.folder_rounded),
+            if (files.isEmpty) const Padding(padding: EdgeInsets.all(16), child: Text('مفيش ملفات', style: TextStyle(color: kMuted))),
+            for (final f in files)
+              if (!active.any((t) => t.path == f.path && (t.state == 'run' || t.state == 'queued')))
+                ListTile(
+                  leading: const Icon(Icons.movie_rounded),
+                  title: Text(f.path.split('/').last, maxLines: 2, overflow: TextOverflow.ellipsis),
+                  subtitle: Text(_mb(f.lengthSync()), style: const TextStyle(fontSize: 11)),
+                  onTap: () async {
+                    final ok = await Native.openVideo(f.path);
+                    if (!ok && mounted) toast(context, 'مفيش مشغل بيفتح الملف — جرّب «ابعت للشاشة» أو شاركه');
+                  },
+                  trailing: PopupMenuButton<String>(
+                    onSelected: (v) async {
+                      if (v == 'cast') await _castFile(f);
+                      if (v == 'share') await SharePlus.instance.share(ShareParams(files: [XFile(f.path)]));
+                      if (v == 'del' && await confirm(context, 'تمسح الملف؟')) {
+                        f.deleteSync();
+                        doneP.remove(f.path);
+                        _scan();
+                      }
+                    },
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(value: 'cast', child: Text('ابعت للشاشة')),
+                      PopupMenuItem(value: 'share', child: Text('شارك')),
+                      PopupMenuItem(value: 'del', child: Text('امسح')),
+                    ],
+                  ),
+                ),
+          ]);
+        },
+      ),
+    );
+  }
+}
+
+// ======== playlists.dart ========
+/// قوايم تشغيل محفوظة (الروابط + الملفات المتنزلة) في Store
+class PlaylistStore {
+  static Map<String, dynamic> _all() {
+    try {
+      return Map<String, dynamic>.from(jsonDecode(Store.p.getString('playlists') ?? '{}') as Map);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static List<String> get names => _all().keys.toList();
+  static Future<void> save(String name, List<QueueItem> q) async {
+    final a = _all();
+    a[name] = [
+      for (final i in q)
+        {'t': i.title, 'u': i.url, 'f': i.file?.path, 'h': i.headers, 'm': i.mime, 's': i.subtitle}
+    ];
+    await Store.p.setString('playlists', jsonEncode(a));
+  }
+
+  static Future<void> delete(String name) async {
+    final a = _all()..remove(name);
+    await Store.p.setString('playlists', jsonEncode(a));
+  }
+
+  /// بيرجّع العناصر الصالحة (الملفات اللي اتمسحت بتتشال)
+  static List<QueueItem> load(String name) {
+    final l = _all()[name];
+    if (l is! List) return [];
+    final out = <QueueItem>[];
+    for (final e in l) {
+      if (e is! Map) continue;
+      final fp = e['f'] as String?;
+      File? f;
+      if (fp != null) {
+        f = File(fp);
+        if (!f.existsSync()) continue;
+      }
+      out.add(QueueItem('${e['t'] ?? ''}', '${e['u'] ?? ''}',
+          file: f, subtitle: e['s'] as String?, mime: e['m'] as String?, headers: {for (final x in (e['h'] as Map? ?? {}).entries) '${x.key}': '${x.value}'}));
+    }
+    return out;
+  }
+}
+
+class PlaylistsPage extends StatefulWidget {
+  const PlaylistsPage({super.key});
+  @override
+  State<PlaylistsPage> createState() => _PlaylistsPageState();
+}
+
+class _PlaylistsPageState extends State<PlaylistsPage> {
+  Future<void> _saveCurrent() async {
+    final cs = CastState.I;
+    if (cs.queue.isEmpty) {
+      toast(context, 'القايمة الحالية فاضية');
+      return;
+    }
+    final n = await askText(context, 'اسم القايمة');
+    if (n == null || n.trim().isEmpty) return;
+    await PlaylistStore.save(n.trim(), cs.queue);
+    if (mounted) {
+      toast(context, 'اتحفظت');
+      setState(() {});
+    }
+  }
+
+  Future<void> _open(String n, {required bool append}) async {
+    final items = PlaylistStore.load(n);
+    if (items.isEmpty) {
+      toast(context, 'القايمة فاضية أو ملفاتها اتمسحت');
+      return;
+    }
+    final cs = CastState.I;
+    if (!append) {
+      cs.queue.clear();
+      cs.playing = -1;
+    }
+    try {
+      for (var i = 0; i < items.length; i++) {
+        await cs.add(items[i], playNow: !append && i == 0);
+      }
+      if (mounted) {
+        toast(context, 'اتحمّلت ${items.length}');
+        Navigator.pop(context);
+      }
+    } catch (e) {
+      if (mounted) toast(context, '$e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ns = PlaylistStore.names;
+    return Scaffold(
+      appBar: AppBar(title: const Text('قوايم محفوظة'), actions: [IconButton(tooltip: 'احفظ القايمة الحالية', onPressed: _saveCurrent, icon: const Icon(Icons.save_rounded))]),
+      body: ns.isEmpty
+          ? const Center(child: Text('مفيش قوايم — دوس حفظ فوق علشان تحفظ قايمة الكاست الحالية', style: TextStyle(color: kMuted)))
+          : ListView(children: [
+              for (final n in ns)
+                ListTile(
+                  leading: const Icon(Icons.queue_music_rounded),
+                  title: Text(n),
+                  subtitle: Text('${(PlaylistStore._all()[n] as List).length} عنصر'),
+                  onTap: () => _open(n, append: false),
+                  trailing: PopupMenuButton<String>(
+                    onSelected: (v) async {
+                      if (v == 'add') await _open(n, append: true);
+                      if (v == 'del' && await confirm(context, 'تمسح القايمة «$n»؟')) {
+                        await PlaylistStore.delete(n);
+                        if (mounted) setState(() {});
+                      }
+                    },
+                    itemBuilder: (_) => const [PopupMenuItem(value: 'add', child: Text('ضيفها على الحالية')), PopupMenuItem(value: 'del', child: Text('امسح'))],
+                  ),
+                ),
+            ]),
+    );
+  }
+}
+
+
+// ======== screen_share.dart (تجريبي — محتاج build.yml الجديد) ========
+/// مشاركة شاشة الموبايل على الكمبيوتر + تحكم: MediaProjection (صورة JPEG عبر سيرفر محلي) + خدمة إمكانية الوصول (لمس/سحب)
+class ScreenSharePage extends StatefulWidget {
+  final PcClient pc;
+  const ScreenSharePage({super.key, required this.pc});
+  @override
+  State<ScreenSharePage> createState() => _ScreenSharePageState();
+}
+
+class _ScreenSharePageState extends State<ScreenSharePage> {
+  static const _ch = MethodChannel('a2r/native');
+  bool running = false, access = false, control = false, nativeOk = true;
+  String pin = '', ip = '';
+  Timer? _t;
+
+  String get link => 'http://$ip:25871/?k=$pin';
+
+  @override
+  void initState() {
+    super.initState();
+    final r = Random.secure();
+    pin = List.generate(8, (_) => 'abcdefghjkmnpqrstuvwxyz23456789'[r.nextInt(31)]).join();
+    phoneIpFor(widget.pc.host).then((v) {
+      if (mounted) setState(() => ip = v ?? '');
+    });
+    _poll();
+    _t = Timer.periodic(const Duration(seconds: 2), (_) => _poll());
+  }
+
+  @override
+  void dispose() {
+    _t?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _poll() async {
+    try {
+      final m = await _ch.invokeMethod('screenState');
+      if (m is Map && mounted) setState(() {
+            running = m['running'] == true;
+            access = m['access'] == true;
+            nativeOk = true;
+          });
+    } on MissingPluginException {
+      if (mounted) setState(() => nativeOk = false);
+    } catch (_) {}
+  }
+
+  Future<void> start() async {
+    try {
+      await _ch.invokeMethod('screenStart', {'pin': pin, 'control': control});
+      AppLog.add('SCREEN', 'start requested');
+    } on MissingPluginException {
+      if (mounted) toast(context, 'النسخة دي من التطبيق مبنية من غير جزء مشاركة الشاشة (محتاج build.yml الجديد)');
+    } catch (e) {
+      if (mounted) toast(context, '$e');
+    }
+  }
+
+  Future<void> stopIt() async {
+    try {
+      await _ch.invokeMethod('screenStop');
+    } catch (_) {}
+    await _poll();
+  }
+
+  Future<void> setControl(bool v) async {
+    setState(() => control = v);
+    try {
+      await _ch.invokeMethod('screenControl', {'on': v});
+    } catch (_) {}
+  }
+
+  Future<void> openOnPc() async {
+    try {
+      await widget.pc.openUrl(link);
+      if (mounted) toast(context, 'اتفتح على الكمبيوتر ✓');
+    } catch (e) {
+      if (mounted) toast(context, 'مقدرتش أفتحه على الكمبيوتر: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('شاشة الموبايل على الكمبيوتر (تجريبي)')),
+      body: ListView(padding: const EdgeInsets.all(12), children: [
+        if (!nativeOk)
+          Card(color: kBad.withValues(alpha: 0.12), child: const Padding(padding: EdgeInsets.all(12), child: Text('الجزء الأصلي (Kotlin) مش موجود في النسخة دي. ارفع build.yml الجديد وابني تاني.', style: TextStyle(fontSize: 12)))),
+        const Card(
+          child: Padding(
+            padding: EdgeInsets.all(12),
+            child: Text(
+                'بتشغّل مشاركة، أندرويد بيطلب إذنك. بعدها بتفتح لينك على الكمبيوتر وتشوف الشاشة (صورة بدل فيديو، تأخير بسيط). اللينك فيه كلمة سر عشوائية جديدة كل مرة، وشغال على نفس الواي فاي بس. التحكم (لمس/سحب/رجوع/هوم) محتاج تفعّل «A2R Home» من إعدادات إمكانية الوصول.',
+                style: TextStyle(fontSize: 12)),
+          ),
+        ),
+        const SizedBox(height: 8),
+        FilledButton.icon(
+          onPressed: running ? stopIt : start,
+          icon: Icon(running ? Icons.stop_rounded : Icons.cast_connected_rounded),
+          label: Text(running ? 'وقّف المشاركة' : 'ابدأ المشاركة'),
+        ),
+        SwitchListTile(title: const Text('اسمح بالتحكم من الكمبيوتر'), subtitle: const Text('بيشتغل بس لو خدمة إمكانية الوصول مفعّلة'), value: control, onChanged: setControl),
+        ListTile(
+          leading: Icon(access ? Icons.check_circle_rounded : Icons.error_outline_rounded, color: access ? kOk : kMuted),
+          title: Text(access ? 'خدمة إمكانية الوصول مفعّلة' : 'خدمة إمكانية الوصول مش مفعّلة'),
+          trailing: TextButton(onPressed: () => Native5.openSettings('android.settings.ACCESSIBILITY_SETTINGS'), child: const Text('افتح الإعدادات')),
+        ),
+        if (running && ip.isNotEmpty) ...[
+          const SectionTitle('اللينك', icon: Icons.link_rounded),
+          Card(child: Padding(padding: const EdgeInsets.all(12), child: SelectableText(link, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 13)))),
+          Wrap(spacing: 8, children: [
+            FilledButton.tonalIcon(onPressed: openOnPc, icon: const Icon(Icons.open_in_new_rounded), label: const Text('افتحه على الكمبيوتر')),
+            OutlinedButton.icon(
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: link));
+                  toast(context, 'اتنسخ');
+                },
+                icon: const Icon(Icons.copy_rounded),
+                label: const Text('انسخ')),
+          ]),
+        ],
+        if (running && ip.isEmpty) const Padding(padding: EdgeInsets.all(12), child: Text('مقدرتش أعرف عنوان الموبايل على الواي فاي', style: TextStyle(color: kBad))),
+      ]),
+    );
   }
 }
 
@@ -6504,6 +7576,76 @@ class GmClient extends ChangeNotifier {
 
   /// 1050 = مؤقت النوم (0 = اقفله) — من GsParentControlActivity
   Future<void> setSleep(int minutes) => _sendLoose(1050, gmSleepFields(minutes));
+
+  // ---------- باب الريسيفر المتقدم (تجريبي — من GsParentControlActivity / GsChannelListFragment) ----------
+  /// 1056 = فحص الباسورد. الرد [{"Data":"N"}] — صفر يعني غلط
+  Future<bool> passwordOk(String pwd) async {
+    try {
+      final r = first(await send(1056, {'data': pwd}, timeout: const Duration(seconds: 6)));
+      final v = int.tryParse('${r['Data'] ?? r['data'] ?? ''}');
+      return v == null ? true : v != 0;
+    } on StateError {
+      return false;
+    }
+  }
+
+  /// 1005 = نقل قناة لمكان قناة تانية (MoveToPosition = ProgramId القناة الهدف)
+  Future<void> moveChannel(StbChannel c, StbChannel target) => _sendLoose(1005, {
+        'array': [
+          {'TvState': c.radio ? '1' : '0', 'MoveToPosition': target.id, 'ProgramId': c.id}
+        ],
+        'TotalNum': '1',
+      });
+
+  /// 18 = أنواع الترتيب المتاحة + الحالي
+  Future<(List<String>, int)> sortTypes() async {
+    final m = first(await send(18, {}, timeout: const Duration(seconds: 6)));
+    final l = '${m['SortTypeList'] ?? ''}'.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    return (l, int.tryParse('${m['SortType'] ?? ''}') ?? -1);
+  }
+
+  /// 1006 = رتّب القنوات (SortType = ترتيبه في القايمة اللي فوق)
+  Future<void> sortBy(int index, bool radio) => _sendLoose(1006, {'SortType': '$index', 'TvState': radio ? '1' : '0'});
+
+  /// 1003 = قفل/فتح قناة (بعد فحص الباسورد)
+  Future<void> lockChannels(List<StbChannel> list) => _sendLoose(1003, {
+        'array': [
+          for (final c in list) {'TvState': list.first.radio ? '1' : '0', 'ProgramId': c.id}
+        ],
+        'TotalNum': '${list.length}',
+      });
+
+  /// 13 + 20 = حالة الرقابة الأبوية (قفل الشاشة + أقفال القوايم)
+  Future<Map<String, dynamic>> controlState() async {
+    final out = <String, dynamic>{};
+    out.addAll(first(await send(13, {}, timeout: const Duration(seconds: 6))));
+    out.addAll(first(await send(20, {}, timeout: const Duration(seconds: 6))));
+    return out;
+  }
+
+  /// 1051 = احفظ أقفال القوايم
+  Future<void> saveLocks(Map<String, dynamic> s) => _sendLoose(1051, {
+        'array': [
+          {
+            'PasswordLock': '${s['PasswordLock'] ?? 0}',
+            'ServiceLock': '${s['ServiceLock'] ?? 0}',
+            'InstallLock': '${s['InstallationLock'] ?? 0}',
+            'EditLock': '${s['EditChannelLock'] ?? 0}',
+            'SettingsLock': '${s['SettingsLock'] ?? 0}',
+            'NetworkLock': '${s['NetworkLock'] ?? 0}',
+            'AgeRating': '${s['AgeRating'] ?? 0}',
+          }
+        ]
+      });
+
+  /// 1053 = اقفل الشاشة. 1008 {data: باسورد} = افتحها
+  Future<void> screenLock(bool on, {String pwd = ''}) => on ? send(1053, {}, reply: false) : _sendLoose(1008, {'data': pwd});
+
+  /// 1052 = غيّر الباسورد
+  Future<void> changePassword(String oldP, String newP) => _sendLoose(1052, {'OldPassword': oldP, 'NewPassword': newP});
+
+  /// 1030 كله، 1031 قنوات التلفزيون، 1032 الراديو، 1033 المشفرة بس — مفيش تراجع
+  Future<void> factoryReset(int req) => _sendLoose(req, {});
 
   // ---- العرض على الريسيفر بطريقة G-MScreen نفسه (1063 + 31) ----
   // من BaseCastViewModel / UrlLinkViewModel / LiveScreenActivity: 1063 = {mediaType, actionCode, url, seekTime}
@@ -12038,6 +13180,7 @@ class PcExtras extends StatelessWidget {
           label: const Text('عرض تقديمي'),
           onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PcPresentPage(pc: pc, onErr: onErr))),
         ),
+        OutlinedButton.icon(icon: const Icon(Icons.screen_share_rounded), label: const Text('شاشة الموبايل (تجريبي)'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ScreenSharePage(pc: pc)))),
         OutlinedButton.icon(icon: const Icon(Icons.list_alt_rounded), label: const Text('العمليات'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PcProcsPage(pc: pc)))),
         OutlinedButton.icon(icon: const Icon(Icons.memory_rounded), label: const Text('معلومات الكمبيوتر'), onPressed: () => _run(context, () => _info(context))),
         OutlinedButton.icon(icon: const Icon(Icons.timer_rounded), label: const Text('مؤقت إطفاء'), onPressed: () => _run(context, () => _timer(context))),
