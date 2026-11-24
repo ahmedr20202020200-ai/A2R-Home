@@ -712,7 +712,7 @@ jobs:
                   }
                   try {
                       val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                      val p = mpm.getMediaProjection(A2RScreenState.resultCode, data)
+                      val p: MediaProjection = mpm.getMediaProjection(A2RScreenState.resultCode, data) ?: throw IllegalStateException("no projection")
                       A2RScreenState.resultData = null
                       val t = HandlerThread("a2r-screen")
                       t.start()
@@ -1188,7 +1188,13 @@ jobs:
 
       - name: Build release APK
         run: |
-          flutter build apk --release --build-name=1.0.${{ github.run_number }} --build-number=${{ github.run_number }} --dart-define=APP_VERSION=1.0.${{ github.run_number }}
+          set -o pipefail
+          if ! flutter build apk --release --build-name=1.0.${{ github.run_number }} --build-number=${{ github.run_number }} --dart-define=APP_VERSION=1.0.${{ github.run_number }} 2>&1 | tee /tmp/build.log; then
+            # الأخطاء بتتلخص في Annotation علشان تتقرا من غير ما تفتح السجل كله
+            MSG=$(grep -E '^e: |error:|What went wrong|Execution failed|FAILURE|AAPT|lint|Lint|Could not|Manifest merger' -A3 /tmp/build.log | head -45 | cut -c1-300 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')
+            echo "::error title=build-summary::${MSG}"
+            exit 1
+          fi
           cp build/app/outputs/flutter-apk/app-release.apk A2R-Home.apk
 
       - name: Upload APK (Artifacts)
