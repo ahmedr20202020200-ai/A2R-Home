@@ -82,7 +82,15 @@ jobs:
           package com.a2r.a2r_home
 
           import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.OpenableColumns
           import android.speech.RecognizerIntent
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
@@ -95,10 +103,14 @@ jobs:
 
               private var voiceResult: MethodChannel.Result? = null
               private var pendingAction: String? = null
+              // «شارك لـ A2R Home»: الملفات بتتنسخ في الخلفية وبعدين تتبعت لدارت
+              private var pendingShare: String? = null
+              private var dartReady = false
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   pendingAction = actionOf(intent)
+                  takeShare(intent)
                   val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "a2r/native")
                   live = ch
                   ch.setMethodCallHandler { call, result ->
@@ -128,7 +140,26 @@ jobs:
                                   }
                               }
                               "pinShortcut" -> result.success(A2RNative.pinShortcut(this, call.argument<String>("id") ?: "", call.argument<String>("label") ?: "", call.argument<String>("data") ?: ""))
-                              "initialAction" -> {
+                              "initialShare" -> {
+                              dartReady = true
+                              val s = pendingShare
+                              pendingShare = null
+                              result.success(s)
+                          }
+                          "openSettings" -> {
+                              try {
+                                  startActivity(Intent(call.argument<String>("action") ?: android.provider.Settings.ACTION_WIRELESS_SETTINGS))
+                                  result.success(true)
+                              } catch (e: Exception) {
+                                  try {
+                                      startActivity(Intent(android.provider.Settings.ACTION_SETTINGS))
+                                      result.success(true)
+                                  } catch (e2: Exception) {
+                                      result.success(false)
+                                  }
+                              }
+                          }
+                          "initialAction" -> {
                                   val a = pendingAction
                                   pendingAction = null
                                   result.success(a)
@@ -144,8 +175,51 @@ jobs:
               private fun actionOf(i: Intent?): String? =
                   if (i != null && i.action == A2RNative.ACTION_CHANNEL) i.getStringExtra("ch") else null
 
+              private fun takeShare(i: Intent?) {
+                  if (i == null || (i.action != Intent.ACTION_SEND && i.action != Intent.ACTION_SEND_MULTIPLE)) return
+                  val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: ""
+                  val mime = i.type ?: ""
+                  val uris = ArrayList<Uri>()
+                  try {
+                      if (i.action == Intent.ACTION_SEND) {
+                          val u: Uri? = if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java) else @Suppress("DEPRECATION") i.getParcelableExtra(Intent.EXTRA_STREAM)
+                          if (u != null) uris.add(u)
+                      } else {
+                          val l: ArrayList<Uri>? = if (Build.VERSION.SDK_INT >= 33) i.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java) else @Suppress("DEPRECATION") i.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+                          if (l != null) uris.addAll(l)
+                      }
+                  } catch (e: Exception) {}
+                  setIntent(Intent())
+                  val app = applicationContext
+                  Thread {
+                      val files = JSONArray()
+                      val dir = File(app.cacheDir, "share").apply { mkdirs() }
+                      for ((n, u) in uris.take(20).withIndex()) {
+                          try {
+                              var name = "shared_$n"
+                              app.contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                                  if (c.moveToFirst() && !c.isNull(0)) name = c.getString(0)
+                              }
+                              name = name.replace(Regex("[^A-Za-z0-9._\\- ]"), "_").take(80)
+                              val out = File(dir, "${System.currentTimeMillis()}_$name")
+                              app.contentResolver.openInputStream(u)?.use { inp -> out.outputStream().use { inp.copyTo(it) } }
+                              if (out.length() > 0) files.put(JSONObject().put("path", out.absolutePath).put("mime", app.contentResolver.getType(u) ?: mime))
+                          } catch (e: Exception) {}
+                      }
+                      val json = JSONObject().put("text", text).put("mime", mime).put("files", files).toString()
+                      Handler(Looper.getMainLooper()).post {
+                          val ch = live
+                          if (dartReady && ch != null) ch.invokeMethod("shareIn", json) else pendingShare = json
+                      }
+                  }.start()
+              }
+
               override fun onNewIntent(intent: Intent) {
                   super.onNewIntent(intent)
+                  if (intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
+                      takeShare(intent)
+                      return
+                  }
                   val a = actionOf(intent) ?: return
                   val ch = live
                   if (ch != null) ch.invokeMethod("openChannel", a) else pendingAction = a
@@ -211,6 +285,12 @@ jobs:
               const val ACTION_KEY = "com.a2r.home.KEY"
               private var lock: WifiManager.MulticastLock? = null
               private var nid = 100
+
+              /** أيقونة الإشعار: أبيض على شفاف (ic_stat_a2r) — ولو خطوة الأيقونة فشلت نرجع لأيقونة التطبيق */
+              fun smallIcon(ctx: Context): Int {
+                  val id = ctx.resources.getIdentifier("ic_stat_a2r", "drawable", ctx.packageName)
+                  return if (id != 0) id else ctx.applicationInfo.icon
+              }
 
               fun handle(ctx: Context, call: MethodCall, result: MethodChannel.Result) {
                   when (call.method) {
@@ -339,7 +419,8 @@ jobs:
                       nm.createNotificationChannel(NotificationChannel("net", "الشبكة", NotificationManager.IMPORTANCE_DEFAULT))
                   }
                   val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, "net") else Notification.Builder(ctx)
-                  b.setSmallIcon(ctx.applicationInfo.icon)
+                  b.setSmallIcon(smallIcon(ctx))
+                      .setColor(0xFFE8B23E.toInt())
                       .setContentTitle(title)
                       .setContentText(body)
                       .setStyle(Notification.BigTextStyle().bigText(body))
@@ -392,7 +473,8 @@ jobs:
                       nm.createNotificationChannel(NotificationChannel("remote", "ريموت الريسيفر", NotificationManager.IMPORTANCE_LOW))
                   }
                   val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, "remote") else Notification.Builder(ctx)
-                  b.setSmallIcon(ctx.applicationInfo.icon)
+                  b.setSmallIcon(smallIcon(ctx))
+                      .setColor(0xFFE8B23E.toInt())
                       .setContentTitle(title)
                       .setContentText("ريموت سريع")
                       .setOngoing(true)
@@ -526,6 +608,13 @@ jobs:
               '            <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter>\n'
               '        </receiver>\n' % (pkg, pkg))
           assert s.count('</application>') == 1
+          # «شارك لـ A2R Home» من أي تطبيق: فيديو/صور/روابط
+          share = ''.join(
+              '            <intent-filter><action android:name="android.intent.action.%s"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="%s"/></intent-filter>\n' % (a, m)
+              for a, m in [('SEND', 'video/*'), ('SEND', 'image/*'), ('SEND', 'text/plain'), ('SEND_MULTIPLE', 'video/*'), ('SEND_MULTIPLE', 'image/*')])
+          i = s.find('</activity>')
+          assert i > 0 and '.MainActivity' in s[:i]
+          s = s[:i] + share + '        ' + s[i:]
           s = s.replace('</application>', receivers + '    </application>', 1)
           open(p, 'w', encoding='utf-8').write(s)
           print(s)
@@ -614,6 +703,8 @@ jobs:
               tmp = Image.new('L', (S, S), 0); tmp.paste(sh, (0, 35))
               fg.paste(Image.new('RGBA', (S, S), (0, 0, 0, 255)), (0, 0), tmp)
               fg.paste(gold().convert('RGBA'), (0, 0), m)
+              global MASK
+              MASK = m.copy()
               return fg
 
           BG = bg_dark()
@@ -659,9 +750,29 @@ jobs:
                  '</adaptive-icon>\n')
           for n in ('ic_launcher', 'ic_launcher_round'):
               open(f'{res}/mipmap-anydpi-v26/{n}.xml', 'w').write(xml)
+          # أيقونة الإشعار (أندرويد بيستخدم الشفافية بس): A2R + الموجات أبيض على شفاف، 24dp
+          bb = MASK.getbbox()
+          crop = MASK.crop(bb)
+          side = max(crop.size)
+          sq = Image.new('L', (side, side), 0)
+          sq.paste(crop, ((side - crop.size[0]) // 2, (side - crop.size[1]) // 2))
+          for name, px in {'mdpi': 24, 'hdpi': 36, 'xhdpi': 48, 'xxhdpi': 72, 'xxxhdpi': 96}.items():
+              d = f'{res}/drawable-{name}'
+              os.makedirs(d, exist_ok=True)
+              inner = px - 2 * max(1, px // 12)   # هامش 2dp تقريبًا
+              a = sq.resize((inner, inner), Image.LANCZOS)
+              out = Image.new('RGBA', (px, px), (255, 255, 255, 0))
+              white = Image.new('RGBA', (inner, inner), (255, 255, 255, 255))
+              white.putalpha(a)
+              out.paste(white, ((px - inner) // 2, (px - inner) // 2))
+              out.save(f'{d}/ic_stat_a2r.png')
+          # علشان ضغط الموارد في نسخة release ميشيلهاش (بنوصلها بالاسم من الكوتلن)
+          os.makedirs(f'{res}/raw', exist_ok=True)
+          open(f'{res}/raw/a2r_keep.xml', 'w').write('<?xml version="1.0" encoding="utf-8"?>\n'
+              '<resources xmlns:tools="http://schemas.android.com/tools" tools:keep="@drawable/ic_stat_a2r"/>\n')
           for r, _, fs in os.walk(res):
               for f in fs:
-                  if 'ic_launcher' in f: print(os.path.join(r, f))
+                  if 'ic_launcher' in f or 'ic_stat' in f: print(os.path.join(r, f))
           PYICON
 
       - name: Disable release lint (lint crash in webview plugin)
