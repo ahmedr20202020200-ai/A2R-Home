@@ -24,7 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, quote
 
-VERSION = "1.0"
+VERSION = "1.1"
 HTTP_PORT = 47800
 UDP_PORT = 47801
 IS_WIN = sys.platform == "win32"
@@ -206,6 +206,57 @@ def list_dir(path):
 
 # ---------------------------------------------------------------- ويندوز (ماوس/كيبورد/شاشة)
 
+# ---- v1.1: لينك، حافظة، مؤقت إطفاء، معلومات الجهاز ----
+
+
+def validate_open_url(u):
+    """بنفتح بس http/https — من غير أوامر أو ملفات."""
+    if not isinstance(u, str) or not (1 <= len(u) <= 2000):
+        raise ValueError("bad_url")
+    if re.search(r"[\s\x00-\x1f\"<>^`|]", u):
+        raise ValueError("bad_url")
+    pu = urlparse(u)
+    if pu.scheme not in ("http", "https") or not pu.netloc:
+        raise ValueError("only_http")
+    return u
+
+
+def clamp_minutes(m):
+    m = int(m)
+    if not (1 <= m <= 1440):
+        raise ValueError("minutes")
+    return m
+
+
+def parse_getmac(out):
+    """من getmac /fo csv /nh → قايمة MAC (AA:BB:..) للكروت الحقيقية."""
+    macs = []
+    for line in out.splitlines():
+        m = re.search(r"([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})", line)
+        if m:
+            mac = m.group(1).replace("-", ":").upper()
+            if mac not in macs and mac != "00:00:00:00:00:00":
+                macs.append(mac)
+    return macs
+
+
+def pc_macs():
+    macs = []
+    if IS_WIN:
+        try:
+            out = subprocess.run(["getmac", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=5,
+                                 creationflags=0x08000000).stdout
+            macs = parse_getmac(out)
+        except Exception:
+            pass
+    if not macs:
+        import uuid
+        n = uuid.getnode()
+        if not (n >> 40) & 1:  # مش عنوان عشوائي
+            macs = [":".join("%02X" % ((n >> (8 * i)) & 0xFF) for i in reversed(range(6)))]
+    return macs
+
+
 if IS_WIN:
     import ctypes
     from ctypes import wintypes
@@ -356,6 +407,124 @@ else:  # للاختبارات على لينكس بس
         return os.path.join(os.path.expanduser("~"), "Downloads")
 
 
+
+if IS_WIN:
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+
+    class _MEM(_ct.Structure):
+        _fields_ = [("dwLength", _wt.DWORD), ("dwMemoryLoad", _wt.DWORD), ("ullTotalPhys", _ct.c_ulonglong),
+                    ("ullAvailPhys", _ct.c_ulonglong), ("ullTotalPageFile", _ct.c_ulonglong), ("ullAvailPageFile", _ct.c_ulonglong),
+                    ("ullTotalVirtual", _ct.c_ulonglong), ("ullAvailVirtual", _ct.c_ulonglong), ("ullAvailExtendedVirtual", _ct.c_ulonglong)]
+
+    class _PWR(_ct.Structure):
+        _fields_ = [("ACLineStatus", _ct.c_ubyte), ("BatteryFlag", _ct.c_ubyte), ("BatteryLifePercent", _ct.c_ubyte),
+                    ("SystemStatusFlag", _ct.c_ubyte), ("BatteryLifeTime", _wt.DWORD), ("BatteryFullLifeTime", _wt.DWORD)]
+
+    _k32 = _ct.windll.kernel32
+    _u32 = _ct.windll.user32
+    _k32.GetTickCount64.restype = _ct.c_ulonglong
+    _k32.GlobalAlloc.restype = _wt.HGLOBAL
+    _k32.GlobalAlloc.argtypes = [_wt.UINT, _ct.c_size_t]
+    _k32.GlobalLock.restype = _wt.LPVOID
+    _k32.GlobalLock.argtypes = [_wt.HGLOBAL]
+    _k32.GlobalUnlock.argtypes = [_wt.HGLOBAL]
+    _u32.GetClipboardData.restype = _wt.HANDLE
+    _u32.SetClipboardData.restype = _wt.HANDLE
+    _u32.SetClipboardData.argtypes = [_wt.UINT, _wt.HANDLE]
+
+    def _cpu_times():
+        i, k, u = _wt.FILETIME(), _wt.FILETIME(), _wt.FILETIME()
+        _k32.GetSystemTimes(_ct.byref(i), _ct.byref(k), _ct.byref(u))
+        f = lambda t: (t.dwHighDateTime << 32) | t.dwLowDateTime
+        return f(i), f(k) + f(u)
+
+    def cpu_percent():
+        i1, t1 = _cpu_times()
+        time.sleep(0.4)
+        i2, t2 = _cpu_times()
+        dt = t2 - t1
+        return round(100.0 * (1 - (i2 - i1) / dt), 1) if dt > 0 else None
+
+    def sysinfo_os():
+        m = _MEM()
+        m.dwLength = _ct.sizeof(_MEM)
+        _k32.GlobalMemoryStatusEx(_ct.byref(m))
+        p = _PWR()
+        bat = None
+        if _k32.GetSystemPowerStatus(_ct.byref(p)) and p.BatteryFlag != 128 and p.BatteryLifePercent != 255:
+            bat = {"pct": int(p.BatteryLifePercent), "plugged": p.ACLineStatus == 1}
+        return {"cpu": cpu_percent(), "ram_pct": int(m.dwMemoryLoad), "ram_total": int(m.ullTotalPhys),
+                "uptime": int(_k32.GetTickCount64() // 1000), "battery": bat}
+
+    def clip_get():
+        if not _u32.OpenClipboard(None):
+            raise RuntimeError("clipboard_busy")
+        try:
+            h = _u32.GetClipboardData(13)  # CF_UNICODETEXT
+            if not h:
+                return ""
+            ptr = _k32.GlobalLock(h)
+            try:
+                return _ct.wstring_at(ptr) if ptr else ""
+            finally:
+                _k32.GlobalUnlock(h)
+        finally:
+            _u32.CloseClipboard()
+
+    def clip_set(text):
+        data = _ct.create_unicode_buffer(text)
+        size = _ct.sizeof(data)
+        if not _u32.OpenClipboard(None):
+            raise RuntimeError("clipboard_busy")
+        try:
+            _u32.EmptyClipboard()
+            h = _k32.GlobalAlloc(0x0002, size)  # GMEM_MOVEABLE
+            ptr = _k32.GlobalLock(h)
+            _ct.memmove(ptr, data, size)
+            _k32.GlobalUnlock(h)
+            if not _u32.SetClipboardData(13, h):
+                raise RuntimeError("clipboard_set")
+        finally:
+            _u32.CloseClipboard()
+
+    def open_url(u):
+        os.startfile(u)
+
+    def shutdown_in(minutes):
+        subprocess.Popen(["shutdown", "/s", "/t", str(minutes * 60)], creationflags=0x08000000)
+else:  # للاختبارات
+    _CLIP = {"t": ""}
+
+    def sysinfo_os():
+        return {"cpu": None, "ram_pct": None, "ram_total": None, "uptime": None, "battery": None}
+
+    def clip_get():
+        return _CLIP["t"]
+
+    def clip_set(text):
+        _CLIP["t"] = text
+
+    def open_url(u):
+        State.opened.append(u)
+
+    def shutdown_in(minutes):
+        State.opened.append("shutdown:%d" % minutes)
+
+
+def sysinfo():
+    import shutil
+    d = sysinfo_os()
+    root = os.environ.get("SystemDrive", "C:") + "\\" if IS_WIN else "/"
+    try:
+        du = shutil.disk_usage(root)
+        d.update({"disk_path": root, "disk_total": du.total, "disk_free": du.free})
+    except Exception:
+        pass
+    d.update({"name": socket.gethostname(), "macs": pc_macs(), "v": VERSION, "shutdown_at": State.shutdown_at})
+    return d
+
+
 def grab_jpeg(width=1280, quality=60):
     import mss
     from PIL import Image, ImageDraw
@@ -410,6 +579,8 @@ def save_tokens(t):
 class State:
     pairing = None
     events = queue.Queue()  # رسايل للشباك
+    shutdown_at = None  # وقت الإطفاء المتجدول (epoch)
+    opened = []  # للاختبارات
 
 
 def log(msg):
@@ -459,7 +630,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"a2r": "pc", "name": socket.gethostname(), "v": VERSION})
             if u.path == "/info":
                 x0, y0, w, h = screen_rect()
-                return self._json(200, {"name": socket.gethostname(), "w": w, "h": h, "v": VERSION, "recv": RECV_DIR, "home": HOME})
+                return self._json(200, {"name": socket.gethostname(), "w": w, "h": h, "v": VERSION, "recv": RECV_DIR, "home": HOME, "macs": pc_macs()})
+            if u.path == "/sysinfo":
+                return self._json(200, sysinfo())
+            if u.path == "/clip":
+                return self._json(200, {"text": clip_get()})
             if u.path == "/frame.jpg":
                 data, w, h = grab_jpeg(int(q.get("w", 1280)), int(q.get("q", 60)))
                 self.send_response(200)
@@ -528,14 +703,42 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/power":
                 d = json.loads(self._body(4096) or b"{}")
                 a = d.get("a")
-                if a not in ("lock", "sleep", "shutdown", "restart", "cancel"):
+                if a not in ("lock", "sleep", "shutdown", "restart", "cancel", "shutdown_in"):
                     return self._json(400, {"error": "bad_action"})
-                if a in ("shutdown", "restart", "sleep") and d.get("confirm") is not True:
+                if a in ("shutdown", "restart", "sleep", "shutdown_in") and d.get("confirm") is not True:
                     return self._json(400, {"error": "need_confirm"})
+                if a == "shutdown_in":
+                    try:
+                        m = clamp_minutes(d.get("minutes"))
+                    except (TypeError, ValueError):
+                        return self._json(400, {"error": "bad_minutes"})
+                    log("إطفاء بعد %d دقيقة" % m)
+                    shutdown_in(m)
+                    State.shutdown_at = int(time.time()) + m * 60
+                    return self._json(200, {"ok": True, "at": State.shutdown_at})
+                if a == "cancel":
+                    State.shutdown_at = None
                 log("أمر: " + a)
                 self._json(200, {"ok": True})
                 threading.Timer(0.3, do_power, args=(a,)).start()
                 return
+            if u.path == "/clip":
+                d = json.loads(self._body(512 * 1024) or b"{}")
+                t = d.get("text")
+                if not isinstance(t, str) or len(t) > 200000:
+                    return self._json(400, {"error": "bad_text"})
+                clip_set(t)
+                log("اتنسخ من الموبايل (%d حرف)" % len(t))
+                return self._json(200, {"ok": True})
+            if u.path == "/open":
+                d = json.loads(self._body(8192) or b"{}")
+                try:
+                    url = validate_open_url(d.get("url"))
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                log("فتح لينك: " + url[:80])
+                open_url(url)
+                return self._json(200, {"ok": True})
             if u.path == "/upload":
                 n = int(self.headers.get("Content-Length") or 0)
                 if n <= 0 or n > MAX_UPLOAD:
