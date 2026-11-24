@@ -24,7 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, quote
 
-VERSION = "1.1"
+VERSION = "1.2"
 HTTP_PORT = 47800
 UDP_PORT = 47801
 IS_WIN = sys.platform == "win32"
@@ -525,6 +525,52 @@ def sysinfo():
     return d
 
 
+# ---------------------------------------------------------------- العمليات (Task Manager)
+PROTECTED = {"system", "system idle process", "registry", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+             "services.exe", "lsass.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "memory compression"}
+
+
+def parse_tasklist(out):
+    """يحوّل ناتج tasklist /fo csv /nh لقايمة {name,pid,mem_mb} مرتبة بالرامات."""
+    import csv
+    rows = []
+    for r in csv.reader(io.StringIO(out)):
+        if len(r) < 5:
+            continue
+        try:
+            pid = int(r[1])
+            mem = int(re.sub(r"[^0-9]", "", r[4]) or 0) / 1024.0
+        except ValueError:
+            continue
+        rows.append({"name": r[0], "pid": pid, "mem_mb": round(mem, 1), "protected": r[0].lower() in PROTECTED or pid <= 4})
+    rows.sort(key=lambda x: -x["mem_mb"])
+    return rows
+
+
+def list_procs():
+    if not IS_WIN:
+        return []
+    out = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, creationflags=0x08000000, timeout=15).stdout
+    return parse_tasklist(out.decode("mbcs", "replace") if hasattr(out, "decode") else out)
+
+
+def kill_proc(pid):
+    pid = int(pid)
+    if pid == os.getpid() or pid <= 4:
+        raise ValueError("protected")
+    for p in list_procs():
+        if p["pid"] == pid:
+            if p["protected"]:
+                raise ValueError("protected")
+            break
+    else:
+        raise ValueError("no_such_pid")
+    if IS_WIN:
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, creationflags=0x08000000, timeout=15)
+        if r.returncode != 0:
+            raise ValueError("kill_failed")
+
+
 def grab_jpeg(width=1280, quality=60):
     import mss
     from PIL import Image, ImageDraw
@@ -635,6 +681,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, sysinfo())
             if u.path == "/clip":
                 return self._json(200, {"text": clip_get()})
+            if u.path == "/procs":
+                return self._json(200, {"procs": list_procs()[:300], "self": os.getpid()})
             if u.path == "/frame.jpg":
                 data, w, h = grab_jpeg(int(q.get("w", 1280)), int(q.get("q", 60)))
                 self.send_response(200)
@@ -722,6 +770,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True})
                 threading.Timer(0.3, do_power, args=(a,)).start()
                 return
+            if u.path == "/kill":
+                d = json.loads(self._body(4096) or b"{}")
+                if d.get("confirm") is not True:
+                    return self._json(400, {"error": "need_confirm"})
+                try:
+                    kill_proc(d.get("pid"))
+                except (TypeError, ValueError) as e:
+                    return self._json(400, {"error": str(e) if str(e) in ("protected", "no_such_pid", "kill_failed") else "bad_pid"})
+                log("اتقفلت عملية %s" % d.get("pid"))
+                return self._json(200, {"ok": True})
             if u.path == "/clip":
                 d = json.loads(self._body(512 * 1024) or b"{}")
                 t = d.get("text")
