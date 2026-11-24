@@ -366,6 +366,7 @@ class _ShellState extends State<Shell> {
 
   @override
   Widget build(BuildContext context) {
+    kAppTab.value = tab; // شاشة الكمبيوتر بتوقف لما التبويب يتغير
     const titles = ['الشبكة', 'العرض على التلفزيون', 'الريسيفر', 'الكمبيوتر'];
     const icons = [Icons.router_rounded, Icons.cast_rounded, Icons.satellite_alt_rounded, Icons.desktop_windows_rounded];
     return Scaffold(
@@ -9723,6 +9724,32 @@ Offset? tapToScreen(Offset p, Size box, Size img) {
   return Offset(x, y);
 }
 
+/// عناوين البحث: العام + عنوان الشبكة (من الموبايل) + x.x.x.255
+List<String> pcDiscoverTargets(String? bcast, String prefix) {
+  final ok = RegExp(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$');
+  return <String>{
+    '255.255.255.255',
+    if (bcast != null && ok.hasMatch(bcast.replaceAll('/', ''))) bcast.replaceAll('/', ''),
+    if (prefix.isNotEmpty) '$prefix.255',
+  }.toList();
+}
+
+/// اسم ملف مش مستخدم: name.ext → name (1).ext → name (2).ext
+String pcUniquePath(String dir, String name, bool Function(String) exists) {
+  var p = '$dir/$name';
+  if (!exists(p)) return p;
+  final dot = name.lastIndexOf('.');
+  final stem = dot > 0 ? name.substring(0, dot) : name;
+  final ext = dot > 0 ? name.substring(dot) : '';
+  for (var i = 1;; i++) {
+    p = '$dir/$stem ($i)$ext';
+    if (!exists(p)) return p;
+  }
+}
+
+/// نفس الكمبيوتر؟ (بالاسم — العنوان ممكن يتغير من الراوتر)
+bool pcSameName(String a, String b) => a.trim().toLowerCase() == b.trim().toLowerCase() && a.trim().isNotEmpty;
+
 class PcClient {
   final String host;
   final int port;
@@ -9785,31 +9812,56 @@ class PcClient {
   }
 
   Future<void> upload(File f, void Function(double) progress) async {
+    // نتأكد الأول إن الربط لسه شغال (قبل كده كان بيطلع خطأ سوكت غريب في نص الرفع)
+    await info();
     final len = await f.length();
-    final r = await _h.openUrl('POST', _u('/upload', {'name': f.uri.pathSegments.last}));
-    r.headers.set('X-A2R-Token', token ?? '');
-    r.contentLength = len;
-    var sent = 0;
-    await r.addStream(f.openRead().map((c) {
-      sent += c.length;
-      progress(sent / max(1, len));
-      return c;
-    }));
-    final res = await r.close();
+    HttpClientResponse res;
+    try {
+      final r = await _h.openUrl('POST', _u('/upload', {'name': f.uri.pathSegments.last}));
+      r.headers.set('X-A2R-Token', token ?? '');
+      r.contentLength = len;
+      var sent = 0;
+      await r.addStream(f.openRead().map((c) {
+        sent += c.length;
+        progress(sent / max(1, len));
+        return c;
+      }));
+      res = await r.close();
+    } on IOException {
+      try {
+        await info();
+      } on PcAuthError {
+        rethrow;
+      } catch (_) {}
+      throw StateError('الاتصال بالكمبيوتر اتقطع أثناء الرفع — جرّب تاني');
+    }
     final t = await utf8.decoder.bind(res).join();
     if (res.statusCode == 401) throw const PcAuthError();
-    if (res.statusCode != 200) throw StateError('الرفع فشل: $t');
+    if (res.statusCode != 200) throw StateError('الرفع فشل: ${pcErrAr(_errCode(t))}');
+  }
+
+  static String _errCode(String t) {
+    try {
+      return '${(jsonDecode(t) as Map)['error']}';
+    } catch (_) {
+      return t;
+    }
   }
 
   Future<File> download(String path, String name, void Function(double) progress) async {
     final res = await _req('GET', '/file', q: {'path': path}, timeout: const Duration(seconds: 20));
+    if (res.statusCode == 401) {
+      await res.drain();
+      throw const PcAuthError();
+    }
     if (res.statusCode != 200) {
       await res.drain();
-      throw StateError('مقدرتش أنزّل الملف');
+      throw StateError(res.statusCode == 404 ? 'الملف مش موجود على الكمبيوتر (اتمسح أو اتنقل؟)' : 'مقدرتش أنزّل الملف');
     }
     final dir = Directory('${(await getExternalStorageDirectory() ?? await getTemporaryDirectory()).path}/A2R-PC');
     await dir.create(recursive: true);
-    final out = File('${dir.path}/${name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')}');
+    // ملفين بنفس الاسم: name (1).ext بدل ما الجديد يمسح القديم
+    final out = File(pcUniquePath(dir.path, name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_'), (p) => File(p).existsSync()));
     final sink = out.openWrite();
     var got = 0;
     final total = res.contentLength;
@@ -9825,7 +9877,7 @@ class PcClient {
   void close() => _h.close(force: true);
 
   /// يدوّر على الكمبيوتر في الشبكة (broadcast)
-  static Future<List<PcInfo>> discover({Duration wait = const Duration(seconds: 3)}) async {
+  static Future<List<PcInfo>> discover({Duration wait = const Duration(seconds: 3), bool scan = true, String? prefix}) async {
     final out = <String, PcInfo>{};
     await Native.multicastLock(true);
     RawDatagramSocket? s;
@@ -9840,8 +9892,19 @@ class PcClient {
         if (p != null) out[p.host] = p;
       });
       final msg = utf8.encode('A2R-PC?');
+      // v6: كمان عنوان الشبكة نفسها (x.x.x.255) — في راوترات/أكسس بوينت مش بتعدّي 255.255.255.255
+      var targets = const ['255.255.255.255'];
+      try {
+        final n = await readPhoneNet();
+        targets = pcDiscoverTargets(n.broadcast, n.prefix);
+        prefix ??= n.prefix;
+      } catch (_) {}
       for (var i = 0; i < 3; i++) {
-        s.send(msg, InternetAddress('255.255.255.255'), kPcUdpPort);
+        for (final t in targets) {
+          try {
+            s.send(msg, InternetAddress(t), kPcUdpPort);
+          } catch (_) {}
+        }
         await Future.delayed(wait ~/ 3);
       }
     } catch (e) {
@@ -9850,7 +9913,38 @@ class PcClient {
       s?.close();
       await Native.multicastLock(false);
     }
+    // مفيش رد على البحث (جدار ناري على UDP أو الراوتر بيمنع) → نجرّب كل عناوين الشبكة على بورت البرنامج
+    if (out.isEmpty && scan && (prefix ?? '').isNotEmpty) {
+      for (final p in await scanSubnet(prefix!)) {
+        out[p.host] = p;
+      }
+    }
     return out.values.toList();
+  }
+
+  /// فحص سريع لكل الشبكة (x.x.x.1 .. 254) على بورت 47800 ← /hello (من غير توكن)
+  static Future<List<PcInfo>> scanSubnet(String prefix, {int port = kPcHttpPort, Duration timeout = const Duration(milliseconds: 500), int parallel = 48}) async {
+    final found = <PcInfo>[];
+    final hc = HttpClient()..connectionTimeout = timeout;
+    final hosts = [for (var i = 1; i <= 254; i++) '$prefix.$i'];
+    var next = 0;
+    Future<void> worker() async {
+      while (next < hosts.length) {
+        final h = hosts[next++];
+        try {
+          final rq = await hc.getUrl(Uri(scheme: 'http', host: h, port: port, path: '/hello')).timeout(timeout * 2);
+          final rs = await rq.close().timeout(timeout * 2);
+          final t = await utf8.decoder.bind(rs).join().timeout(timeout * 2);
+          final p = parsePcReply(h, t);
+          if (p != null) found.add(PcInfo(h, p.name, port));
+        } catch (_) {}
+      }
+    }
+
+    await Future.wait([for (var i = 0; i < parallel; i++) worker()]);
+    hc.close(force: true);
+    AppLog.add('PC', 'scan $prefix.x → ${found.length}');
+    return found;
   }
 }
 
@@ -9869,6 +9963,8 @@ String pcErrAr(String e) {
   if (e == 'protected') return 'دي عملية نظام ومحمية';
   if (e == 'no_such_pid') return 'العملية دي اتقفلت قبل كده';
   if (e == 'kill_failed') return 'ويندوز رفض يقفلها';
+  if (e == 'blocked') return pcWarnAr('admin');
+  if (e == 'shutdown_failed') return 'ويندوز رفض أمر الإطفاء — جرّب تاني';
   return e;
 }
 
@@ -9934,9 +10030,54 @@ class _PcPageState extends State<PcPage> with AutomaticKeepAliveClientMixin {
         msg = 'الكمبيوتر لغى الربط — اربط تاني';
       });
     } catch (e) {
+      if (!mounted) return;
+      setState(() => msg = 'الكمبيوتر مش بيرد على ${pc!.host} — بدوّر عليه…');
+      if (await _rediscover()) return;
+      if (!mounted || pc == null) return;
       setState(() => msg = PcWake.macs.isEmpty
-          ? 'الكمبيوتر مش بيرد — شغّل A2R PC عليه (${pc!.host})'
+          ? 'الكمبيوتر مش بيرد — شغّل A2R PC عليه (${pc!.host}). لو شغال: دوس «اسمح في الجدار الناري» في شباكه'
           : 'الكمبيوتر مش بيرد — لو مقفول جرّب «شغّل الكمبيوتر» من القايمة (⋮)');
+    }
+  }
+
+  bool _redisc = false;
+  DateTime _rediscT = DateTime(2000);
+
+  /// الراوتر ممكن يدّي الكمبيوتر عنوان جديد: ندوّر عليه بالاسم ونحدّث العنوان من غير ربط جديد
+  Future<bool> _rediscover() async {
+    final s = PcSaved.get();
+    if (_redisc || pc == null || s == null) return false;
+    if (DateTime.now().difference(_rediscT).inSeconds < 30) return false; // مرة كل 30 ثانية بالكتير
+    _rediscT = DateTime.now();
+    _redisc = true;
+    try {
+      final list = await PcClient.discover();
+      PcInfo? hit;
+      for (final p in list) {
+        if (pcSameName(p.name, s.name) && p.host != pc!.host) hit = p;
+      }
+      if (hit == null || !mounted) return false;
+      final c = PcClient(hit.host, port: hit.port, token: s.token);
+      try {
+        await c.info();
+      } catch (_) {
+        c.close();
+        return false;
+      }
+      await PcSaved.put(hit.host, s.name, s.token);
+      final old = pc;
+      setState(() {
+        pc = c;
+        msg = 'الكمبيوتر غيّر عنوانه لـ ${hit!.host} — اتظبط لوحده ✓';
+      });
+      old?.close();
+      AppLog.add('PC', 'rediscovered ${s.name} → ${hit.host}');
+      return true;
+    } catch (e) {
+      AppLog.add('PC', 'rediscover $e');
+      return false;
+    } finally {
+      _redisc = false;
     }
   }
 
@@ -9990,12 +10131,22 @@ class _PcPageState extends State<PcPage> with AutomaticKeepAliveClientMixin {
     });
   }
 
+  String _lastErr = '';
+  DateTime _lastErrT = DateTime(2000);
+
   void onErr(Object e) {
     if (e is PcAuthError) {
       PcSaved.clear();
       setState(() => pc = null);
+    } else if (e is SocketException || e is TimeoutException) {
+      unawaited(_rediscover());
     }
-    if (mounted) toast(context, '$e'.replaceFirst('Bad state: ', ''));
+    final m = '$e'.replaceFirst('Bad state: ', '');
+    // نفس الرسالة كل شوية (مثلاً شباك أدمن والماوس شغال) → مرة كل 4 ثواني بس
+    if (m == _lastErr && DateTime.now().difference(_lastErrT).inSeconds < 4) return;
+    _lastErr = m;
+    _lastErrT = DateTime.now();
+    if (mounted) toast(context, m);
   }
 
   @override
@@ -10039,9 +10190,9 @@ class _PcPageState extends State<PcPage> with AutomaticKeepAliveClientMixin {
       const SizedBox(height: 6),
       Expanded(
         child: switch (view) {
-          0 => PcMousePad(pc: pc!, onErr: onErr),
-          1 => PcScreenView(pc: pc!, onErr: onErr),
-          _ => PcFilesView(pc: pc!, onErr: onErr),
+          0 => PcMousePad(key: ValueKey('pad${pc!.host}'), pc: pc!, onErr: onErr),
+          1 => PcScreenView(key: ValueKey('scr${pc!.host}'), pc: pc!, onErr: onErr),
+          _ => PcFilesView(key: ValueKey('fil${pc!.host}'), pc: pc!, onErr: onErr),
         },
       ),
     ]);
@@ -10090,6 +10241,7 @@ class _InputBatcher {
   final PcClient pc;
   final void Function(Object) onErr;
   double _dx = 0, _dy = 0, _sc = 0;
+  Map<String, dynamic>? _absP; // آخر مكان مطلق (بنبعت الأخير بس)
   final List<Map<String, dynamic>> _q = [];
   Timer? _t;
   bool _sending = false;
@@ -10106,6 +10258,12 @@ class _InputBatcher {
     _kick();
   }
 
+  /// تحريك السهم لمكان (0..1) على شاشة معيّنة — الحركات الكتير بتتجمع في آخر مكان
+  void absMove(double x, double y, [int? mon]) {
+    _absP = {'t': 'abs', 'x': x, 'y': y, if (mon != null) 'm': mon};
+    _kick();
+  }
+
   void cmd(Map<String, dynamic> c) {
     _flushMove();
     _q.add(c);
@@ -10113,6 +10271,10 @@ class _InputBatcher {
   }
 
   void _flushMove() {
+    if (_absP != null) {
+      _q.add(_absP!);
+      _absP = null;
+    }
     if (_dx.abs() >= 1 || _dy.abs() >= 1) {
       _q.add({'t': 'move', 'dx': _dx.round(), 'dy': _dy.round()});
       _dx = _dy = 0;
@@ -10134,7 +10296,9 @@ class _InputBatcher {
     _q.clear();
     _sending = true;
     try {
-      await pc.input(batch);
+      final r = await pc.inputR(batch);
+      // v1.3: ويندوز هيتجاهل الأوامر في شباك أدمن / شاشة القفل
+      if (r['warn'] is String) onErr(StateError(pcWarnAr(r['warn'] as String)));
     } catch (e) {
       onErr(e);
     } finally {
@@ -10174,7 +10338,14 @@ class _PcMousePadState extends State<PcMousePad> {
   }
 
   Future<void> power(String a, String label) async {
-    if (a != 'lock' && !await confirm(context, '$label الكمبيوتر؟')) return;
+    if (a != 'lock' &&
+        !await confirm(
+            context,
+            a == 'shutdown' || a == 'restart'
+                ? '$label الكمبيوتر؟\n⚠️ ويندوز هيقفل البرامج بالعافية — أي شغل مش محفوظ هيضيع.'
+                : '$label الكمبيوتر؟')) {
+      return;
+    }
     try {
       await widget.pc.power(a);
       if (mounted) toast(context, a == 'shutdown' || a == 'restart' ? '$label خلال 5 ثواني (إلغاء ← من القايمة)' : '$label ✓');
@@ -10344,61 +10515,431 @@ class _PcMousePadState extends State<PcMousePad> {
   }
 }
 
+// ======== شاشة الكمبيوتر v6: ماوس (تاتش باد) + لمس مباشر + تكبير مع التحكم + ملء الشاشة ========
+// السبب: أحمد مكانش عارف يكبّر (السحب كان بيكسب التكبير وبيبعت ضغطة ماوس) ولا يتحكم باللمس (الصورة صغيرة وأي حركة = سحب).
+// الحل: مستقبل لمس واحد بيعدّ الصوابع بنفسه (مفيش تعارض بين السحب والتكبير)، ووضعين: ماوس (افتراضي) ولمس.
+
+/// تبويب التطبيق الحالي (0 الشبكة .. 3 الكمبيوتر) — علشان الشاشة توقف لما تسيب التبويب
+final ValueNotifier<int> kAppTab = ValueNotifier<int>(0);
+
+enum PcGMode { mouse, touch }
+
+/// حدث من مستقبل اللمس
+class PcGEvent {
+  final String k; // move | tap | right | down | drag | up | scroll | zoom | pan
+  final Offset p; // مكان (للمس) أو فرق حركة
+  final double v; // معامل التكبير / مقدار السكرول
+  const PcGEvent(this.k, [this.p = Offset.zero, this.v = 0]);
+  @override
+  String toString() => '$k(${p.dx.toStringAsFixed(1)},${p.dy.toStringAsFixed(1)} $v)';
+}
+
+/// مستقبل اللمس (منطق صافي عليه اختبارات): بيحوّل صوابع → أحداث
+/// ماوس: صباع = حركة السهم • دوسة = كليك • دوستين = دبل كليك • صباعين دوسة = كليك يمين
+///       صباعين سحب = سكرول • قرصة = تكبير • ضغطة طويلة وحرّك = سحب
+/// لمس: دوسة = كليك مكانها • صباعين = سكرول/تكبير • صباع واحد = تحريك الصورة المكبّرة • ضغطة طويلة = سحب
+class PcGestures {
+  PcGMode mode;
+  double Function() zoom;
+  static const double slop = 10, longMs = 450, tapMs = 450, twoTapMs = 400, dblMs = 380, dblDist = 32;
+  PcGestures({this.mode = PcGMode.mouse, double Function()? zoom}) : zoom = zoom ?? (() => 1.0);
+
+  final Map<int, Offset> _pts = {};
+  final List<PcGEvent> out = [];
+  String state = 'idle'; // idle pending moving drag two zoom scroll done
+  int _t0 = 0, _t2 = 0;
+  Offset _start = Offset.zero, _last = Offset.zero;
+  double _d0 = 1, _dl = 1;
+  Offset _c0 = Offset.zero, _cl = Offset.zero;
+  int _tapT = -100000;
+  Offset _tapP = Offset.zero;
+
+  List<PcGEvent> take() {
+    final r = List<PcGEvent>.from(out);
+    out.clear();
+    return r;
+  }
+
+  (Offset, double) _two() {
+    final v = _pts.values.take(2).toList();
+    return ((v[0] + v[1]) / 2, max(1.0, (v[0] - v[1]).distance));
+  }
+
+  void down(int id, Offset p, int t) {
+    _pts[id] = p;
+    if (_pts.length == 1) {
+      state = 'pending';
+      _t0 = t;
+      _start = _last = p;
+    } else if (_pts.length == 2 && (state == 'pending' || state == 'moving')) {
+      state = 'two';
+      _t2 = t;
+      final (c, d) = _two();
+      _c0 = _cl = c;
+      _d0 = _dl = d;
+    } else if (state != 'drag') {
+      state = 'done';
+    }
+  }
+
+  void move(int id, Offset p, int t) {
+    if (!_pts.containsKey(id)) return;
+    _pts[id] = p;
+    switch (state) {
+      case 'pending':
+        if (_pts.length == 1 && (p - _start).distance > slop) {
+          state = 'moving';
+          _one(p - _start);
+          _last = p;
+        }
+      case 'moving':
+        _one(p - _last);
+        _last = p;
+      case 'drag':
+        out.add(PcGEvent('drag', mode == PcGMode.mouse ? p - _last : p));
+        _last = p;
+      case 'two' || 'zoom' || 'scroll':
+        if (_pts.length < 2) return;
+        final (c, d) = _two();
+        if (state == 'two') {
+          if ((log(d / _d0)).abs() > 0.12) {
+            state = 'zoom';
+          } else if ((c - _c0).distance > slop) {
+            state = 'scroll';
+          }
+        }
+        if (state == 'zoom') {
+          out.add(PcGEvent('zoom', c, d / _dl));
+          if (c != _cl) out.add(PcGEvent('pan', c - _cl));
+        } else if (state == 'scroll') {
+          out.add(PcGEvent('scroll', c - _cl, (c - _cl).dy));
+        }
+        if (state != 'two') {
+          _cl = c;
+          _dl = d;
+        }
+    }
+  }
+
+  void _one(Offset d) {
+    if (mode == PcGMode.mouse) {
+      out.add(PcGEvent('move', d));
+    } else if (zoom() > 1.01) {
+      out.add(PcGEvent('pan', d));
+    }
+  }
+
+  void up(int id, Offset p, int t) {
+    if (!_pts.containsKey(id)) return;
+    final n = _pts.length;
+    _pts.remove(id);
+    if (state == 'pending' && n == 1) {
+      if (t - _t0 < tapMs) {
+        // دوستين ورا بعض في نفس المكان تقريبًا → نفس النقطة بالظبط علشان ويندوز يعتبرها دبل كليك
+        final dbl = t - _tapT < dblMs && (p - _tapP).distance < dblDist;
+        final at = dbl ? _tapP : _start;
+        out.add(PcGEvent('tap', at));
+        _tapT = dbl ? -100000 : t;
+        _tapP = at;
+      }
+    } else if (state == 'drag') {
+      if (_pts.isEmpty) out.add(const PcGEvent('up'));
+    } else if (state == 'two' && n == 2) {
+      if (t - _t2 < twoTapMs) out.add(PcGEvent('right', _c0));
+      state = 'done';
+    } else if (state == 'zoom' || state == 'scroll') {
+      state = 'done';
+    }
+    if (_pts.isEmpty) state = 'idle';
+  }
+
+  void cancel(int id) {
+    _pts.remove(id);
+    if (state == 'drag' && _pts.isEmpty) out.add(const PcGEvent('up'));
+    if (_pts.isEmpty) {
+      state = 'idle';
+    } else if (state != 'drag') {
+      state = 'done';
+    }
+  }
+
+  /// بيتنادى من تايمر بعد الضغطة بنص ثانية: لو الصباع لسه ثابت = سحب
+  bool longPress(int t) {
+    if (state == 'pending' && _pts.length == 1 && t - _t0 >= longMs) {
+      state = 'drag';
+      out.add(PcGEvent('down', _start));
+      _last = _start;
+      return true;
+    }
+    return false;
+  }
+}
+
+/// مستطيل الصورة جوه المساحة (BoxFit.contain)
+Rect pcImageRect(Size box, Size img) {
+  if (img.width <= 0 || img.height <= 0) return Offset.zero & box;
+  final s = min(box.width / img.width, box.height / img.height);
+  final w = img.width * s, h = img.height * s;
+  return Rect.fromLTWH((box.width - w) / 2, (box.height - h) / 2, w, h);
+}
+
+/// التكبير: تحريك الصورة لازم يفضل مغطي المساحة
+Offset pcClampOff(Offset off, double sc, Size box) =>
+    Offset(off.dx.clamp(box.width * (1 - sc), 0.0).toDouble(), off.dy.clamp(box.height * (1 - sc), 0.0).toDouble());
+
+/// تكبير حوالين نقطة (مكان الصوابع)
+({double sc, Offset off}) pcZoomAt(double sc, Offset off, double f, Offset focal, Size box, {double maxSc = 6}) {
+  final ns = (sc * f).clamp(1.0, maxSc).toDouble();
+  final noff = focal - (focal - off) * (ns / sc);
+  return (sc: ns, off: pcClampOff(noff, ns, box));
+}
+
+Offset pcViewToChild(Offset v, double sc, Offset off) => (v - off) / sc;
+Offset pcChildToView(Offset c, double sc, Offset off) => c * sc + off;
+
+/// السهم بيتحرك مع الصورة: فرق الصباع على الشاشة → فرق نسبة (0..1) على الكمبيوتر، مع تسارع بسيط
+Offset pcCursorStep(Offset cur, Offset d, Rect img, double sc, double speed) {
+  final v = d.distance;
+  final acc = v > 18 ? 2.2 : (v > 8 ? 1.5 : 1.0);
+  final k = acc * speed / sc;
+  final w = max(1.0, img.width), h = max(1.0, img.height);
+  return Offset((cur.dx + d.dx * k / w).clamp(0.0, 1.0).toDouble(), (cur.dy + d.dy * k / h).clamp(0.0, 1.0).toDouble());
+}
+
+/// لو السهم قرب يطلع برة الجزء المكبّر → حرّك الصورة معاه
+Offset pcFollow(Offset off, double sc, Size box, Offset cursorView, {double margin = 48}) {
+  if (sc <= 1.01) return off;
+  var dx = 0.0, dy = 0.0;
+  final m = min(margin, min(box.width, box.height) / 4);
+  if (cursorView.dx < m) dx = m - cursorView.dx;
+  if (cursorView.dx > box.width - m) dx = box.width - m - cursorView.dx;
+  if (cursorView.dy < m) dy = m - cursorView.dy;
+  if (cursorView.dy > box.height - m) dy = box.height - m - cursorView.dy;
+  return pcClampOff(off + Offset(dx, dy), sc, box);
+}
+
+/// الجودة التلقائية: (عرض الصورة، جودة JPEG)
+const List<(int, int)> kPcAutoLevels = [(720, 40), (960, 50), (1280, 58), (1600, 65)];
+
+/// متوسط وقت الصورة (ms) → مستوى أعلى/أقل
+int pcAdaptLevel(int level, double avgMs) {
+  if (avgMs > 350 && level > 0) return level - 1;
+  if (avgMs < 120 && level < kPcAutoLevels.length - 1) return level + 1;
+  return level;
+}
+
+/// الكتابة المباشرة: الفرق بين النص القديم والجديد → (عدد مسح، نص جديد يتكتب)
+(int, String) pcTypingDiff(String a, String b) {
+  var i = 0;
+  final ar = a.runes.toList(), br = b.runes.toList();
+  while (i < ar.length && i < br.length && ar[i] == br[i]) {
+    i++;
+  }
+  return (ar.length - i, String.fromCharCodes(br.sublist(i)));
+}
+
+/// صورة واحدة من الكمبيوتر
+class PcFrame {
+  final Uint8List? bytes; // null = زي اللي قبلها (204)
+  final Size img, screen;
+  final String hash;
+  final Offset? cursor; // 0..1
+  final int mon;
+  const PcFrame(this.bytes, this.img, this.screen, this.hash, this.cursor, this.mon);
+}
+
+Size _pcSize(String? s) {
+  final m = RegExp(r'^(\d+)x(\d+)$').firstMatch(s ?? '');
+  return m == null ? Size.zero : Size(double.parse(m[1]!), double.parse(m[2]!));
+}
+
+Offset? _pcCursor(String? s) {
+  final p = (s ?? '').split(',');
+  if (p.length != 2) return null;
+  final x = double.tryParse(p[0]), y = double.tryParse(p[1]);
+  return x == null || y == null ? null : Offset(x, y);
+}
+
+extension PcClientV6 on PcClient {
+  /// صورة الشاشة (v1.3: رقم الشاشة + من غير سهم + 204 لو متغيرتش)
+  Future<PcFrame?> frameX({int width = 1280, int quality = 60, int? mon, bool cursor = true, String? last}) async {
+    final res = await _req('GET', '/frame.jpg', q: {
+      'w': '$width',
+      'q': '$quality',
+      if (mon != null) 'm': '$mon',
+      if (!cursor) 'c': '0',
+      if (last != null && last.isNotEmpty) 'h': last,
+    }, timeout: const Duration(seconds: 6));
+    if (res.statusCode == 401) {
+      await res.drain();
+      throw const PcAuthError();
+    }
+    final hash = res.headers.value('x-hash') ?? '';
+    final cur = _pcCursor(res.headers.value('x-cursor'));
+    final scr = _pcSize(res.headers.value('x-screen'));
+    final mi = int.tryParse(res.headers.value('x-mon') ?? '') ?? 0;
+    if (res.statusCode == 204) {
+      await res.drain();
+      return PcFrame(null, Size.zero, scr, hash, cur, mi);
+    }
+    if (res.statusCode != 200) {
+      await res.drain();
+      return null;
+    }
+    final b = BytesBuilder(copy: false);
+    await for (final c in res) {
+      b.add(c);
+    }
+    return PcFrame(b.takeBytes(), _pcSize(res.headers.value('x-img')), scr, hash, cur, mi);
+  }
+
+  /// أمر ماوس/كيبورد وبيرجع الرد (فيه warn لو ويندوز هيتجاهل الأمر)
+  Future<Map<String, dynamic>> inputR(List<Map<String, dynamic>> cmds) => _json('POST', '/input', json: cmds);
+}
+
+String pcWarnAr(String w) => w == 'locked'
+    ? 'الكمبيوتر على شاشة القفل أو رسالة صلاحيات (UAC) — ويندوز مش بيسمح بالتحكم فيها'
+    : 'الويندوز رفض — الشباك ده محتاج صلاحيات أدمن (افتح A2R PC كمسؤول لو محتاج تتحكم فيه)';
+
 class PcScreenView extends StatefulWidget {
   final PcClient pc;
   final void Function(Object) onErr;
-  const PcScreenView({super.key, required this.pc, required this.onErr});
+  final bool full;
+  const PcScreenView({super.key, required this.pc, required this.onErr, this.full = false});
   @override
   State<PcScreenView> createState() => _PcScreenViewState();
 }
 
-class _PcScreenViewState extends State<PcScreenView> {
+class _PcScreenViewState extends State<PcScreenView> with WidgetsBindingObserver {
   Uint8List? img;
   Size imgSize = Size.zero;
-  bool running = true, control = true;
-  int quality = Store.p.getInt('pc_q') ?? 55;
-  int width = Store.p.getInt('pc_w') ?? 1280;
-  int fps = 0, _frames = 0;
+  bool running = true;
+  // الجودة: 0 = تلقائي، وإلا 35/55/80
+  int quality = Store.p.getInt('pc_q2') ?? 0;
+  int level = 2;
+  int fps = 0, _resp = 0;
   DateTime _t0 = DateTime.now();
+  final List<int> _lat = [];
   int _gen = 0;
   late final _InputBatcher b = _InputBatcher(widget.pc, widget.onErr);
-  final tc = TransformationController();
+  PcGMode mode = Store.p.getString('pc_mode') == 'touch' ? PcGMode.touch : PcGMode.mouse;
+  late final PcGestures g = PcGestures(mode: mode, zoom: () => sc);
+  double sc = 1;
+  Offset off = Offset.zero;
+  Size box = Size.zero;
+  Offset cur = const Offset(.5, .5);
+  bool curKnown = false, dragging = false, bar = true;
+  DateTime _lastLocal = DateTime(2000);
+  double speed = Store.p.getDouble('pc_speed2') ?? 1.0;
+  List<Map<String, dynamic>> mons = [];
+  int? mon;
+  String hash = '';
+  Timer? _lp;
+  AppLifecycleState _life = AppLifecycleState.resumed;
+  String status = '';
 
   @override
   void initState() {
     super.initState();
-    _loop();
+    WidgetsBinding.instance.addObserver(this);
+    _loadMons();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _loop();
+    });
   }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) => _life = s;
 
   @override
   void dispose() {
     _gen++;
+    _lp?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     b.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadMons() async {
+    try {
+      final i = await widget.pc.info();
+      final l = [for (final m in (i['mons'] as List? ?? const [])) Map<String, dynamic>.from(m as Map)];
+      if (mounted) setState(() => mons = l);
+    } catch (_) {}
+  }
+
+  bool get _visible {
+    if (!mounted || _life != AppLifecycleState.resumed) return false;
+    if (!widget.full && kAppTab.value != 3) return false;
+    return _route?.isCurrent ?? true; // صفحة تانية فوقها (مثلاً ملء الشاشة) → توقف
+  }
+
+  ModalRoute<dynamic>? _route;
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _route = ModalRoute.of(context);
+  }
+
+  (int, int) get _wq {
+    if (quality == 0) return kPcAutoLevels[level];
+    return quality == 35 ? (960, 35) : (quality == 55 ? (1280, 55) : (1920, 80));
   }
 
   Future<void> _loop() async {
     final my = ++_gen;
     var fails = 0;
     while (mounted && running && my == _gen) {
+      if (!_visible) {
+        // التبويب مش ظاهر / التطبيق في الخلفية / صفحة فوقه → منسحبش صور (بطارية + نت + معالج الكمبيوتر)
+        await Future.delayed(const Duration(milliseconds: 350));
+        continue;
+      }
       try {
-        final f = await widget.pc.frame(width: width, quality: quality);
-        if (f != null && mounted) {
-          if (imgSize == Size.zero || _frames % 30 == 0) {
-            final im = await decodeImageFromList(f);
-            imgSize = Size(im.width.toDouble(), im.height.toDouble());
-            im.dispose();
-          }
-          _frames++;
-          final el = DateTime.now().difference(_t0).inMilliseconds;
-          if (el > 1000) {
-            fps = (_frames * 1000 / el).round();
-            _frames = 0;
-            _t0 = DateTime.now();
-          }
-          setState(() => img = f);
-          fails = 0;
+        final (w, q) = _wq;
+        final sw = Stopwatch()..start();
+        final f = await widget.pc.frameX(width: w, quality: q, mon: mon, cursor: mode == PcGMode.touch, last: hash);
+        if (!mounted || my != _gen) return;
+        _resp++;
+        final el = DateTime.now().difference(_t0).inMilliseconds;
+        if (el > 1000) {
+          fps = (_resp * 1000 / el).round();
+          _resp = 0;
+          _t0 = DateTime.now();
         }
+        if (f == null) {
+          fails++;
+          await Future.delayed(const Duration(milliseconds: 300));
+        } else {
+          fails = 0;
+          hash = f.hash;
+          if (f.cursor != null && !dragging && DateTime.now().difference(_lastLocal).inMilliseconds > 700) {
+            cur = f.cursor!;
+            curKnown = true;
+          }
+          if (f.bytes != null) {
+            _lat.add(sw.elapsedMilliseconds);
+            if (_lat.length >= 6) {
+              if (quality == 0) level = pcAdaptLevel(level, _lat.reduce((a, c) => a + c) / _lat.length);
+              _lat.clear();
+            }
+            var s = f.img;
+            if (s == Size.zero) {
+              final im = await decodeImageFromList(f.bytes!);
+              s = Size(im.width.toDouble(), im.height.toDouble());
+              im.dispose();
+            }
+            if (!mounted) return;
+            setState(() {
+              img = f.bytes;
+              imgSize = s;
+            });
+          } else {
+            if (mode == PcGMode.mouse && mounted) setState(() {});
+            await Future.delayed(const Duration(milliseconds: 60));
+          }
+        }
+        if (fails >= 5) throw StateError('الكمبيوتر مش بيبعت صور');
       } catch (e) {
         fails++;
         if (e is PcAuthError || fails >= 5) {
@@ -10411,87 +10952,481 @@ class _PcScreenViewState extends State<PcScreenView> {
     }
   }
 
-  void _at(Offset local, Size box, Map<String, dynamic> then) {
-    final p = tapToScreen(local, box, imgSize);
-    if (p == null) return;
-    b.cmd({'t': 'abs', 'x': p.dx, 'y': p.dy});
-    b.cmd(then);
+  // ---------- اللمس
+  int get _now => DateTime.now().millisecondsSinceEpoch;
+
+  void _down(PointerDownEvent e) {
+    g.down(e.pointer, e.localPosition, _now);
+    _lp?.cancel();
+    _lp = Timer(const Duration(milliseconds: 460), () {
+      if (g.longPress(_now)) {
+        HapticFeedback.heavyImpact();
+        _handle();
+      }
+    });
+    _handle();
+  }
+
+  void _move(PointerMoveEvent e) {
+    g.move(e.pointer, e.localPosition, _now);
+    if (g.state != 'pending') _lp?.cancel();
+    _handle();
+  }
+
+  void _up(PointerUpEvent e) {
+    g.up(e.pointer, e.localPosition, _now);
+    _lp?.cancel();
+    _handle();
+  }
+
+  void _cancel(PointerCancelEvent e) {
+    g.cancel(e.pointer);
+    _lp?.cancel();
+    _handle();
+  }
+
+  Rect get _rect => pcImageRect(box, imgSize);
+
+  /// مكان على الشاشة (view) → نسبة على الكمبيوتر
+  Offset? _toPc(Offset v) => tapToScreen(pcViewToChild(v, sc, off), box, imgSize);
+
+  void _abs(Offset p) {
+    b.absMove(p.dx, p.dy, mon);
+  }
+
+  void _moveCursor(Offset d) {
+    cur = pcCursorStep(cur, d, _rect, sc, speed);
+    curKnown = true;
+    _lastLocal = DateTime.now();
+    _abs(cur);
+    final cv = pcChildToView(_rect.topLeft + Offset(cur.dx * _rect.width, cur.dy * _rect.height), sc, off);
+    off = pcFollow(off, sc, box, cv);
+  }
+
+  void _handle() {
+    final ev = g.take();
+    if (ev.isEmpty) return;
+    for (final e in ev) {
+      switch (e.k) {
+        case 'move':
+          _moveCursor(e.p);
+        case 'tap':
+          HapticFeedback.selectionClick();
+          if (mode == PcGMode.touch) {
+            final p = _toPc(e.p);
+            if (p == null) break;
+            cur = p;
+            _abs(p);
+          }
+          b.cmd({'t': 'click', 'b': 'left'});
+        case 'right':
+          HapticFeedback.mediumImpact();
+          if (mode == PcGMode.touch) {
+            final p = _toPc(e.p);
+            if (p == null) break;
+            cur = p;
+            _abs(p);
+          }
+          b.cmd({'t': 'click', 'b': 'right'});
+        case 'down':
+          dragging = true;
+          if (mode == PcGMode.touch) {
+            final p = _toPc(e.p);
+            if (p != null) {
+              cur = p;
+              _abs(p);
+            }
+          }
+          b.cmd({'t': 'down', 'b': 'left'});
+        case 'drag':
+          if (mode == PcGMode.mouse) {
+            _moveCursor(e.p);
+          } else {
+            final p = _toPc(e.p);
+            if (p != null) {
+              cur = p;
+              _lastLocal = DateTime.now();
+              _abs(p);
+            }
+          }
+        case 'up':
+          dragging = false;
+          b.cmd({'t': 'up', 'b': 'left'});
+        case 'scroll':
+          // طبيعي زي الموبايل: الصباع لفوق = الصفحة تطلع لفوق
+          b.scroll(-e.v / 6);
+        case 'zoom':
+          final z = pcZoomAt(sc, off, e.v, e.p, box);
+          sc = z.sc;
+          off = z.off;
+        case 'pan':
+          off = pcClampOff(off + e.p, sc, box);
+      }
+    }
+    setState(() {});
+  }
+
+  // ---------- الكيبورد
+  void key(String k, [List<String> mods = const []]) {
+    HapticFeedback.selectionClick();
+    b.cmd({'t': 'key', 'k': k, 'mods': mods});
+  }
+
+  Future<void> _keyboard() async {
+    final t = TextEditingController();
+    var prev = '';
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (c) => Padding(
+        padding: EdgeInsets.only(bottom: MediaQuery.of(c).viewInsets.bottom, left: 12, right: 12, top: 12),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(
+            controller: t,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'اكتب — بيتكتب على الكمبيوتر على طول (عربي أو إنجليزي)'),
+            onChanged: (v) {
+              final (bs, ins) = pcTypingDiff(prev, v);
+              for (var i = 0; i < bs; i++) {
+                b.cmd({'t': 'key', 'k': 'backspace', 'mods': <String>[]});
+              }
+              if (ins.isNotEmpty) b.cmd({'t': 'text', 's': ins});
+              prev = v;
+            },
+            onSubmitted: (_) {
+              b.cmd({'t': 'key', 'k': 'enter', 'mods': <String>[]});
+              t.clear();
+              prev = '';
+            },
+          ),
+          const SizedBox(height: 6),
+          Directionality(textDirection: TextDirection.ltr, child: Wrap(children: _keys(small: true))),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    t.dispose();
+  }
+
+  List<Widget> _keys({bool small = false}) {
+    Widget k(String label, VoidCallback f) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+          child: ActionChip(
+            visualDensity: VisualDensity.compact,
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            label: Text(label, style: const TextStyle(fontSize: 12)),
+            onPressed: f,
+          ),
+        );
+    return [
+      k('Esc', () => key('esc')),
+      k('Win', () => key('win')),
+      k('Alt+Tab', () => key('tab', ['alt'])),
+      k('Ctrl+C', () => key('c', ['ctrl'])),
+      k('Ctrl+V', () => key('v', ['ctrl'])),
+      k('Ctrl+Z', () => key('z', ['ctrl'])),
+      k('Enter', () => key('enter')),
+      k('⌫', () => key('backspace')),
+      k('←', () => key('left')),
+      k('↑', () => key('up')),
+      k('↓', () => key('down')),
+      k('→', () => key('right')),
+      k('Alt+F4', () => key('f4', ['alt'])),
+      if (!small) k('كليك يمين', () => b.cmd({'t': 'click', 'b': 'right'})),
+    ];
+  }
+
+  void _help() {
+    showDialog(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: const Text('إزاي تتحكم'),
+        content: const SingleChildScrollView(
+          child: Text(
+            'وضع الماوس (زي تاتش باد اللابتوب):\n'
+            '• حرّك صباع = السهم يتحرك\n• دوسة = كليك • دوستين = دبل كليك\n'
+            '• دوسة بصباعين = كليك يمين\n• اسحب بصباعين = سكرول\n'
+            '• ضغطة طويلة وبعدين حرّك = سحب (تحريك شباك / تحديد)\n• قرّب/بعّد صباعين = تكبير، والصورة بتمشي مع السهم\n\n'
+            'وضع اللمس:\n'
+            '• دوسة = كليك مكانها بالظبط\n• صباعين = سكرول أو تكبير\n• صباع واحد = تحريك الصورة لما تبقى مكبّرة\n'
+            '• ضغطة طويلة وحرّك = سحب\n\n'
+            'ملاحظات:\n• Ctrl+Alt+Del مينفعش يتبعت — ويندوز بيمنعه من أي برنامج.\n'
+            '• شبابيك الأدمن (Task Manager، برامج التسطيب) وشاشة القفل ويندوز مش بيسمح بالتحكم فيها — التطبيق هيقولك لو ده حصل.',
+            style: TextStyle(height: 1.7),
+          ),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(d), child: const Text('تمام'))],
+      ),
+    );
+  }
+
+  void _setMode(PcGMode m) {
+    setState(() {
+      mode = m;
+      g.mode = m;
+      hash = ''; // السهم في الصورة بيتغير
+    });
+    Store.p.setString('pc_mode', m == PcGMode.touch ? 'touch' : 'mouse');
+  }
+
+  Future<void> _full() async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => PcScreenFullPage(pc: widget.pc, onErr: widget.onErr)));
   }
 
   @override
   Widget build(BuildContext context) {
-    return Column(children: [
-      Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        child: Row(children: [
+    final top = Padding(
+      padding: EdgeInsets.symmetric(horizontal: widget.full ? 4 : 8),
+      child: Row(children: [
+        IconButton(
+          visualDensity: VisualDensity.compact,
+          icon: Icon(running ? Icons.pause_rounded : Icons.play_arrow_rounded, color: kGold),
+          onPressed: () {
+            setState(() => running = !running);
+            if (running) _loop();
+          },
+        ),
+        Expanded(
+            child: FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: AlignmentDirectional.centerStart,
+          child: SegmentedButton<PcGMode>(
+          showSelectedIcon: false,
+          style: const ButtonStyle(visualDensity: VisualDensity.compact, tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+          segments: const [
+            ButtonSegment(value: PcGMode.mouse, icon: Icon(Icons.mouse_rounded, size: 18), label: Text('ماوس')),
+            ButtonSegment(value: PcGMode.touch, icon: Icon(Icons.touch_app_rounded, size: 18), label: Text('لمس')),
+          ],
+          selected: {mode},
+          onSelectionChanged: (s) => _setMode(s.first),
+        ),
+        )),
+        Text('$fps fps', style: const TextStyle(fontSize: 11, color: kMuted)),
+        PopupMenuButton<String>(
+          icon: const Icon(Icons.tune_rounded, color: kMuted),
+          onSelected: (v) {
+            if (v.startsWith('q')) {
+              setState(() {
+                quality = int.parse(v.substring(1));
+                hash = '';
+              });
+              Store.p.setInt('pc_q2', quality);
+            } else if (v.startsWith('m')) {
+              setState(() {
+                mon = int.parse(v.substring(1));
+                hash = '';
+                curKnown = false;
+                sc = 1;
+                off = Offset.zero;
+              });
+            } else if (v == 'help') {
+              _help();
+            } else if (v.startsWith('s')) {
+              setState(() => speed = double.parse(v.substring(1)));
+              Store.p.setDouble('pc_speed2', speed);
+            }
+          },
+          itemBuilder: (c) => [
+            for (final e in const [(0, 'جودة تلقائية (حسب سرعة الشبكة)'), (35, 'جودة واطية (أسرع)'), (55, 'جودة متوسطة'), (80, 'جودة عالية')])
+              CheckedPopupMenuItem(value: 'q${e.$1}', checked: quality == e.$1, child: Text(e.$2)),
+            const PopupMenuDivider(),
+            for (final e in const [(0.6, 'سرعة السهم: بطيئة'), (1.0, 'سرعة السهم: عادية'), (1.6, 'سرعة السهم: سريعة')])
+              CheckedPopupMenuItem(value: 's${e.$1}', checked: (speed - e.$1).abs() < .01, child: Text(e.$2)),
+            if (mons.length > 1) ...[
+              const PopupMenuDivider(),
+              for (final m in mons)
+                CheckedPopupMenuItem(
+                  value: 'm${m['i']}',
+                  checked: mon == null ? m['primary'] == true : mon == m['i'],
+                  child: Text('شاشة ${m['i']}${m['primary'] == true ? ' (الأساسية)' : ''} • ${m['w']}×${m['h']}'),
+                ),
+            ],
+            const PopupMenuDivider(),
+            const PopupMenuItem(value: 'help', child: Text('إزاي تتحكم؟')),
+          ],
+        ),
+        if (sc > 1.01)
           IconButton(
-            icon: Icon(running ? Icons.pause_rounded : Icons.play_arrow_rounded, color: kGold),
-            onPressed: () {
-              setState(() => running = !running);
-              if (running) _loop();
-            },
+            visualDensity: VisualDensity.compact,
+            tooltip: 'رجّع الحجم',
+            icon: const Icon(Icons.zoom_out_map_rounded, color: kGold),
+            onPressed: () => setState(() {
+              sc = 1;
+              off = Offset.zero;
+            }),
           ),
-          Expanded(
-            child: DropdownButton<int>(
-              isExpanded: true,
-              value: quality <= 40 ? 35 : (quality <= 60 ? 55 : 80),
-              items: const [
-                DropdownMenuItem(value: 35, child: Text('جودة واطية (أسرع)')),
-                DropdownMenuItem(value: 55, child: Text('جودة متوسطة')),
-                DropdownMenuItem(value: 80, child: Text('جودة عالية')),
-              ],
-              onChanged: (v) {
-                setState(() {
-                  quality = v!;
-                  width = v == 35 ? 960 : (v == 55 ? 1280 : 1920);
-                });
-                Store.p.setInt('pc_q', quality);
-                Store.p.setInt('pc_w', width);
-              },
-            ),
-          ),
-          Text('$fps fps', style: const TextStyle(fontSize: 11, color: kMuted)),
-          IconButton(
-            tooltip: control ? 'تحكم (دوس = كليك)' : 'تكبير/تحريك بس',
-            icon: Icon(control ? Icons.touch_app_rounded : Icons.zoom_in_rounded, color: control ? kGold : kMuted),
-            onPressed: () => setState(() => control = !control),
-          ),
-        ]),
-      ),
-      Expanded(
-        child: img == null
-            ? Center(child: running ? const CircularProgressIndicator() : const Text('متوقف', style: TextStyle(color: kMuted)))
-            : LayoutBuilder(
-                builder: (c, cons) {
-                  final box = Size(cons.maxWidth, cons.maxHeight);
-                  return InteractiveViewer(
-                    transformationController: tc,
-                    maxScale: 5,
-                    panEnabled: !control,
-                    child: GestureDetector(
-                      onTapUp: control ? (d) => _at(d.localPosition, box, {'t': 'click', 'b': 'left'}) : null,
-                      onDoubleTapDown: control ? (d) => _at(d.localPosition, box, {'t': 'click', 'b': 'left', 'n': 2}) : null,
-                      onDoubleTap: control ? () {} : null,
-                      onLongPressStart: control ? (d) => _at(d.localPosition, box, {'t': 'click', 'b': 'right'}) : null,
-                      onPanStart: control ? (d) => _at(d.localPosition, box, {'t': 'down', 'b': 'left'}) : null,
-                      onPanUpdate: control
-                          ? (d) {
-                              final p = tapToScreen(d.localPosition, box, imgSize);
-                              if (p != null) b.cmd({'t': 'abs', 'x': p.dx, 'y': p.dy});
-                            }
-                          : null,
-                      onPanEnd: control ? (_) => b.cmd({'t': 'up', 'b': 'left'}) : null,
+        IconButton(
+          visualDensity: VisualDensity.compact,
+          tooltip: widget.full ? 'اخرج من ملء الشاشة' : 'ملء الشاشة بالعرض',
+          icon: Icon(widget.full ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded, color: kGold),
+          onPressed: widget.full ? () => Navigator.maybePop(context) : _full,
+        ),
+      ]),
+    );
+    final view = img == null
+        ? Center(child: running ? const CircularProgressIndicator() : const Text('متوقف — دوس ▶', style: TextStyle(color: kMuted)))
+        : LayoutBuilder(builder: (c, cons) {
+            final nb = Size(cons.maxWidth, cons.maxHeight);
+            if (nb != box) {
+              box = nb;
+              off = pcClampOff(off, sc, box);
+            }
+            final r = _rect;
+            final cv = pcChildToView(r.topLeft + Offset(cur.dx * r.width, cur.dy * r.height), sc, off);
+            return Listener(
+              behavior: HitTestBehavior.opaque,
+              onPointerDown: _down,
+              onPointerMove: _move,
+              onPointerUp: _up,
+              onPointerCancel: _cancel,
+              child: ClipRect(
+                child: Stack(children: [
+                  Positioned.fill(
+                    child: Transform(
+                      transform: Matrix4(sc, 0, 0, 0, 0, sc, 0, 0, 0, 0, 1, 0, off.dx, off.dy, 0, 1),
                       child: SizedBox(width: box.width, height: box.height, child: Image.memory(img!, fit: BoxFit.contain, gaplessPlayback: true)),
                     ),
-                  );
-                },
+                  ),
+                  if (mode == PcGMode.mouse && curKnown)
+                    Positioned(
+                      left: cv.dx,
+                      top: cv.dy,
+                      child: IgnorePointer(child: CustomPaint(size: const Size(22, 30), painter: _PcCursorPainter(dragging))),
+                    ),
+                  if (dragging)
+                    const Positioned(
+                      top: 6,
+                      left: 0,
+                      right: 0,
+                      child: IgnorePointer(
+                        child: Center(
+                          child: Chip(visualDensity: VisualDensity.compact, label: Text('بتسحب… ارفع صباعك علشان تسيب', style: TextStyle(fontSize: 11))),
+                        ),
+                      ),
+                    ),
+                ]),
               ),
-      ),
-      const Padding(
-        padding: EdgeInsets.all(6),
-        child: Text('دوسة = كليك • دوستين = دبل كليك • ضغطة طويلة = كليك يمين • اسحب = سحب • لتكبير الصورة اقفل وضع التحكم', style: TextStyle(fontSize: 11, color: kMuted)),
+            );
+          });
+    final keysBar = SizedBox(
+      height: 40,
+      child: Row(children: [
+        IconButton(
+          visualDensity: VisualDensity.compact,
+          tooltip: 'كيبورد',
+          icon: const Icon(Icons.keyboard_rounded, color: kGold),
+          onPressed: _keyboard,
+        ),
+        Expanded(
+          child: Directionality(
+            textDirection: TextDirection.ltr,
+            child: ListView(scrollDirection: Axis.horizontal, children: _keys()),
+          ),
+        ),
+        if (widget.full)
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.expand_more_rounded, color: kMuted),
+            onPressed: () => setState(() => bar = false),
+          ),
+      ]),
+    );
+    if (widget.full) {
+      return Stack(children: [
+        Positioned.fill(child: view),
+        if (bar)
+          Positioned(top: 0, left: 0, right: 0, child: Container(color: const Color(0xB0101318), child: top)),
+        if (bar)
+          Positioned(bottom: 0, left: 0, right: 0, child: Container(color: const Color(0xB0101318), child: keysBar)),
+        if (!bar)
+          Positioned(
+            right: 6,
+            bottom: 6,
+            child: IconButton.filledTonal(icon: const Icon(Icons.expand_less_rounded), onPressed: () => setState(() => bar = true)),
+          ),
+      ]);
+    }
+    return Column(children: [
+      top,
+      Expanded(child: view),
+      keysBar,
+      Padding(
+        padding: const EdgeInsets.fromLTRB(8, 0, 8, 4),
+        child: Text(
+          mode == PcGMode.mouse
+              ? 'ماوس: حرّك صباع • دوسة = كليك • صباعين دوسة = يمين • صباعين سحب = سكرول • قرصة = تكبير • ضغطة طويلة = سحب'
+              : 'لمس: دوسة = كليك مكانها • صباعين = سكرول/تكبير • صباع = تحريك الصورة المكبّرة • ضغطة طويلة = سحب',
+          style: const TextStyle(fontSize: 10.5, color: kMuted),
+          textAlign: TextAlign.center,
+        ),
       ),
     ]);
+  }
+}
+
+class _PcCursorPainter extends CustomPainter {
+  final bool drag;
+  const _PcCursorPainter(this.drag);
+  @override
+  void paint(Canvas c, Size s) {
+    final p = Path()
+      ..moveTo(0, 0)
+      ..lineTo(0, s.height * .78)
+      ..lineTo(s.width * .3, s.height * .58)
+      ..lineTo(s.width * .52, s.height)
+      ..lineTo(s.width * .68, s.height * .93)
+      ..lineTo(s.width * .46, s.height * .52)
+      ..lineTo(s.width * .8, s.height * .5)
+      ..close();
+    c.drawPath(p, Paint()..color = drag ? kGold : Colors.white);
+    c.drawPath(
+        p,
+        Paint()
+          ..color = Colors.black
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6);
+  }
+
+  @override
+  bool shouldRepaint(_PcCursorPainter o) => o.drag != drag;
+}
+
+/// ملء الشاشة بالعرض
+class PcScreenFullPage extends StatefulWidget {
+  final PcClient pc;
+  final void Function(Object) onErr;
+  const PcScreenFullPage({super.key, required this.pc, required this.onErr});
+  @override
+  State<PcScreenFullPage> createState() => _PcScreenFullPageState();
+}
+
+class _PcScreenFullPageState extends State<PcScreenFullPage> {
+  @override
+  void initState() {
+    super.initState();
+    SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  }
+
+  @override
+  void dispose() {
+    // نرجّع زي ما كان: كل الاتجاهات + الشريط اللي فوق وتحت
+    SystemChrome.setPreferredOrientations(const []);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    super.dispose();
+  }
+
+  void _err(Object e) {
+    if (e is PcAuthError && mounted) Navigator.maybePop(context);
+    widget.onErr(e);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: PcScreenView(pc: widget.pc, onErr: _err, full: true),
+    );
   }
 }
 
@@ -13126,6 +14061,11 @@ class PcExtras extends StatelessWidget {
       ),
     );
     if (m == null) return;
+    if (m > 0 &&
+        context.mounted &&
+        !await confirm(context, 'الكمبيوتر هيطفي بعد $m دقيقة.\n⚠️ وقت الإطفاء ويندوز بيقفل البرامج بالعافية — أي شغل مش محفوظ هيضيع.\n(لو في إطفاء متجدول قبل كده هيتلغي ويتحط ده مكانه)')) {
+      return;
+    }
     if (m == 0) {
       await pc.power('cancel');
       if (context.mounted) toast(context, 'اتلغى الإطفاء');
@@ -13222,7 +14162,13 @@ class _PcProcsPageState extends State<PcProcsPage> {
   }
 
   Future<void> _kill(Map<String, dynamic> p) async {
-    if (!await confirm(context, 'تقفل ${p['name']} (رقم ${p['pid']})؟\nأي شغل مش محفوظ فيه هيضيع.')) return;
+    final warn = p['warn'] == true || '${p['name']}'.toLowerCase() == 'explorer.exe';
+    if (!await confirm(
+        context,
+        'تقفل ${p['name']} (رقم ${p['pid']})؟\nأي شغل مش محفوظ فيه هيضيع.'
+        '${warn ? '\n\n⚠️ ده شريط المهام وسطح المكتب والفولدرات — هيختفوا لحد ما ويندوز يرجّعه لوحده أو تعمل ريستارت.' : ''}')) {
+      return;
+    }
     try {
       await widget.pc.killProc((p['pid'] as num).toInt());
       if (mounted) toast(context, 'اتقفلت ✓');
