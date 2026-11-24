@@ -139,6 +139,22 @@ jobs:
                                       }
                                   }
                               }
+                              "screenStart" -> {
+                                  val si = Intent(this, A2RProjectionActivity::class.java)
+                                      .putExtra("pin", call.argument<String>("pin") ?: "")
+                                      .putExtra("control", call.argument<Boolean>("control") ?: false)
+                                  startActivity(si)
+                                  result.success(true)
+                              }
+                              "screenStop" -> {
+                                  stopService(Intent(this, A2RScreenService::class.java))
+                                  result.success(true)
+                              }
+                              "screenControl" -> {
+                                  A2RScreenState.allowControl = call.argument<Boolean>("on") ?: false
+                                  result.success(true)
+                              }
+                              "screenState" -> result.success(mapOf("running" to A2RScreenState.running, "access" to (A2RAccessService.inst != null)))
                               "pinShortcut" -> result.success(A2RNative.pinShortcut(this, call.argument<String>("id") ?: "", call.argument<String>("label") ?: "", call.argument<String>("data") ?: ""))
                               "initialShare" -> {
                               dartReady = true
@@ -584,6 +600,355 @@ jobs:
               }
           }
           KT_END
+          cat > /tmp/a2rkt/A2RScreen.kt <<'KT_END'
+          package com.a2r.a2r_home
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.app.Activity
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import android.view.accessibility.AccessibilityEvent
+          import java.io.ByteArrayOutputStream
+          import java.io.OutputStream
+          import java.net.InetSocketAddress
+          import java.net.ServerSocket
+          import java.net.Socket
+          import java.net.URLDecoder
+
+          object A2RScreenState {
+              @Volatile var running = false
+              @Volatile var pin = ""
+              @Volatile var allowControl = false
+              @Volatile var jpeg: ByteArray? = null
+              @Volatile var frameNo = 0L
+              @Volatile var resultCode = 0
+              @Volatile var resultData: Intent? = null
+              const val PORT = 25871
+          }
+
+          /** شفافة: بتطلب إذن تسجيل الشاشة وبعدين بتشغّل الخدمة */
+          class A2RProjectionActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  A2RScreenState.pin = intent.getStringExtra("pin") ?: ""
+                  A2RScreenState.allowControl = intent.getBooleanExtra("control", false)
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  try {
+                      startActivityForResult(mpm.createScreenCaptureIntent(), 4712)
+                  } catch (e: Exception) {
+                      finish()
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 4712 && resultCode == RESULT_OK && data != null) {
+                      A2RScreenState.resultCode = resultCode
+                      A2RScreenState.resultData = data
+                      val i = Intent(this, A2RScreenService::class.java)
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+                  }
+                  finish()
+              }
+          }
+
+          class A2RScreenService : Service() {
+              private var proj: MediaProjection? = null
+              private var vd: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private var server: ServerSocket? = null
+              private var ht: HandlerThread? = null
+              private var lastAt = 0L
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val data = A2RScreenState.resultData
+                  if (data == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  val nb: Notification.Builder
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(NotificationChannel("a2r_screen", "A2R screen share", NotificationManager.IMPORTANCE_LOW))
+                      nb = Notification.Builder(this, "a2r_screen")
+                  } else {
+                      nb = Notification.Builder(this)
+                  }
+                  nb.setContentTitle("A2R Home: مشاركة الشاشة شغالة")
+                  nb.setContentText("اقفلها من التطبيق")
+                  nb.setSmallIcon(android.R.drawable.ic_menu_share)
+                  nb.setOngoing(true)
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          startForeground(4712, nb.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                      } else {
+                          startForeground(4712, nb.build())
+                      }
+                  } catch (e: Exception) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  try {
+                      val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      val p = mpm.getMediaProjection(A2RScreenState.resultCode, data)
+                      A2RScreenState.resultData = null
+                      val t = HandlerThread("a2r-screen")
+                      t.start()
+                      ht = t
+                      val h = Handler(t.looper)
+                      p.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() {
+                              stopSelf()
+                          }
+                      }, h)
+                      proj = p
+                      val dm = resources.displayMetrics
+                      val w = 720
+                      var hh = dm.heightPixels * w / dm.widthPixels
+                      if (hh % 2 == 1) hh++
+                      val r = ImageReader.newInstance(w, hh, PixelFormat.RGBA_8888, 2)
+                      reader = r
+                      vd = p.createVirtualDisplay("a2r", w, hh, dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, h)
+                      r.setOnImageAvailableListener({ rd -> grab(rd, w, hh) }, h)
+                      A2RScreenState.running = true
+                      startServer()
+                  } catch (e: Exception) {
+                      stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun grab(rd: ImageReader, w: Int, h: Int) {
+                  val img = rd.acquireLatestImage() ?: return
+                  try {
+                      val now = System.currentTimeMillis()
+                      if (now - lastAt < 120) return
+                      lastAt = now
+                      val pl = img.planes[0]
+                      val rowPad = pl.rowStride - pl.pixelStride * w
+                      val bmp = Bitmap.createBitmap(w + rowPad / pl.pixelStride, h, Bitmap.Config.ARGB_8888)
+                      bmp.copyPixelsFromBuffer(pl.buffer)
+                      val crop = if (rowPad == 0) bmp else Bitmap.createBitmap(bmp, 0, 0, w, h)
+                      val out = ByteArrayOutputStream()
+                      crop.compress(Bitmap.CompressFormat.JPEG, 55, out)
+                      A2RScreenState.jpeg = out.toByteArray()
+                      A2RScreenState.frameNo = A2RScreenState.frameNo + 1
+                  } catch (e: Exception) {
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              private fun startServer() {
+                  Thread {
+                      try {
+                          val ss = ServerSocket()
+                          ss.reuseAddress = true
+                          ss.bind(InetSocketAddress(A2RScreenState.PORT))
+                          server = ss
+                          while (!ss.isClosed) {
+                              val s = ss.accept()
+                              Thread { handle(s) }.start()
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }.start()
+              }
+
+              private fun reply(out: OutputStream, code: Int, type: String, body: ByteArray) {
+                  val head = "HTTP/1.1 " + code + " X\r\nContent-Type: " + type + "\r\nContent-Length: " + body.size + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                  out.write(head.toByteArray())
+                  out.write(body)
+                  out.flush()
+              }
+
+              private fun handle(s: Socket) {
+                  try {
+                      s.soTimeout = 15000
+                      val inp = s.getInputStream().bufferedReader(Charsets.ISO_8859_1)
+                      val line = inp.readLine() ?: return
+                      while (true) {
+                          val l = inp.readLine() ?: break
+                          if (l.isEmpty()) break
+                      }
+                      val parts = line.split(" ")
+                      if (parts.size < 2) return
+                      val target = parts[1]
+                      val path = target.substringBefore("?")
+                      val q = HashMap<String, String>()
+                      for (kv in target.substringAfter("?", "").split("&")) {
+                          val k = kv.substringBefore("=")
+                          if (k.isNotEmpty()) q[k] = URLDecoder.decode(kv.substringAfter("=", ""), "UTF-8")
+                      }
+                      val out = s.getOutputStream()
+                      val pin = A2RScreenState.pin
+                      if (pin.isEmpty() || q["k"] != pin) {
+                          reply(out, 403, "text/plain", "forbidden".toByteArray())
+                          return
+                      }
+                      when (path) {
+                          "/" -> reply(out, 200, "text/html; charset=utf-8", page().toByteArray())
+                          "/shot" -> {
+                              val j = A2RScreenState.jpeg
+                              if (j == null) reply(out, 503, "text/plain", "no frame".toByteArray()) else reply(out, 200, "image/jpeg", j)
+                          }
+                          "/stream" -> stream(s, out)
+                          "/tap", "/swipe", "/key" -> control(out, path, q)
+                          else -> reply(out, 404, "text/plain", "not found".toByteArray())
+                      }
+                  } catch (e: Exception) {
+                  } finally {
+                      try {
+                          s.close()
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun stream(s: Socket, out: OutputStream) {
+                  s.soTimeout = 0
+                  out.write("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=a2rframe\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n".toByteArray())
+                  var seen = -1L
+                  var sentAt = 0L
+                  while (A2RScreenState.running && !s.isClosed) {
+                      val j = A2RScreenState.jpeg
+                      val no = A2RScreenState.frameNo
+                      val now = System.currentTimeMillis()
+                      if (j != null && (no != seen || now - sentAt > 1500)) {
+                          seen = no
+                          sentAt = now
+                          out.write(("--a2rframe\r\nContent-Type: image/jpeg\r\nContent-Length: " + j.size + "\r\n\r\n").toByteArray())
+                          out.write(j)
+                          out.write("\r\n".toByteArray())
+                          out.flush()
+                      } else {
+                          Thread.sleep(40)
+                      }
+                  }
+              }
+
+              private fun control(out: OutputStream, path: String, q: HashMap<String, String>) {
+                  if (!A2RScreenState.allowControl) {
+                      reply(out, 403, "text/plain", "control off".toByteArray())
+                      return
+                  }
+                  val svc = A2RAccessService.inst
+                  if (svc == null) {
+                      reply(out, 409, "text/plain", "accessibility off".toByteArray())
+                      return
+                  }
+                  val dm = resources.displayMetrics
+                  val sw = dm.widthPixels.toFloat()
+                  val sh = dm.heightPixels.toFloat()
+                  fun f(k: String): Float {
+                      val v = (q[k] ?: "0").toFloatOrNull() ?: 0f
+                      return if (v < 0f) 0f else if (v > 1f) 1f else v
+                  }
+                  if (path == "/tap") {
+                      svc.gesture(f("x") * sw, f("y") * sh, f("x") * sw, f("y") * sh, 50L)
+                  } else if (path == "/swipe") {
+                      var ms = (q["ms"] ?: "300").toLongOrNull() ?: 300L
+                      if (ms < 100L) ms = 100L
+                      if (ms > 1500L) ms = 1500L
+                      svc.gesture(f("x1") * sw, f("y1") * sh, f("x2") * sw, f("y2") * sh, ms)
+                  } else {
+                      svc.key(q["n"] ?: "")
+                  }
+                  reply(out, 200, "text/plain", "ok".toByteArray())
+              }
+
+              private fun page(): String {
+                  val html = """<!doctype html><html dir="rtl"><head><meta charset="utf-8"><title>A2R شاشة الموبايل</title>
+          <style>body{margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center}img{max-height:90vh;max-width:98vw;cursor:crosshair;user-select:none;-webkit-user-drag:none}button{margin:6px;padding:8px 14px;font-size:15px}</style></head><body>
+          <div><button onclick="k('back')">رجوع</button><button onclick="k('home')">الرئيسية</button><button onclick="k('recents')">التطبيقات</button><button onclick="k('notifications')">الإشعارات</button><span id="m"></span></div>
+          <img id="s" src="/stream?k=PINX">
+          <script>
+          var K='PINX';var img=document.getElementById('s');var d=null;
+          function say(t){document.getElementById('m').textContent=t}
+          function call(u){fetch(u).then(function(r){if(r.status==403)say('التحكم مقفول من التطبيق');else if(r.status==409)say('فعّل خدمة إمكانية الوصول على الموبايل');else say('')})}
+          function pos(e){var r=img.getBoundingClientRect();return [(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]}
+          img.onmousedown=function(e){e.preventDefault();d=[pos(e),Date.now()]};
+          img.onmouseup=function(e){if(!d)return;var a=d[0],b=pos(e),ms=Date.now()-d[1];d=null;
+          if(Math.abs(a[0]-b[0])+Math.abs(a[1]-b[1])<0.02)call('/tap?k='+K+'&x='+a[0]+'&y='+a[1]);
+          else call('/swipe?k='+K+'&x1='+a[0]+'&y1='+a[1]+'&x2='+b[0]+'&y2='+b[1]+'&ms='+Math.max(100,Math.min(1500,ms)))};
+          function k(n){call('/key?k='+K+'&n='+n)}
+          </script></body></html>"""
+                  return html.replace("PINX", A2RScreenState.pin)
+              }
+
+              override fun onDestroy() {
+                  A2RScreenState.running = false
+                  A2RScreenState.jpeg = null
+                  try { server?.close() } catch (e: Exception) {}
+                  try { vd?.release() } catch (e: Exception) {}
+                  try { reader?.close() } catch (e: Exception) {}
+                  try { proj?.stop() } catch (e: Exception) {}
+                  try { ht?.quitSafely() } catch (e: Exception) {}
+                  super.onDestroy()
+              }
+          }
+
+          /** التحكم من الكمبيوتر: لمسات وسحب وأزرار النظام (لازم المستخدم يفعّلها من إمكانية الوصول) */
+          class A2RAccessService : AccessibilityService() {
+              companion object {
+                  @Volatile var inst: A2RAccessService? = null
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  inst = this
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  inst = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, ms: Long) {
+                  val p = Path()
+                  p.moveTo(x1, y1)
+                  if (x1 != x2 || y1 != y2) p.lineTo(x2, y2) else p.lineTo(x1 + 0.1f, y1)
+                  val g = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0L, ms)).build()
+                  dispatchGesture(g, null, null)
+              }
+
+              fun key(n: String) {
+                  when (n) {
+                      "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
+                      "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+                      "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
+                      "notifications" -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+                      else -> false
+                  }
+              }
+          }
+          KT_END
           python3 - <<'PY'
           import glob, os, re
           p = 'android/app/src/main/AndroidManifest.xml'
@@ -592,7 +957,7 @@ jobs:
           perms = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % x for x in [
               'INTERNET', 'ACCESS_NETWORK_STATE', 'ACCESS_WIFI_STATE', 'CHANGE_WIFI_MULTICAST_STATE',
               'POST_NOTIFICATIONS', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION', 'WAKE_LOCK',
-              'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM'])
+              'RECEIVE_BOOT_COMPLETED', 'USE_EXACT_ALARM', 'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MEDIA_PROJECTION'])
           # منبه دقيق لمواعيد الحظر: أندرويد 12 بيطلب SCHEDULE_EXACT_ALARM، و13+ بيكفيه USE_EXACT_ALARM
           perms += '    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32"/>\n'
           s = s.replace('<application', perms + '    <application android:usesCleartextTraffic="true"', 1)
@@ -615,11 +980,33 @@ jobs:
           i = s.find('</activity>')
           assert i > 0 and '.MainActivity' in s[:i]
           s = s[:i] + share + '        ' + s[i:]
-          s = s.replace('</application>', receivers + '    </application>', 1)
+          screen = (
+              '        <service android:name="%s.A2RScreenService" android:exported="false" android:foregroundServiceType="mediaProjection"/>\n'
+              '        <activity android:name="%s.A2RProjectionActivity" android:exported="false" android:theme="@android:style/Theme.Translucent.NoTitleBar"/>\n'
+              '        <service android:name="%s.A2RAccessService" android:exported="true" android:label="A2R Home" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">\n'
+              '            <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>\n'
+              '            <meta-data android:name="android.accessibilityservice" android:resource="@xml/a2r_access"/>\n'
+              '        </service>\n' % (pkg, pkg, pkg))
+          s = s.replace('</application>', receivers + screen + '    </application>', 1)
+          resdir = os.path.join(os.path.dirname(p), 'res')
+          os.makedirs(os.path.join(resdir, 'xml'), exist_ok=True)
+          os.makedirs(os.path.join(resdir, 'values'), exist_ok=True)
+          open(os.path.join(resdir, 'xml', 'a2r_access.xml'), 'w', encoding='utf-8').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n'
+              '<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"\n'
+              '    android:accessibilityEventTypes="typeWindowStateChanged"\n'
+              '    android:accessibilityFeedbackType="feedbackGeneric"\n'
+              '    android:canPerformGestures="true"\n'
+              '    android:description="@string/a2r_access_desc"\n'
+              '    android:notificationTimeout="200"/>\n')
+          open(os.path.join(resdir, 'values', 'a2r_strings.xml'), 'w', encoding='utf-8').write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+              '    <string name="a2r_access_desc">Lets A2R Home tap and swipe on this phone when you control it from your PC.</string>\n'
+              '</resources>\n')
           open(p, 'w', encoding='utf-8').write(s)
           print(s)
 
-          for name in ('MainActivity.kt', 'A2RNative.kt'):
+          for name in ('MainActivity.kt', 'A2RNative.kt', 'A2RScreen.kt'):
               code = open('/tmp/a2rkt/' + name, encoding='utf-8').read()
               code = re.sub(r'(?m)^package\s+[\w.]+', 'package ' + pkg, code, count=1)
               open(os.path.join(os.path.dirname(mp), name), 'w', encoding='utf-8').write(code)
