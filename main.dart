@@ -1098,8 +1098,16 @@ class _SmsPageState extends State<SmsPage> {
 class QueueItem {
   final String title, url;
   final String? subtitle;
-  QueueItem(this.title, this.url, {this.subtitle});
+  final File? file; // لو من الموبايل
+  final Map<String, String> headers; // Referer/User-Agent (للنت)
+  bool viaPhone; // يعدّي على سيرفر الموبايل (proxy)
+  QueueItem(this.title, this.url, {this.subtitle, this.file, this.headers = const {}, this.viaPhone = false});
 }
+
+/// طريقة العرض على الشاشة
+enum CastWay { dlna, gm }
+
+const String kChromeUa = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36';
 
 class CastState extends ChangeNotifier {
   CastState._();
@@ -1111,22 +1119,52 @@ class CastState extends ChangeNotifier {
   int playing = -1;
   Duration pos = Duration.zero, dur = Duration.zero;
   String state = '';
+  String note = ''; // آخر حاجة حصلت (بالعربي)
   int volume = 30;
   bool searching = false;
+  bool busy = false;
+  CastWay way = CastWay.dlna;
+  int _gmMedia = 0;
+  String _gmUrl = '';
+  int _seq = 0;
+
+  /// الريسيفر متوصّل في تبويب الريسيفر؟
+  GmClient? get gm {
+    final g = GmClient.active;
+    return (g != null && g.connected) ? g : null;
+  }
+
+  bool get gmPossible => gm != null && (current == null || current!.ip == gm!.host);
 
   Future<void> discover() async {
     searching = true;
     notifyListeners();
-    devices = await discoverRenderers();
+    final extra = <String>{
+      if (Store.castLocation != null) Store.castLocation!,
+      // الـQmax بيعلن الـDLNA على 49152 — بنجربه مباشرة لو الـSSDP اتأخر
+      if (Store.receiverIp != null) 'http://${Store.receiverIp}:49152/description.xml',
+    };
+    devices = await discoverRenderers(extra: extra.toList());
     if (current != null && !devices.any((d) => d.avTransport == current!.avTransport)) devices.insert(0, current!);
-    if (current == null && devices.length == 1) current = devices.first;
+    if (current == null && devices.isNotEmpty) {
+      // الافتراضي: الريسيفر، وبعده آخر شاشة اتستخدمت
+      current = devices.firstWhere((d) => d.isReceiver,
+          orElse: () => devices.firstWhere((d) => d.location == Store.castLocation, orElse: () => devices.first));
+      _loadVolume();
+    }
+    if (devices.isEmpty && gm != null) way = CastWay.gm;
     searching = false;
     notifyListeners();
   }
 
   void select(DlnaDevice? d) {
     current = d;
+    if (d != null) Store.castLocation = d.location;
     notifyListeners();
+    _loadVolume();
+  }
+
+  void _loadVolume() {
     client?.getVolume().then((v) {
       if (v != null) {
         volume = v;
@@ -1135,13 +1173,113 @@ class CastState extends ChangeNotifier {
     }).catchError((_) {});
   }
 
-  Future<void> playIndex(int i) async {
-    final c = client;
-    if (c == null) throw StateError('اختار شاشة الأول');
-    if (i < 0 || i >= queue.length) return;
-    playing = i;
+  void setWay(CastWay w) {
+    way = w;
     notifyListeners();
-    await c.load(queue[i].url, queue[i].title, subtitle: queue[i].subtitle);
+  }
+
+  void _note(String s) {
+    note = s;
+    AppLog.add('CAST', s);
+    notifyListeners();
+  }
+
+  String? _targetIp() => way == CastWay.gm ? gm?.host : current?.ip;
+
+  /// الرابط اللي الشاشة هتفتحه (مباشر أو عبر الموبايل)
+  Future<String> _urlFor(QueueItem q) async {
+    final ip = await phoneIpFor(_targetIp());
+    if (q.file != null) {
+      if (ip == null) throw StateError('الموبايل لازم يكون على نفس الواي فاي بتاع الشاشة');
+      return MediaServer.I.share(q.file!, ip);
+    }
+    if (q.viaPhone) {
+      if (ip == null) throw StateError('الموبايل لازم يكون على نفس الواي فاي بتاع الشاشة');
+      return MediaServer.I.proxy(q.url, {'User-Agent': kChromeUa, ...q.headers}, ip, mime: await probeMime(q.url, q.headers));
+    }
+    return q.url;
+  }
+
+  Future<void> playIndex(int i) async {
+    if (i < 0 || i >= queue.length) return;
+    if (way == CastWay.dlna && client == null) {
+      if (gm != null) {
+        way = CastWay.gm;
+      } else {
+        throw StateError('اختار الشاشة الأول (أو اتصل بالريسيفر من تبويب الريسيفر)');
+      }
+    }
+    if (way == CastWay.gm && gm == null) throw StateError('الريسيفر مش متصل — افتح تبويب الريسيفر واتصل الأول');
+    final my = ++_seq;
+    playing = i;
+    pos = dur = Duration.zero;
+    state = '';
+    busy = true;
+    notifyListeners();
+    final q = queue[i];
+    try {
+      final mime = q.file != null ? mimeOf(q.file!.path) : await probeMime(q.url, q.headers);
+      final url = await _urlFor(q);
+      _note('بشغّل "${q.title}" ${way == CastWay.gm ? 'بطريقة G-MScreen' : 'على ${current!.name}'}${q.viaPhone ? ' عبر الموبايل' : ''}…');
+      if (way == CastWay.gm) {
+        _gmMedia = gmMediaTypeFor(mime);
+        _gmUrl = url;
+        await gm!.castSend(_gmMedia, 0, url);
+      } else {
+        await client!.load(url, q.title, subtitle: q.subtitle, mime: mime);
+      }
+      _note('اتبعت للشاشة — مستني يبدأ…');
+      _watchStart(my, i);
+    } catch (e) {
+      AppLog.add('CAST', 'play ✗ $e');
+      // زي Web Video Caster: لو الرابط المباشر اترفض نجرب عبر الموبايل
+      if (q.file == null && !q.viaPhone && q.url.startsWith('http') && my == _seq) {
+        _note('الشاشة رفضت الرابط المباشر — بجرب عبر الموبايل…');
+        q.viaPhone = true;
+        busy = false;
+        return playIndex(i);
+      }
+      // ولو الـDLNA فشل خالص والريسيفر متوصّل نجرب طريقة G-MScreen
+      if (way == CastWay.dlna && gmPossible && my == _seq) {
+        _note('الـDLNA فشل — بجرب طريقة G-MScreen…');
+        way = CastWay.gm;
+        busy = false;
+        return playIndex(i);
+      }
+      _note('مقدرتش أشغّل: ${castErrorAr(e)}');
+      rethrow;
+    } finally {
+      if (my == _seq) {
+        busy = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// لو الشاشة مبدأتش خلال 12 ثانية والرابط مباشر → نعيده عبر الموبايل
+  void _watchStart(int my, int i) {
+    Future(() async {
+      for (var k = 0; k < 6; k++) {
+        await Future.delayed(const Duration(seconds: 2));
+        if (my != _seq) return;
+        await poll();
+        if (state == 'PLAYING' || state == 'PAUSED_PLAYBACK' || pos > Duration.zero) {
+          _note('شغال ✓');
+          return;
+        }
+      }
+      if (my != _seq || i >= queue.length) return;
+      final q = queue[i];
+      if (q.file == null && !q.viaPhone && q.url.startsWith('http')) {
+        _note('الشاشة مبدأتش — بعيد المحاولة عبر الموبايل…');
+        q.viaPhone = true;
+        try {
+          await playIndex(i);
+        } catch (_) {}
+      } else {
+        _note('الشاشة لسه مبدأتش ($state). لو مفيش صورة: جرّب الطريقة التانية أو ابعت السجل');
+      }
+    });
   }
 
   Future<void> add(QueueItem q, {bool playNow = true}) async {
@@ -1150,10 +1288,52 @@ class CastState extends ChangeNotifier {
     if (playNow) await playIndex(queue.length - 1);
   }
 
+  // ---- أزرار التحكم (نفس الأزرار للطريقتين) ----
+  Future<void> play() async => way == CastWay.gm ? gm?.castSend(_gmMedia, 1, _gmUrl) : client?.play();
+  Future<void> pause() async => way == CastWay.gm ? gm?.castSend(_gmMedia, 2, _gmUrl) : client?.pause();
+  Future<void> stop() async {
+    _seq++;
+    if (way == CastWay.gm) {
+      await gm?.castSend(_gmMedia, 3, _gmUrl);
+    } else {
+      await client?.stop();
+    }
+    state = 'STOPPED';
+    notifyListeners();
+  }
+
+  Future<void> seek(Duration d) async {
+    if (d < Duration.zero) d = Duration.zero;
+    if (way == CastWay.gm) {
+      if (_gmMedia == 1) return; // الصور مفيهاش تقديم
+      await gm?.castSend(_gmMedia, 4, _gmUrl, seekMs: d.inMilliseconds);
+    } else {
+      await client?.seek(d);
+    }
+  }
+
+  Future<void> setVolume(int v) async {
+    if (way == CastWay.dlna) await client?.setVolume(v);
+  }
+
   Future<void> poll() async {
-    final c = client;
-    if (c == null || playing < 0) return;
+    if (playing < 0) return;
     try {
+      if (way == CastWay.gm) {
+        final g = gm;
+        if (g == null) return;
+        final s = await g.castInfo();
+        if (s == null) return;
+        final ended = state == 'PLAYING' && (s.state == 2 || s.mediaType == -1) && dur.inSeconds > 0 && (dur - pos).inSeconds < 8;
+        pos = Duration(milliseconds: s.currentMs);
+        dur = Duration(milliseconds: s.totalMs);
+        state = s.mediaType == -1 ? 'NO_MEDIA_PRESENT' : s.stateName;
+        notifyListeners();
+        if (ended && playing + 1 < queue.length) await playIndex(playing + 1);
+        return;
+      }
+      final c = client;
+      if (c == null) return;
       final s = await c.status();
       final ended = state == 'PLAYING' && s.state == 'STOPPED' && dur.inSeconds > 0 && (dur - pos).inSeconds < 8;
       pos = s.pos;
@@ -1165,6 +1345,21 @@ class CastState extends ChangeNotifier {
   }
 }
 
+/// رسالة عربي واضحة لأي خطأ في الكاست
+String castErrorAr(Object e) {
+  if (e is SoapFault) return e.toString();
+  if (e is TimeoutException) return 'الشاشة مردتش (اتأكد إنها شغالة وعلى نفس الواي فاي)';
+  if (e is SocketException) {
+    final m = e.message.isNotEmpty ? e.message : '${e.osError?.message ?? ''}';
+    if (m.contains('refused')) return 'الشاشة رفضت الاتصال — يمكن الـDLNA مقفول فيها';
+    if (m.contains('unreachable') || m.contains('No route')) return 'مش قادر أوصل للشاشة — الموبايل والشاشة لازم على نفس الواي فاي';
+    return m.isEmpty ? 'مشكلة في الشبكة' : m;
+  }
+  if (e is StateError) return e.message;
+  if (e is HttpException) return e.message;
+  return '$e';
+}
+
 class CastPage extends StatefulWidget {
   const CastPage({super.key});
   @override
@@ -1174,6 +1369,7 @@ class CastPage extends StatefulWidget {
 class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin {
   final cs = CastState.I;
   Timer? t;
+  bool _polling = false;
   @override
   bool get wantKeepAlive => true;
 
@@ -1181,7 +1377,15 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
   void initState() {
     super.initState();
     cs.discover();
-    t = Timer.periodic(const Duration(seconds: 2), (_) => cs.poll());
+    t = Timer.periodic(const Duration(seconds: 2), (_) async {
+      if (_polling || cs.busy) return;
+      _polling = true;
+      try {
+        await cs.poll();
+      } finally {
+        _polling = false;
+      }
+    });
   }
 
   @override
@@ -1194,15 +1398,15 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
     try {
       await f();
     } catch (e) {
-      if (mounted) toast(context, 'خطأ: $e');
+      if (mounted) toast(context, 'خطأ: ${castErrorAr(e)}');
     }
   }
 
   Future<void> pickLocal() async {
     final r = await FilePicker.pickFiles(type: FileType.media);
     if (r.isEmpty) return;
-    final net = await readPhoneNet();
-    if (net.ip == null) {
+    final ip = await phoneIpFor(cs.current?.ip ?? cs.gm?.host);
+    if (ip == null) {
       if (mounted) toast(context, 'الموبايل لازم يكون على نفس الواي فاي');
       return;
     }
@@ -1210,15 +1414,14 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
     if (r.length == 1 && mimeOf(r.first.name).startsWith('video') && mounted && await confirm(context, 'تضيف ملف ترجمة (srt)؟')) {
       final s = await FilePicker.pickFile(type: FileType.any);
       final p = s == null ? null : await pickedToFile(s);
-      if (p != null) sub = await MediaServer.I.share(p, net.ip!);
+      if (p != null) sub = await MediaServer.I.share(p, ip);
     }
     if (mounted) toast(context, 'بجهّز الملفات…');
     var first = true;
     for (final f in r) {
       final file = await pickedToFile(f);
       if (file == null) continue;
-      final url = await MediaServer.I.share(file, net.ip!);
-      await _run(() => cs.add(QueueItem(f.name, url, subtitle: sub), playNow: first));
+      await _run(() => cs.add(QueueItem(f.name, file.path, subtitle: sub, file: file), playNow: first));
       first = false;
     }
   }
@@ -1226,7 +1429,29 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
   Future<void> addLink() async {
     final u = await askText(context, 'رابط فيديو مباشر', hint: 'https://…mp4 أو m3u8', type: TextInputType.url);
     if (u == null || u.trim().isEmpty) return;
-    await _run(() => cs.add(QueueItem(Uri.parse(u.trim()).pathSegments.lastOrNull ?? u, u.trim())));
+    var s = u.trim();
+    if (!s.contains('://')) s = 'http://$s';
+    await _run(() => cs.add(QueueItem(Uri.tryParse(s)?.pathSegments.where((x) => x.isNotEmpty).lastOrNull ?? s, s)));
+  }
+
+  Future<void> manualRenderer() async {
+    final ip = await askText(context, 'عنوان الشاشة / الريسيفر', hint: Store.receiverIp ?? '192.168.1.50', type: TextInputType.url);
+    if (ip == null || ip.trim().isEmpty) return;
+    final t = ip.trim();
+    final locs = t.startsWith('http') ? [t] : ['http://$t:49152/description.xml', 'http://$t:1400/xml/device_description.xml', 'http://$t:8080/description.xml'];
+    if (mounted) toast(context, 'بجرب $t…');
+    for (final l in locs) {
+      final d = await fetchRenderer(l);
+      if (d != null) {
+        cs.devices.removeWhere((x) => x.avTransport == d.avTransport);
+        cs.devices.insert(0, d);
+        cs.select(d);
+        cs.setWay(CastWay.dlna);
+        if (mounted) toast(context, 'لقيت ${d.name}');
+        return;
+      }
+    }
+    if (mounted) toast(context, 'ملقتش DLNA على $t');
   }
 
   @override
@@ -1238,30 +1463,68 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
         Card(
           child: Padding(
             padding: const EdgeInsets.all(10),
-            child: Row(children: [
-              const Icon(Icons.tv, color: kGold),
-              const SizedBox(width: 8),
-              Expanded(
-                child: DropdownButton<String>(
-                  isExpanded: true,
-                  value: cs.current?.avTransport,
-                  hint: Text(cs.searching ? 'بدوّر على الشاشات…' : (cs.devices.isEmpty ? 'ملقتش شاشات DLNA' : 'اختار الشاشة')),
-                  items: [
-                    for (final d in cs.devices)
-                      DropdownMenuItem(value: d.avTransport, child: Text('${d.name}  (${d.ip})', overflow: TextOverflow.ellipsis)),
-                  ],
-                  onChanged: (v) => cs.select(cs.devices.firstWhere((d) => d.avTransport == v)),
+            child: Column(children: [
+              Row(children: [
+                const Icon(Icons.tv, color: kGold),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: DropdownButton<String>(
+                    isExpanded: true,
+                    value: cs.devices.any((d) => d.avTransport == cs.current?.avTransport) ? cs.current?.avTransport : null,
+                    hint: Text(cs.searching ? 'بدوّر على الشاشات…' : (cs.devices.isEmpty ? 'ملقتش شاشات DLNA' : 'اختار الشاشة')),
+                    items: [
+                      for (final d in cs.devices)
+                        DropdownMenuItem(
+                            value: d.avTransport,
+                            child: Text('${d.isReceiver ? 'الريسيفر — ' : ''}${d.name}  (${d.ip})', overflow: TextOverflow.ellipsis)),
+                    ],
+                    onChanged: (v) => cs.select(cs.devices.firstWhere((d) => d.avTransport == v)),
+                  ),
                 ),
-              ),
-              IconButton(onPressed: cs.searching ? null : cs.discover, icon: const Icon(Icons.refresh)),
+                IconButton(onPressed: cs.searching ? null : cs.discover, icon: const Icon(Icons.refresh), tooltip: 'دوّر تاني'),
+                IconButton(onPressed: manualRenderer, icon: const Icon(Icons.edit_location_alt_outlined), tooltip: 'اكتب العنوان'),
+              ]),
+              Row(children: [
+                const Text('الطريقة:', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: SegmentedButton<CastWay>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment(value: CastWay.dlna, label: Text('DLNA', style: TextStyle(fontSize: 12))),
+                      ButtonSegment(value: CastWay.gm, label: Text('G-MScreen', style: TextStyle(fontSize: 12))),
+                    ],
+                    selected: {cs.way},
+                    onSelectionChanged: (s) {
+                      if (s.first == CastWay.gm && cs.gm == null) {
+                        toast(context, 'اتصل بالريسيفر من تبويب الريسيفر الأول');
+                        return;
+                      }
+                      cs.setWay(s.first);
+                    },
+                  ),
+                ),
+              ]),
             ]),
           ),
         ),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 12),
-          child: Text('الشاشات السمارت (سامسونج/LG/سوني/أندرويد TV) لازم يكون فيها DLNA شغال. Chromecast مش مدعوم في النسخة دي.',
-              style: TextStyle(fontSize: 12, color: Colors.white60)),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Text(
+              cs.way == CastWay.gm
+                  ? 'طريقة G-MScreen بتبعت الرابط للريسيفر على نفس اتصال الريموت (أمر 1063). لو مشتغلتش ارجع لـ DLNA.'
+                  : 'DLNA زي Web Video Caster. الريسيفر بيظهر أول واحد لو متوصّل قبل كده. Chromecast مش مدعوم.',
+              style: const TextStyle(fontSize: 12, color: Colors.white60)),
         ),
+        if (cs.note.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+            child: Row(children: [
+              if (cs.busy) const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+              if (cs.busy) const SizedBox(width: 8),
+              Expanded(child: Text(cs.note, style: const TextStyle(fontSize: 12, color: kGold))),
+            ]),
+          ),
         Padding(
           padding: const EdgeInsets.all(10),
           child: Wrap(spacing: 8, runSpacing: 8, children: [
@@ -1279,7 +1542,7 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
             FilledButton.tonalIcon(icon: const Icon(Icons.link), label: const Text('رابط'), onPressed: addLink),
           ]),
         ),
-        if (cs.playing >= 0) _remote(),
+        if (cs.playing >= 0 && cs.playing < cs.queue.length) _remote(),
         Padding(
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
           child: Row(children: [
@@ -1316,8 +1579,17 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
                 key: ValueKey('${cs.queue[i].url}#$i'),
                 leading: Icon(i == cs.playing ? Icons.play_arrow : Icons.movie_outlined, color: i == cs.playing ? kGold : null),
                 title: Text(cs.queue[i].title, maxLines: 1, overflow: TextOverflow.ellipsis),
-                subtitle: Text(cs.queue[i].url, maxLines: 1, overflow: TextOverflow.ellipsis, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 11)),
+                subtitle: Text('${cs.queue[i].viaPhone ? '[عبر الموبايل] ' : ''}${cs.queue[i].url}',
+                    maxLines: 1, overflow: TextOverflow.ellipsis, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 11)),
                 onTap: () => _run(() => cs.playIndex(i)),
+                onLongPress: cs.queue[i].file != null
+                    ? null
+                    : () {
+                        final q = cs.queue[i];
+                        q.viaPhone = !q.viaPhone;
+                        toast(context, q.viaPhone ? 'هيتشغل عبر الموبايل (للروابط اللي محتاجة دخول/هيدرز)' : 'هيتشغل الرابط مباشرة');
+                        setState(() {});
+                      },
                 trailing: IconButton(
                   icon: const Icon(Icons.close),
                   onPressed: () {
@@ -1330,20 +1602,24 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
               ),
           ],
         ),
+        if (cs.queue.isNotEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 12),
+            child: Text('ضغطة طويلة على رابط = تشغيله عبر الموبايل أو مباشرة', style: TextStyle(fontSize: 11, color: Colors.white38)),
+          ),
         const SizedBox(height: 60),
       ]),
     );
   }
 
   Widget _remote() {
-    final c = cs.client;
     final max = cs.dur.inSeconds.toDouble();
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(10),
         child: Column(children: [
           Text(cs.queue[cs.playing].title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
-          Text(cs.state, style: const TextStyle(fontSize: 11, color: Colors.white54)),
+          Text('${cs.way == CastWay.gm ? 'G-MScreen' : 'DLNA'} • ${castStateAr(cs.state)}', style: const TextStyle(fontSize: 11, color: Colors.white54)),
           Row(children: [
             Text(fmtHms(cs.pos), style: const TextStyle(fontSize: 11)),
             Expanded(
@@ -1351,37 +1627,47 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
                 value: cs.pos.inSeconds.toDouble().clamp(0, max <= 0 ? 1 : max),
                 max: max <= 0 ? 1 : max,
                 onChanged: max <= 0 ? null : (v) => setState(() => cs.pos = Duration(seconds: v.round())),
-                onChangeEnd: max <= 0 ? null : (v) => _run(() => c!.seek(Duration(seconds: v.round()))),
+                onChangeEnd: max <= 0 ? null : (v) => _run(() => cs.seek(Duration(seconds: v.round()))),
               ),
             ),
             Text(fmtHms(cs.dur), style: const TextStyle(fontSize: 11)),
           ]),
           Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
             IconButton(icon: const Icon(Icons.skip_previous), onPressed: cs.playing > 0 ? () => _run(() => cs.playIndex(cs.playing - 1)) : null),
-            IconButton(icon: const Icon(Icons.replay_10), onPressed: () => _run(() => c!.seek(cs.pos - const Duration(seconds: 10) < Duration.zero ? Duration.zero : cs.pos - const Duration(seconds: 10)))),
-            IconButton.filled(icon: const Icon(Icons.play_arrow), onPressed: () => _run(c!.play)),
-            IconButton(icon: const Icon(Icons.pause), onPressed: () => _run(c!.pause)),
-            IconButton(icon: const Icon(Icons.stop), onPressed: () => _run(c!.stop)),
-            IconButton(icon: const Icon(Icons.forward_30), onPressed: () => _run(() => c!.seek(cs.pos + const Duration(seconds: 30)))),
+            IconButton(icon: const Icon(Icons.replay_10), onPressed: () => _run(() => cs.seek(cs.pos - const Duration(seconds: 10)))),
+            IconButton.filled(icon: const Icon(Icons.play_arrow), onPressed: () => _run(cs.play)),
+            IconButton(icon: const Icon(Icons.pause), onPressed: () => _run(cs.pause)),
+            IconButton(icon: const Icon(Icons.stop), onPressed: () => _run(cs.stop)),
+            IconButton(icon: const Icon(Icons.forward_30), onPressed: () => _run(() => cs.seek(cs.pos + const Duration(seconds: 30)))),
             IconButton(icon: const Icon(Icons.skip_next), onPressed: cs.playing + 1 < cs.queue.length ? () => _run(() => cs.playIndex(cs.playing + 1)) : null),
           ]),
-          Row(children: [
-            const Icon(Icons.volume_down, size: 18),
-            Expanded(
-              child: Slider(
-                value: cs.volume.toDouble().clamp(0, 100),
-                max: 100,
-                onChanged: (v) => setState(() => cs.volume = v.round()),
-                onChangeEnd: (v) => _run(() => c!.setVolume(v.round())),
+          if (cs.way == CastWay.dlna && cs.current?.rendering != null)
+            Row(children: [
+              const Icon(Icons.volume_down, size: 18),
+              Expanded(
+                child: Slider(
+                  value: cs.volume.toDouble().clamp(0, 100),
+                  max: 100,
+                  onChanged: (v) => setState(() => cs.volume = v.round()),
+                  onChangeEnd: (v) => _run(() => cs.setVolume(v.round())),
+                ),
               ),
-            ),
-            const Icon(Icons.volume_up, size: 18),
-          ]),
+              const Icon(Icons.volume_up, size: 18),
+            ]),
         ]),
       ),
     );
   }
 }
+
+String castStateAr(String s) => const {
+      'PLAYING': 'شغال',
+      'PAUSED_PLAYBACK': 'متوقف مؤقتًا',
+      'STOPPED': 'واقف',
+      'TRANSITIONING': 'بيحمّل…',
+      'NO_MEDIA_PRESENT': 'مفيش حاجة شغالة',
+    }[s] ??
+    (s.isEmpty ? '…' : s);
 
 /// لو الملف جاي content:// بننسخه للكاش علشان السيرفر يقدر يقرا أي جزء منه (Range)
 Future<File?> pickedToFile(PlatformFile f) async {
@@ -1476,8 +1762,8 @@ class _BrowserPageState extends State<BrowserPage> {
   Future<void> cast(String u) async {
     final name = title.isNotEmpty ? title : (Uri.parse(u).pathSegments.lastOrNull ?? 'فيديو');
     try {
-      await CastState.I.add(QueueItem(name, u));
-      if (mounted) toast(context, 'بيتشغل على ${CastState.I.current?.name}');
+      await CastState.I.add(QueueItem(name, u, headers: {if (urlC.text.startsWith('http')) 'Referer': urlC.text, 'User-Agent': kChromeUa}));
+      if (mounted) toast(context, 'اتبعت للشاشة');
     } catch (e) {
       if (mounted) toast(context, '$e');
     }
@@ -1816,6 +2102,16 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       showDragHandle: true,
       builder: (c) => ListView(shrinkWrap: true, padding: const EdgeInsets.only(bottom: 20), children: [
         const SectionTitle('معلومات الريسيفر', icon: Icons.info_outline_rounded),
+        ListTile(
+          leading: const Icon(Icons.bedtime_rounded, color: kGold),
+          title: const Text('مؤقت النوم'),
+          onTap: () {
+            Navigator.pop(c);
+            sleepTimer();
+          },
+        ),
+        if (gm?.info != null)
+          ListTile(dense: true, title: const Text('ضبط الطبق من الموبايل'), trailing: Text(gm!.info!.satFinder == null ? '؟' : (gm!.info!.satFinder! ? 'مدعوم' : 'مش مدعوم'), style: const TextStyle(color: kMuted))),
         for (final e in st.entries)
           ListTile(dense: true, title: Text(names[e.key] ?? e.key), trailing: Text('${e.value}', style: const TextStyle(color: kMuted))),
       ]),
@@ -1922,6 +2218,9 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               if (v == 'ip') manual();
               if (v == 'info') showInfo();
               if (v == 'reload') loadChannels();
+              if (v == 'timers' && gm != null) {
+                Navigator.push(context, MaterialPageRoute(builder: (_) => TimersPage(gm: gm!, channels: channels, playingId: playingId)));
+              }
               if (v == 'off') {
                 gm?.disconnect();
                 setState(() {
@@ -1934,6 +2233,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               const PopupMenuItem(value: 'find', child: ListTile(leading: Icon(Icons.search_rounded), title: Text('دوّر على ريسيفر'))),
               const PopupMenuItem(value: 'ip', child: ListTile(leading: Icon(Icons.edit_rounded), title: Text('عنوان يدوي'))),
               if (on) const PopupMenuItem(value: 'info', child: ListTile(leading: Icon(Icons.info_outline_rounded), title: Text('معلومات الريسيفر'))),
+              if (on) const PopupMenuItem(value: 'timers', child: ListTile(leading: Icon(Icons.alarm_rounded), title: Text('المؤقتات (تسجيل/تشغيل)'))),
               if (on) const PopupMenuItem(value: 'reload', child: ListTile(leading: Icon(Icons.refresh_rounded), title: Text('حدّث القنوات'))),
               if (on) const PopupMenuItem(value: 'off', child: ListTile(leading: Icon(Icons.link_off_rounded), title: Text('اقفل الاتصال'))),
             ],
@@ -2141,6 +2441,23 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                 label: const Text('شغّلها على التلفزيون'),
               ),
               OutlinedButton.icon(onPressed: () => watch(ch), icon: const Icon(Icons.phone_android_rounded), label: const Text('على الموبايل')),
+              OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.pop(c);
+                  renameCh(ch);
+                },
+                icon: const Icon(Icons.edit_rounded),
+                label: const Text('غيّر الاسم'),
+              ),
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(foregroundColor: kBad),
+                onPressed: () {
+                  Navigator.pop(c);
+                  deleteCh(ch);
+                },
+                icon: const Icon(Icons.delete_outline_rounded),
+                label: const Text('امسحها'),
+              ),
             ]),
           ),
           const SectionTitle('بيانات القناة من الريسيفر'),
@@ -2149,6 +2466,54 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
         ]),
       ),
     );
+  }
+
+  Future<void> renameCh(StbChannel ch) async {
+    final n = await askText(context, 'اسم جديد لـ ${ch.name}', initial: ch.name);
+    if (n == null || n.trim().isEmpty || n.trim() == ch.name || gm == null) return;
+    try {
+      await gm!.renameChannel(ch, n.trim());
+      if (mounted) toast(context, 'اتبعت — بحدّث القايمة');
+      await Future.delayed(const Duration(milliseconds: 800));
+      await loadChannels();
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
+  }
+
+  Future<void> deleteCh(StbChannel ch) async {
+    if (gm == null) return;
+    final ok = await confirm(context, 'مسح «${ch.name}» من على الريسيفر نهائي — هترجع بس لو عملت بحث تاني على القمر.\n\nتمسحها؟');
+    if (!ok) return;
+    try {
+      await gm!.deleteChannels([ch]);
+      if (mounted) toast(context, 'اتمسحت — بحدّث القايمة');
+      await Future.delayed(const Duration(milliseconds: 800));
+      await loadChannels();
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
+  }
+
+  Future<void> sleepTimer() async {
+    if (gm == null) return;
+    final m = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      builder: (c) => ListView(shrinkWrap: true, children: [
+        const SectionTitle('مؤقت النوم للريسيفر', icon: Icons.bedtime_rounded),
+        for (final v in [0, 15, 30, 60, 90, 120])
+          ListTile(title: Text(v == 0 ? 'اقفل المؤقت' : '$v دقيقة'), onTap: () => Navigator.pop(c, v)),
+      ]),
+    );
+    if (m == null) return;
+    try {
+      await gm!.setSleep(m);
+      if (mounted) toast(context, m == 0 ? 'المؤقت اتقفل' : 'الريسيفر هيقفل بعد $m دقيقة');
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
   }
 
   Future<void> watch(StbChannel ch) async {
@@ -2532,157 +2897,237 @@ class DishPage extends StatefulWidget {
 }
 
 class _DishPageState extends State<DishPage> {
-  Timer? poll, beep;
+  Timer? beep;
   SignalReading sig = const SignalReading();
   String raw = '';
-  bool running = false;
-  bool sound = true;
+  bool running = false, busy = false, sound = true, finderOn = false;
+  int _gen = 0;
   String q = '';
-  List<String> sats = [];
+  late FinderCfg cfg = _loadCfg();
+  final freqC = TextEditingController(), symC = TextEditingController();
 
-  int? get reqCode => int.tryParse(Store.p.getString('stb_signal_req') ?? '');
-  String get reqFields => Store.p.getString('stb_signal_fields') ?? '';
+  static FinderCfg _loadCfg() {
+    try {
+      return FinderCfg.fromJson(jsonDecode(Store.p.getString('finder_cfg') ?? '{}') as Map);
+    } catch (_) {
+      return const FinderCfg();
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    freqC.text = cfg.freq > 0 ? '${cfg.freq}' : '';
+    symC.text = '${cfg.sym}';
+  }
+
+  void _save(FinderCfg c) {
+    setState(() => cfg = c);
+    Store.p.setString('finder_cfg', jsonEncode(c.toJson()));
+  }
 
   @override
   void dispose() {
-    poll?.cancel();
+    _gen++;
     beep?.cancel();
+    if (finderOn) widget.gm.finderEnd().catchError((_) {});
+    freqC.dispose();
+    symC.dispose();
     super.dispose();
-  }
-
-  Future<void> _tick() async {
-    final code = reqCode;
-    if (code == null) return;
-    Map<String, dynamic> fields = {};
-    if (reqFields.trim().isNotEmpty) {
-      try {
-        fields = Map<String, dynamic>.from(jsonDecode(reqFields) as Map);
-      } catch (_) {}
-    }
-    try {
-      final r = await widget.gm.send(code, fields, timeout: const Duration(seconds: 3));
-      final s = parseSignal(r);
-      raw = jsonEncode(r);
-      if (raw.length > 400) raw = '${raw.substring(0, 400)}…';
-      if (mounted) setState(() => sig = s);
-      _scheduleBeep();
-    } catch (e) {
-      if (mounted) setState(() => raw = 'خطأ: $e');
-    }
   }
 
   void _scheduleBeep() {
     beep?.cancel();
     if (!running || !sound) return;
-    final qv = sig.quality ?? sig.strength;
+    final qv = (sig.quality ?? 0) > 0 ? sig.quality : sig.strength; // زي G-MScreen: الجودة لو موجودة، وإلا القوة
     if (qv == null) return;
     beep = Timer.periodic(Duration(milliseconds: beepIntervalMs(qv)), (_) {
       SystemSound.play(SystemSoundType.click);
-      if ((qv) >= 70) HapticFeedback.lightImpact();
+      if (qv >= 70) HapticFeedback.lightImpact();
     });
   }
 
-  void start() {
-    if (reqCode == null) {
-      setCode();
+  Future<void> start() async {
+    final f = int.tryParse(freqC.text.trim()) ?? 0;
+    final sr = int.tryParse(symC.text.trim()) ?? 0;
+    if (f < 900 || sr < 1000) {
+      toast(context, 'اكتب الترددة (مثلاً 11013) والـSymbol Rate (مثلاً 27500) أو خدهم من قناة');
       return;
     }
-    setState(() => running = true);
-    AppLog.add('STB', 'signal poll start req=$reqCode fields=$reqFields');
-    poll?.cancel();
-    poll = Timer.periodic(const Duration(milliseconds: 900), (_) => _tick());
-    _tick();
+    _save(cfg.copyWith(freq: f, sym: sr));
+    final sup = widget.gm.info?.satFinder;
+    if (sup == false) {
+      final ok = await confirm(context, 'الريسيفر ده بيقول إنه مش بيدعم ضبط الطبق من الموبايل (SatFinder). G-MScreen نفسه بيخفي الخاصية دي عنده.\n\nتجرب برضه؟');
+      if (!ok || !mounted) return;
+    }
+    final my = ++_gen;
+    setState(() {
+      busy = true;
+      raw = '';
+    });
+    try {
+      AppLog.add('STB', 'satfinder start ${jsonEncode(cfg.toJson())}');
+      await widget.gm.finderStart();
+      finderOn = true;
+      await widget.gm.finderLock(cfg);
+      if (!mounted || my != _gen) return;
+      setState(() {
+        busy = false;
+        running = true;
+      });
+      _loop(my);
+    } catch (e) {
+      AppLog.add('STB', 'satfinder failed: $e');
+      if (mounted) {
+        setState(() {
+          busy = false;
+          raw = 'خطأ: $e';
+        });
+        toast(context, 'الريسيفر رفض: $e');
+      }
+      await _end();
+    }
+  }
+
+  Future<void> _loop(int my) async {
+    var fails = 0;
+    while (mounted && my == _gen && running) {
+      try {
+        final s = await widget.gm.finderSq();
+        fails = 0;
+        if (!mounted || my != _gen) return;
+        setState(() {
+          sig = s;
+          raw = 'القوة ${s.strength?.round() ?? '-'}%  الجودة ${s.quality?.round() ?? '-'}%';
+        });
+        _scheduleBeep();
+      } catch (e) {
+        fails++;
+        if (mounted) setState(() => raw = 'خطأ: $e');
+        if (fails >= 5) {
+          stop();
+          return;
+        }
+      }
+      await Future.delayed(const Duration(milliseconds: 350));
+    }
+  }
+
+  Future<void> _end() async {
+    if (!finderOn) return;
+    finderOn = false;
+    try {
+      await widget.gm.finderEnd();
+    } catch (_) {}
   }
 
   void stop() {
-    poll?.cancel();
+    _gen++;
     beep?.cancel();
-    setState(() => running = false);
+    _end();
+    if (mounted) setState(() => running = false);
   }
 
-  Future<void> setCode() async {
-    final ok = await confirm(context,
-        'قراية الإشارة لسه تجريبية: كود الطلب بتاع الإشارة في G-MScreen مش معروف لسه للـQmax.\n\nاكتب كود بس لو انت عارفه (مثلاً من سجل أو من حد جرّبه). كود غلط ممكن يعمل حاجة تانية في الريسيفر.\n\nتكمّل؟');
-    if (!ok || !mounted) return;
-    final c = await askText(context, 'كود طلب الإشارة', initial: Store.p.getString('stb_signal_req') ?? '', type: TextInputType.number);
-    if (c == null || !mounted) return;
-    await Store.p.setString('stb_signal_req', c.trim());
-    if (!mounted) return;
-    final f = await askText(context, 'حقول إضافية (JSON) — سيبها فاضية لو مش عارف', initial: reqFields, hint: '{"TpIndex":"0"}');
-    if (f != null) await Store.p.setString('stb_signal_fields', f.trim());
-    setState(() {});
+  void fromChannel(StbChannel c) {
+    final n = finderFromChannel(cfg, c.raw);
+    if (n == null) {
+      toast(context, 'الريسيفر مش باعت ترددة القناة دي — اكتبها بإيدك');
+      return;
+    }
+    freqC.text = '${n.freq}';
+    symC.text = '${n.sym}';
+    _save(n);
+    toast(context, '${c.name}: ${n.freq} ${n.pol == 0 ? 'H' : 'V'} ${n.sym}');
   }
+
+  Widget _drop(String label, List<String> items, int value, void Function(int) on) => DropdownButtonFormField<int>(
+        initialValue: value.clamp(0, items.length - 1),
+        isExpanded: true,
+        decoration: InputDecoration(labelText: label, isDense: true),
+        items: [for (var i = 0; i < items.length; i++) DropdownMenuItem(value: i, child: Text(items[i], overflow: TextOverflow.ellipsis))],
+        onChanged: running ? null : (v) => on(v ?? 0),
+      );
 
   Future<void> showOnTv() async {
-    // تجريبي: على ريسيفرات كتير Info (مرة أو مرتين) بيطلّع بار القوة/الجودة على التلفزيون
     HapticFeedback.mediumImpact();
     try {
-      await widget.gm.key(K.info);
-      await Future.delayed(const Duration(milliseconds: 500));
       await widget.gm.key(K.info);
     } catch (e) {
       if (mounted) toast(context, '$e');
     }
   }
 
-  Future<void> loadSats() async {
-    try {
-      final r = await widget.gm.send(22, {}, timeout: const Duration(seconds: 8));
-      final out = <String>[];
-      void walk(dynamic x) {
-        if (x is Map) {
-          for (final e in x.entries) {
-            final k = '${e.key}'.toLowerCase();
-            if (k.contains('name') && '${e.value}'.trim().isNotEmpty) out.add('${e.value}');
-            if (e.value is Map || e.value is List) walk(e.value);
-          }
-        } else if (x is List) {
-          for (final e in x) {
-            walk(e);
-          }
-        }
-      }
-
-      walk(r);
-      if (out.isEmpty) out.add(jsonEncode(r).substring(0, min(200, jsonEncode(r).length)));
-      setState(() => sats = out);
-    } catch (e) {
-      if (mounted) toast(context, 'مقدرتش أقرا الأقمار: $e');
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
-    final playing = widget.channels.where((c) => c.id == widget.playingId).firstOrNull;
     final list = q.isEmpty ? <StbChannel>[] : widget.channels.where((c) => c.name.toLowerCase().contains(q.toLowerCase())).take(8).toList();
+    final presetIdx = kSatPresets.indexWhere((p) => p.$2 == cfg.angle && p.$3 == cfg.dir);
+    final sup = widget.gm.info?.satFinder;
     return ListView(padding: const EdgeInsets.only(bottom: 16), children: [
-      const SectionTitle('١. اختار قناة على القمر اللي بتظبط عليه', icon: Icons.live_tv_rounded),
+      if (sup == false)
+        Card(
+          color: kBad.withValues(alpha: 0.12),
+          child: const Padding(
+            padding: EdgeInsets.all(12),
+            child: Text('الريسيفر ده مش معلن إنه بيدعم ضبط الطبق من الموبايل — ممكن ميردش. استخدم زرار Info تحت.', style: TextStyle(fontSize: 12)),
+          ),
+        ),
+      const SectionTitle('١. القمر والترددة', icon: Icons.satellite_alt_rounded),
       Card(
         child: Padding(
           padding: const EdgeInsets.all(12),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(playing == null ? 'مفيش قناة معروفة شغالة' : 'شغالة دلوقتي: ${playing.name}', style: const TextStyle(color: kMuted, fontSize: 13)),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            DropdownButtonFormField<int>(
+              initialValue: presetIdx < 0 ? null : presetIdx,
+              isExpanded: true,
+              decoration: const InputDecoration(labelText: 'القمر', isDense: true),
+              hint: Text('${cfg.satName} ${cfg.angle}°${cfg.dir == 0 ? 'E' : 'W'}'),
+              items: [for (var i = 0; i < kSatPresets.length; i++) DropdownMenuItem(value: i, child: Text(kSatPresets[i].$1))],
+              onChanged: running ? null : (i) => i == null ? null : _save(cfg.copyWith(satName: kSatPresets[i].$1, angle: kSatPresets[i].$2, dir: kSatPresets[i].$3)),
+            ),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(child: TextField(controller: freqC, enabled: !running, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'الترددة MHz', hintText: '11013', isDense: true))),
+              const SizedBox(width: 8),
+              Expanded(child: TextField(controller: symC, enabled: !running, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Symbol Rate', isDense: true))),
+            ]),
             const SizedBox(height: 8),
-            TextField(decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'اسم القناة (مثلاً Nile)'), onChanged: (v) => setState(() => q = v)),
+            SegmentedButton<int>(
+              showSelectedIcon: false,
+              segments: const [ButtonSegment(value: 0, label: Text('H أفقي')), ButtonSegment(value: 1, label: Text('V رأسي'))],
+              selected: {cfg.pol},
+              onSelectionChanged: running ? null : (v) => _save(cfg.copyWith(pol: v.first)),
+            ),
+            const SizedBox(height: 8),
+            TextField(decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'أو خد الترددة من قناة (اكتب اسمها)', isDense: true), onChanged: (v) => setState(() => q = v)),
             for (final c in list)
               ListTile(
                 dense: true,
                 leading: const Icon(Icons.tv_rounded),
                 title: Text(c.name),
-                onTap: () async {
-                  try {
-                    await widget.gm.zap(c);
-                    widget.onZapped(c.id);
-                    setState(() => q = '');
-                  } catch (e) {
-                    if (mounted) toast(context, '$e');
-                  }
+                trailing: const Icon(Icons.download_rounded, size: 18),
+                onTap: () {
+                  fromChannel(c);
+                  setState(() => q = '');
                 },
               ),
+            ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              title: const Text('إعدادات الـLNB (سيبها زي ما هي لو مش متأكد)', style: TextStyle(fontSize: 13)),
+              children: [
+                _drop('نوع الـLNB', kLnbTypes, cfg.lnbType, (v) => _save(cfg.copyWith(lnbType: v))),
+                const SizedBox(height: 8),
+                _drop('باور الـLNB', kLnbPowers, cfg.lnbPower, (v) => _save(cfg.copyWith(lnbPower: v))),
+                const SizedBox(height: 8),
+                _drop('22K', k22kModes, cfg.k22, (v) => _save(cfg.copyWith(k22: v))),
+                const SizedBox(height: 8),
+                _drop('DiSEqC 1.0', kDiseqcModes, cfg.diseqc, (v) => _save(cfg.copyWith(diseqc: v))),
+                const SizedBox(height: 8),
+              ],
+            ),
           ]),
         ),
       ),
-      const SectionTitle('٢. شوف الإشارة', icon: Icons.network_check_rounded),
+      const SectionTitle('٢. الإشارة', icon: Icons.network_check_rounded),
       Card(
         child: Padding(
           padding: const EdgeInsets.all(14),
@@ -2691,19 +3136,13 @@ class _DishPageState extends State<DishPage> {
               Gauge(label: 'القوة', value: sig.strength, color: kGold),
               Gauge(label: 'الجودة', value: sig.quality, color: kOk),
             ]),
-            if (sig.snr != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text('SNR: ${sig.snr}', style: const TextStyle(color: kMuted))),
-            if (sig.locked != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: Badge2(sig.locked! ? 'الإشارة ماسكة' : 'مفيش قفل', color: sig.locked! ? kOk : kBad),
-              ),
             const SizedBox(height: 12),
             Row(children: [
               Expanded(
                 child: FilledButton.icon(
-                  onPressed: running ? stop : start,
-                  icon: Icon(running ? Icons.stop_rounded : Icons.play_arrow_rounded),
-                  label: Text(running ? 'وقّف القياس' : 'ابدأ القياس'),
+                  onPressed: busy ? null : (running ? stop : start),
+                  icon: busy ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : Icon(running ? Icons.stop_rounded : Icons.play_arrow_rounded),
+                  label: Text(busy ? 'بيقفل على الترددة…' : (running ? 'وقّف القياس' : 'ابدأ القياس')),
                 ),
               ),
               const SizedBox(width: 8),
@@ -2715,25 +3154,10 @@ class _DishPageState extends State<DishPage> {
                 },
                 icon: Icon(sound ? Icons.volume_up_rounded : Icons.volume_off_rounded),
               ),
-              IconButton.filledTonal(tooltip: 'كود الطلب', onPressed: setCode, icon: const Icon(Icons.tune_rounded)),
             ]),
             const SizedBox(height: 8),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(color: kGold.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(12), border: Border.all(color: kGold.withValues(alpha: 0.3))),
-              child: Text(
-                reqCode == null
-                    ? 'تجريبي: قراية القوة والجودة على الموبايل محتاجة كود طلب من G-MScreen لسه مش متأكدين منه للـQmax. لحد ما نتأكد، استخدم الزرار اللي تحت يطلّع الإشارة على التلفزيون.'
-                    : 'تجريبي: بقرا بالكود $reqCode كل ثانية تقريباً — الصفارة بتسرع كل ما الجودة تعلى. الرد الخام بيتسجل في السجل.',
-                style: const TextStyle(fontSize: 12, color: Colors.white70),
-              ),
-            ),
-            if (raw.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Directionality(textDirection: TextDirection.ltr, child: Text(raw, style: const TextStyle(fontSize: 10, fontFamily: 'monospace', color: kMuted))),
-              ),
+            const Text('وقت القياس الريسيفر بيسيب القناة ويقفل على الترددة دي. لما توقف بيرجع. الصفارة بتسرع كل ما الجودة تعلى.', style: TextStyle(fontSize: 12, color: kMuted)),
+            if (raw.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(raw, style: const TextStyle(fontSize: 12, color: kMuted))),
           ]),
         ),
       ),
@@ -2742,20 +3166,14 @@ class _DishPageState extends State<DishPage> {
         child: Padding(
           padding: const EdgeInsets.all(12),
           child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            FilledButton.tonalIcon(onPressed: showOnTv, icon: const Icon(Icons.signal_cellular_alt_rounded), label: const Text('اعرض الإشارة على التلفزيون (زرار Info)')),
+            FilledButton.tonalIcon(onPressed: showOnTv, icon: const Icon(Icons.signal_cellular_alt_rounded), label: const Text('زرار Info')),
             const SizedBox(height: 6),
-            OutlinedButton.icon(onPressed: () => widget.gm.key(K.exit), icon: const Icon(Icons.close_rounded), label: const Text('اقفله (Exit)')),
+            OutlinedButton.icon(onPressed: () => widget.gm.key(K.exit), icon: const Icon(Icons.close_rounded), label: const Text('Exit')),
             const SizedBox(height: 8),
-            const Text('حرّك الطبق شوية شوية (يمين/شمال الأول، وبعدين فوق/تحت) واستنى ثانيتين بعد كل حركة عشان الرقم يتحدث.',
-                style: TextStyle(fontSize: 12, color: kMuted)),
+            const Text('حرّك الطبق شوية شوية (يمين/شمال الأول، وبعدين فوق/تحت) واستنى ثانية بعد كل حركة.', style: TextStyle(fontSize: 12, color: kMuted)),
           ]),
         ),
       ),
-      SectionTitle('الأقمار اللي على الريسيفر', icon: Icons.public_rounded, trailing: TextButton(onPressed: loadSats, child: const Text('اقرا'))),
-      if (sats.isNotEmpty)
-        Card(
-          child: Column(children: [for (final s in sats) ListTile(dense: true, leading: const Icon(Icons.satellite_alt_rounded, size: 18), title: Text(s))]),
-        ),
     ]);
   }
 }
@@ -2886,6 +3304,8 @@ class Store {
   static set m3uUrl(String? v) => v == null ? p.remove('m3u_url') : p.setString('m3u_url', v);
   static String get homePage => p.getString('home_page') ?? 'https://www.google.com';
   static set homePage(String v) => p.setString('home_page', v);
+  static String? get castLocation => p.getString('cast_loc');
+  static set castLocation(String? v) => v == null ? p.remove('cast_loc') : p.setString('cast_loc', v);
 }
 
 const String appVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'تجريبي');
@@ -3834,6 +4254,7 @@ class DlnaDevice {
   final String? rendering;
   final String ip;
   DlnaDevice(this.name, this.model, this.location, this.avTransport, this.rendering, this.ip);
+  bool get isReceiver => ip.isNotEmpty && ip == Store.receiverIp;
 }
 
 String _resolve(String base, String path) {
@@ -3852,7 +4273,7 @@ String _resolve(String base, String path) {
 /// يقرا وصف الجهاز (description.xml) ويطلع روابط التحكم
 DlnaDevice? parseDeviceDescription(String xmlText, String location) {
   try {
-    final doc = XmlDocument.parse(xmlText);
+    final doc = XmlDocument.parse(xmlText.trim());
     String text(XmlElement e, String tag) =>
         e.descendants.whereType<XmlElement>().where((x) => x.name.local == tag).map((x) => x.innerText.trim()).firstWhere((_) => true, orElse: () => '');
     final root = doc.rootElement;
@@ -3875,22 +4296,41 @@ DlnaDevice? parseDeviceDescription(String xmlText, String location) {
   }
 }
 
-Future<List<DlnaDevice>> discoverRenderers() async {
+/// يجيب وصف جهاز واحد (بمحاولة تانية — الـQmax ساعات بيقفل أول اتصال "Broken pipe")
+Future<DlnaDevice?> fetchRenderer(String location) async {
+  for (var k = 0; k < 2; k++) {
+    try {
+      final res = await http.get(Uri.parse(location), headers: {'User-Agent': kDlnaUa}).timeout(const Duration(seconds: 4));
+      if (res.statusCode != 200) {
+        AppLog.add('CAST', 'desc $location → ${res.statusCode}');
+        continue;
+      }
+      final d = parseDeviceDescription(utf8.decode(res.bodyBytes, allowMalformed: true), location);
+      if (d != null) AppLog.add('CAST', 'renderer "${d.name}" ${d.ip} av=${d.avTransport} rc=${d.rendering}');
+      return d;
+    } catch (e) {
+      AppLog.add('CAST', 'desc $location ✗ $e');
+      await Future.delayed(const Duration(milliseconds: 400));
+    }
+  }
+  return null;
+}
+
+/// يدوّر على الشاشات (SSDP) + آخر شاشة اتستخدمت + الريسيفر المحفوظ
+Future<List<DlnaDevice>> discoverRenderers({List<String> extra = const []}) async {
   final replies = await ssdpDiscover([
     'urn:schemas-upnp-org:device:MediaRenderer:1',
     'urn:schemas-upnp-org:service:AVTransport:1',
   ]);
+  final locs = <String>{...replies.map((r) => r.location), ...extra};
   final out = <DlnaDevice>[];
   final seen = <String>{};
-  await Future.wait(replies.map((r) async {
-    try {
-      final res = await http.get(Uri.parse(r.location)).timeout(const Duration(seconds: 4));
-      final d = parseDeviceDescription(utf8.decode(res.bodyBytes, allowMalformed: true), r.location);
-      if (d != null && seen.add(d.avTransport!)) out.add(d);
-    } catch (e) {
-      AppLog.add('CAST', 'desc ${r.location} ✗ $e');
-    }
+  await Future.wait(locs.map((l) async {
+    final d = await fetchRenderer(l);
+    if (d != null && seen.add(d.avTransport!)) out.add(d);
   }));
+  // الريسيفر الأول
+  out.sort((a, b) => (b.isReceiver ? 1 : 0) - (a.isReceiver ? 1 : 0));
   return out;
 }
 
@@ -3901,27 +4341,69 @@ String xmlEsc(String s) => s
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&apos;');
 
-String mimeOf(String url) {
-  final u = url.toLowerCase().split('?').first;
-  if (u.endsWith('.m3u8')) return 'application/x-mpegURL';
-  if (u.endsWith('.mpd')) return 'application/dash+xml';
-  if (u.endsWith('.mkv')) return 'video/x-matroska';
-  if (u.endsWith('.webm')) return 'video/webm';
-  if (u.endsWith('.avi')) return 'video/x-msvideo';
-  if (u.endsWith('.mov')) return 'video/quicktime';
-  if (u.endsWith('.ts')) return 'video/mp2t';
-  if (u.endsWith('.mp3')) return 'audio/mpeg';
-  if (u.endsWith('.m4a') || u.endsWith('.aac')) return 'audio/mp4';
-  if (u.endsWith('.jpg') || u.endsWith('.jpeg')) return 'image/jpeg';
-  if (u.endsWith('.png')) return 'image/png';
-  if (u.endsWith('.gif')) return 'image/gif';
-  if (u.endsWith('.srt')) return 'text/srt';
-  if (u.endsWith('.vtt')) return 'text/vtt';
-  return 'video/mp4';
+const Map<String, String> kExtMime = {
+  'm3u8': 'application/x-mpegURL',
+  'm3u': 'application/x-mpegURL',
+  'mpd': 'application/dash+xml',
+  'mp4': 'video/mp4',
+  'm4v': 'video/mp4',
+  'mkv': 'video/x-matroska',
+  'webm': 'video/webm',
+  'avi': 'video/x-msvideo',
+  'mov': 'video/quicktime',
+  'ts': 'video/mp2t',
+  'm2ts': 'video/mp2t',
+  'mts': 'video/mp2t',
+  'flv': 'video/x-flv',
+  '3gp': 'video/3gpp',
+  'mpg': 'video/mpeg',
+  'mpeg': 'video/mpeg',
+  'vob': 'video/mpeg',
+  'wmv': 'video/x-ms-wmv',
+  'mp3': 'audio/mpeg',
+  'm4a': 'audio/mp4',
+  'aac': 'audio/aac',
+  'ac3': 'audio/ac3',
+  'wav': 'audio/wav',
+  'flac': 'audio/flac',
+  'ogg': 'audio/ogg',
+  'jpg': 'image/jpeg',
+  'jpeg': 'image/jpeg',
+  'png': 'image/png',
+  'gif': 'image/gif',
+  'bmp': 'image/bmp',
+  'webp': 'image/webp',
+  'srt': 'text/srt',
+  'vtt': 'text/vtt',
+};
+
+String? extOf(String url) {
+  var u = url.toLowerCase().split('#').first.split('?').first;
+  final slash = u.lastIndexOf('/');
+  if (slash >= 0) u = u.substring(slash + 1);
+  final dot = u.lastIndexOf('.');
+  if (dot < 0 || dot == u.length - 1) return null;
+  return u.substring(dot + 1);
 }
 
+bool hasKnownExt(String url) => kExtMime.containsKey(extOf(url));
+
+String mimeOf(String url) => kExtMime[extOf(url)] ?? 'video/mp4';
+
+bool isHlsMime(String m) => m.toLowerCase().contains('mpegurl');
+bool isLiveMime(String m) => isHlsMime(m) || m.toLowerCase().contains('dash');
+
+// نفس الأعلام اللي تطبيقات الكاست المعروفة (Web Video Caster/BubbleUPnP) بتبعتها:
+// OP=01 = يسمح بالتقديم (Range)، FLAGS = streaming + background + DLNA 1.5
+const String kDlnaFlags = 'DLNA.ORG_FLAGS=01700000000000000000000000000000';
+const String kDlnaUa = 'Android/UPnP/1.0 DLNADOC/1.50 A2RHome/1.0';
+
+String dlnaFeatures(String mime) => isLiveMime(mime) ? 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;$kDlnaFlags' : 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kDlnaFlags';
+
+String protocolInfoFor(String mime, {bool dlna = true}) => 'http-get:*:$mime:${dlna ? dlnaFeatures(mime) : '*'}';
+
 /// DIDL-Lite (وصف الملف اللي بيتبعت للشاشة) + ترجمة لو موجودة
-String buildDidl(String url, String title, {String? mime, String? subtitleUrl}) {
+String buildDidl(String url, String title, {String? mime, String? subtitleUrl, bool dlnaFlags = true}) {
   final m = mime ?? mimeOf(url);
   final cls = m.startsWith('image')
       ? 'object.item.imageItem.photo'
@@ -3934,10 +4416,10 @@ String buildDidl(String url, String title, {String? mime, String? subtitleUrl}) 
           '<res protocolInfo="http-get:*:text/srt:*">${xmlEsc(subtitleUrl)}</res>';
   return '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
       'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
-      'xmlns:sec="http://www.sec.co.kr/" xmlns:pv="http://www.pv.com/pvns/">'
+      'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/" xmlns:sec="http://www.sec.co.kr/" xmlns:pv="http://www.pv.com/pvns/">'
       '<item id="0" parentID="-1" restricted="1"><dc:title>${xmlEsc(title)}</dc:title>'
       '<upnp:class>$cls</upnp:class>'
-      '<res protocolInfo="http-get:*:$m:*"${subtitleUrl == null ? '' : ' pv:subtitleFileUri="${xmlEsc(subtitleUrl)}" pv:subtitleFileType="srt"'}>${xmlEsc(url)}</res>'
+      '<res protocolInfo="${protocolInfoFor(m, dlna: dlnaFlags)}"${subtitleUrl == null ? '' : ' pv:subtitleFileUri="${xmlEsc(subtitleUrl)}" pv:subtitleFileType="srt"'}>${xmlEsc(url)}</res>'
       '$sub</item></DIDL-Lite>';
 }
 
@@ -3950,8 +4432,38 @@ String soapEnvelope(String service, String action, Map<String, String> args) {
 
 /// يطلع قيمة عنصر من رد SOAP
 String? soapValue(String xml, String tag) {
-  final m = RegExp('<(?:\\w+:)?$tag>([\\s\\S]*?)</(?:\\w+:)?$tag>').firstMatch(xml);
+  final m = RegExp('<(?:\\w+:)?$tag(?:\\s[^>]*)?>([\\s\\S]*?)</(?:\\w+:)?$tag>').firstMatch(xml);
   return m?.group(1);
+}
+
+const Map<int, String> kUpnpErrAr = {
+  401: 'الجهاز مش بيدعم الأمر ده',
+  402: 'الجهاز رفض البيانات',
+  501: 'الجهاز رفض الأمر',
+  701: 'الجهاز مش جاهز للأمر ده دلوقتي',
+  702: 'مفيش فيديو محمّل على الجهاز',
+  704: 'صيغة التشغيل مش مدعومة',
+  705: 'الجهاز مش قادر يقرا الفيديو',
+  710: 'التقديم بالطريقة دي مش مدعوم',
+  711: 'الوقت اللي اخترته مش صالح',
+  714: 'نوع الملف مش مدعوم على الجهاز',
+  716: 'الجهاز مقدرش يوصل للرابط',
+  718: 'رقم الجلسة غلط',
+};
+
+class SoapFault implements Exception {
+  final String action;
+  final int http;
+  final int? code;
+  final String desc;
+  SoapFault(this.action, this.http, this.code, this.desc);
+  static SoapFault parse(String action, int http, String body) =>
+      SoapFault(action, http, int.tryParse((soapValue(body, 'errorCode') ?? '').trim()), (soapValue(body, 'errorDescription') ?? '').trim());
+  @override
+  String toString() {
+    final ar = code == null ? null : kUpnpErrAr[code];
+    return '$action: ${ar ?? 'الجهاز رد بخطأ'} (${code ?? http}${desc.isEmpty ? '' : ' $desc'})';
+  }
 }
 
 String fmtHms(Duration d) {
@@ -3961,11 +4473,13 @@ String fmtHms(Duration d) {
 
 Duration parseHms(String? s) {
   if (s == null) return Duration.zero;
-  final p = s.split(':');
+  final p = s.trim().split(':');
   if (p.length != 3) return Duration.zero;
   final sec = double.tryParse(p[2]) ?? 0;
   return Duration(hours: int.tryParse(p[0]) ?? 0, minutes: int.tryParse(p[1]) ?? 0, milliseconds: (sec * 1000).round());
 }
+
+String _cut(String s, int n) => s.length > n ? '${s.substring(0, n)}…(${s.length})' : s;
 
 class DlnaClient {
   final DlnaDevice dev;
@@ -3973,30 +4487,71 @@ class DlnaClient {
 
   Future<String> _call(String service, String url, String action, Map<String, String> args) async {
     final body = soapEnvelope(service, action, args);
-    AppLog.add('CAST', '→ ${dev.name} $action ${args.keys.join(',')}');
+    AppLog.add('CAST', '→ ${dev.name} $action $url\n${_cut(body, 1800)}');
     final r = await http
         .post(Uri.parse(url),
             headers: {
               'Content-Type': 'text/xml; charset="utf-8"',
               'SOAPAction': '"urn:schemas-upnp-org:service:$service:1#$action"',
+              'User-Agent': kDlnaUa,
             },
             body: utf8.encode(body))
-        .timeout(const Duration(seconds: 8));
+        .timeout(const Duration(seconds: 10));
     final txt = utf8.decode(r.bodyBytes, allowMalformed: true);
-    AppLog.add('CAST', '← ${r.statusCode} ${txt.length > 400 ? txt.substring(0, 400) : txt}');
-    if (r.statusCode != 200) throw HttpException('$action فشل (${r.statusCode})');
+    AppLog.add('CAST', '← $action ${r.statusCode} ${_cut(txt, 700)}');
+    if (r.statusCode != 200) throw SoapFault.parse(action, r.statusCode, txt);
     return txt;
   }
 
   Future<String> av(String action, [Map<String, String> args = const {}]) =>
       _call('AVTransport', dev.avTransport!, action, {'InstanceID': '0', ...args});
 
-  Future<void> load(String url, String title, {String? subtitle}) async {
+  /// زي Web Video Caster: Stop → SetAVTransportURI (بوصف كامل، ولو اترفض: وصف بسيط، ولو اترفض: من غير وصف) → Play
+  Future<void> load(String url, String title, {String? subtitle, String? mime}) async {
+    final m = mime ?? mimeOf(url);
     try {
       await av('Stop');
     } catch (_) {}
-    await av('SetAVTransportURI', {'CurrentURI': url, 'CurrentURIMetaData': buildDidl(url, title, subtitleUrl: subtitle)});
-    await play();
+    final metas = <(String, String)>[
+      ('كامل', buildDidl(url, title, mime: m, subtitleUrl: subtitle)),
+      ('بسيط', buildDidl(url, title, mime: m, subtitleUrl: subtitle, dlnaFlags: false)),
+      ('من غير وصف', ''),
+    ];
+    Object? last;
+    for (final meta in metas) {
+      try {
+        await av('SetAVTransportURI', {'CurrentURI': url, 'CurrentURIMetaData': meta.$2});
+        last = null;
+        AppLog.add('CAST', 'SetAVTransportURI ok (وصف ${meta.$1})');
+        break;
+      } catch (e) {
+        last = e;
+        AppLog.add('CAST', 'SetAVTransportURI (وصف ${meta.$1}) ✗ $e');
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+    }
+    if (last != null) throw last;
+    await Future.delayed(const Duration(milliseconds: 500));
+    for (var i = 0; i < 4; i++) {
+      try {
+        await play();
+        return;
+      } catch (e) {
+        // بعض الأجهزة بتشغّل لوحدها بعد SetAVTransportURI وترفض Play
+        final st = await transportState();
+        if (st == 'PLAYING' || st == 'TRANSITIONING') return;
+        if (i == 3) rethrow;
+        await Future.delayed(const Duration(milliseconds: 800));
+      }
+    }
+  }
+
+  Future<String> transportState() async {
+    try {
+      return (soapValue(await av('GetTransportInfo'), 'CurrentTransportState') ?? '').trim();
+    } catch (_) {
+      return '';
+    }
   }
 
   Future<void> play() => av('Play', {'Speed': '1'});
@@ -4006,17 +4561,14 @@ class DlnaClient {
 
   Future<({Duration pos, Duration dur, String state})> status() async {
     final p = await av('GetPositionInfo');
-    String st = '';
-    try {
-      st = soapValue(await av('GetTransportInfo'), 'CurrentTransportState') ?? '';
-    } catch (_) {}
+    final st = await transportState();
     return (pos: parseHms(soapValue(p, 'RelTime')), dur: parseHms(soapValue(p, 'TrackDuration')), state: st);
   }
 
   Future<int?> getVolume() async {
     if (dev.rendering == null) return null;
     final r = await _call('RenderingControl', dev.rendering!, 'GetVolume', {'InstanceID': '0', 'Channel': 'Master'});
-    return int.tryParse(soapValue(r, 'CurrentVolume') ?? '');
+    return int.tryParse((soapValue(r, 'CurrentVolume') ?? '').trim());
   }
 
   Future<void> setVolume(int v) async {
@@ -4026,55 +4578,149 @@ class DlnaClient {
   }
 }
 
-/// سيرفر صغير جوه الموبايل علشان الشاشة تقرا ملفات الموبايل (فيديو/صور/ترجمة)
+/// عنوان الموبايل اللي على نفس شبكة الشاشة (لو الموبايل عليه أكتر من شبكة)
+Future<String?> phoneIpFor(String? targetIp) async {
+  String? first;
+  try {
+    final tp = targetIp?.split('.');
+    for (final ni in await NetworkInterface.list(type: InternetAddressType.IPv4)) {
+      for (final a in ni.addresses) {
+        if (a.isLoopback) continue;
+        final p = a.address.split('.');
+        if (tp != null && tp.length == 4 && p.length == 4 && p[0] == tp[0] && p[1] == tp[1] && p[2] == tp[2]) return a.address;
+        if (ni.name.startsWith('wlan')) first ??= a.address;
+      }
+    }
+  } catch (_) {}
+  return first ?? (await readPhoneNet()).ip;
+}
+
+/// نوع الملف من الرابط، ولو الرابط مفيهوش امتداد نسأل السيرفر (HEAD)
+Future<String> probeMime(String url, Map<String, String> headers) async {
+  if (hasKnownExt(url) || !url.startsWith('http')) return mimeOf(url);
+  final c = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+  try {
+    for (final method in ['HEAD', 'GET']) {
+      try {
+        final rq = await c.openUrl(method, Uri.parse(url)).timeout(const Duration(seconds: 6));
+        headers.forEach(rq.headers.set);
+        if (method == 'GET') rq.headers.set('Range', 'bytes=0-1');
+        final rs = await rq.close().timeout(const Duration(seconds: 6));
+        final ct = (rs.headers.contentType?.mimeType ?? '').toLowerCase();
+        rs.drain<void>().catchError((_) {});
+        AppLog.add('CAST', 'probe $method ${rs.statusCode} type=$ct');
+        if (ct.startsWith('video/') || ct.startsWith('audio/') || ct.startsWith('image/')) return ct;
+        if (ct.contains('mpegurl')) return 'application/x-mpegURL';
+        if (ct.contains('dash')) return 'application/dash+xml';
+      } catch (e) {
+        AppLog.add('CAST', 'probe $method ✗ $e');
+      }
+    }
+  } finally {
+    c.close(force: true);
+  }
+  return mimeOf(url);
+}
+
+/// يعيد كتابة قايمة m3u8 علشان كل الأجزاء تعدّي على الموبايل (proxy)
+String rewriteM3u8(String text, Uri base, String Function(String absUrl) mk) {
+  final out = StringBuffer();
+  for (final raw in const LineSplitter().convert(text)) {
+    final line = raw.trim();
+    if (line.isEmpty) {
+      out.writeln(raw);
+    } else if (line.startsWith('#')) {
+      out.writeln(line.replaceAllMapped(RegExp(r'URI="([^"]+)"'), (m) => 'URI="${mk(base.resolve(m[1]!).toString())}"'));
+    } else {
+      out.writeln(mk(base.resolve(line).toString()));
+    }
+  }
+  return out.toString();
+}
+
+class _Shared {
+  final File? file;
+  final String? remote;
+  final Map<String, String> headers;
+  final String mime;
+  String? subtitleUrl;
+  _Shared({this.file, this.remote, this.headers = const {}, required this.mime, this.subtitleUrl});
+}
+
+/// سيرفر صغير جوه الموبايل: بيقدّم ملفات الموبايل، وبيعدّي روابط النت اللي محتاجة هيدرز/HTTPS (زي وضع الـproxy في Web Video Caster)
 class MediaServer {
   MediaServer._();
   static final MediaServer I = MediaServer._();
   HttpServer? _srv;
-  final Map<String, File> _files = {};
+  final Map<String, _Shared> _items = {};
+  final Map<String, String> _byKey = {};
+  String _host = '';
 
-  Future<String> share(File f, String phoneIp) async {
+  Future<String> _base(String phoneIp) async {
     _srv ??= await _start();
-    final id = '${_files.length + 1}';
-    _files[id] = f;
-    final name = Uri.encodeComponent(f.uri.pathSegments.last);
-    return 'http://$phoneIp:${_srv!.port}/f/$id/$name';
+    _host = phoneIp;
+    return 'http://$phoneIp:${_srv!.port}';
+  }
+
+  String _id(String key, _Shared Function() make) {
+    final old = _byKey[key];
+    if (old != null) return old;
+    final id = '${_items.length + 1}';
+    _items[id] = make();
+    _byKey[key] = id;
+    return id;
+  }
+
+  static String _name(String s) {
+    final n = s.split('?').first.split('/').where((x) => x.isNotEmpty).lastOrNull ?? 'media';
+    return Uri.encodeComponent(n.length > 60 ? n.substring(n.length - 60) : n);
+  }
+
+  Future<String> share(File f, String phoneIp, {String? subtitleUrl}) async {
+    final b = await _base(phoneIp);
+    final id = _id('f:${f.path}', () => _Shared(file: f, mime: mimeOf(f.path), subtitleUrl: subtitleUrl));
+    if (subtitleUrl != null) _items[id]!.subtitleUrl = subtitleUrl;
+    return '$b/f/$id/${_name(f.path)}';
+  }
+
+  Future<String> proxy(String url, Map<String, String> headers, String phoneIp, {String? mime}) async {
+    final b = await _base(phoneIp);
+    final id = _id('p:$url', () => _Shared(remote: url, headers: Map.of(headers), mime: mime ?? mimeOf(url)));
+    return '$b/p/$id/${_name(url)}';
   }
 
   Future<HttpServer> _start() async {
     final s = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+    s.autoCompress = false;
+    s.idleTimeout = const Duration(seconds: 60);
     AppLog.add('CAST', 'media server on port ${s.port}');
-    s.listen(_handle, onError: (e) => AppLog.add('CAST', 'server error $e'));
+    s.listen((q) => _handle(q), onError: (e) => AppLog.add('CAST', 'server error $e'));
     return s;
+  }
+
+  void _dlnaHeaders(HttpResponse res, String mime, _Shared it) {
+    res.headers.set('transferMode.dlna.org', mime.startsWith('image') ? 'Interactive' : 'Streaming');
+    res.headers.set('contentFeatures.dlna.org', dlnaFeatures(mime));
+    res.headers.set('Access-Control-Allow-Origin', '*');
+    if (it.subtitleUrl != null) res.headers.set('CaptionInfo.sec', it.subtitleUrl!);
   }
 
   Future<void> _handle(HttpRequest q) async {
     final seg = q.uri.pathSegments;
     final res = q.response;
     try {
-      if (seg.length < 2 || seg[0] != 'f' || !_files.containsKey(seg[1])) {
+      final it = seg.length >= 2 ? _items[seg[1]] : null;
+      if (it == null || (seg[0] != 'f' && seg[0] != 'p')) {
         res.statusCode = 404;
         await res.close();
         return;
       }
-      final f = _files[seg[1]]!;
-      final len = await f.length();
-      res.headers.set('Content-Type', mimeOf(f.path));
-      res.headers.set('Accept-Ranges', 'bytes');
-      res.headers.set('transferMode.dlna.org', 'Streaming');
-      res.headers.set('contentFeatures.dlna.org', 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000');
-      final range = parseRange(q.headers.value('range'), len);
-      AppLog.add('CAST', 'serve ${q.method} ${f.path.split('/').last} range=${q.headers.value('range')}');
-      if (range != null) {
-        res.statusCode = HttpStatus.partialContent;
-        res.headers.set('Content-Range', 'bytes ${range.$1}-${range.$2}/$len');
-        res.contentLength = range.$2 - range.$1 + 1;
-        if (q.method != 'HEAD') await res.addStream(f.openRead(range.$1, range.$2 + 1));
+      AppLog.add('CAST', 'serve ${q.method} /${seg[0]}/${seg[1]} from ${q.connectionInfo?.remoteAddress.address} range=${q.headers.value('range')}');
+      if (it.file != null) {
+        await _serveFile(q, it);
       } else {
-        res.contentLength = len;
-        if (q.method != 'HEAD') await res.addStream(f.openRead());
+        await _serveProxy(q, it);
       }
-      await res.close();
     } catch (e) {
       AppLog.add('CAST', 'serve error $e');
       try {
@@ -4082,17 +4728,99 @@ class MediaServer {
       } catch (_) {}
     }
   }
+
+  Future<void> _serveFile(HttpRequest q, _Shared it) async {
+    final res = q.response;
+    final f = it.file!;
+    final len = await f.length();
+    res.headers.set('Content-Type', it.mime);
+    res.headers.set('Accept-Ranges', 'bytes');
+    _dlnaHeaders(res, it.mime, it);
+    final range = parseRange(q.headers.value('range'), len);
+    if (q.headers.value('range') != null && range == null) {
+      res.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+      res.headers.set('Content-Range', 'bytes */$len');
+      await res.close();
+      return;
+    }
+    if (range != null) {
+      res.statusCode = HttpStatus.partialContent;
+      res.headers.set('Content-Range', 'bytes ${range.$1}-${range.$2}/$len');
+      res.contentLength = range.$2 - range.$1 + 1;
+      if (q.method != 'HEAD') await res.addStream(f.openRead(range.$1, range.$2 + 1));
+    } else {
+      res.contentLength = len;
+      if (q.method != 'HEAD') await res.addStream(f.openRead());
+    }
+    await res.close();
+  }
+
+  Future<void> _serveProxy(HttpRequest q, _Shared it) async {
+    final res = q.response;
+    final c = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10)
+      ..badCertificateCallback = (_, __, ___) => true;
+    try {
+      final up = Uri.parse(it.remote!);
+      final hls = isHlsMime(it.mime) || extOf(it.remote!) == 'm3u8';
+      final rq = await c.openUrl(q.method == 'HEAD' && !hls ? 'HEAD' : 'GET', up);
+      it.headers.forEach(rq.headers.set);
+      final range = q.headers.value('range');
+      if (range != null && !hls) rq.headers.set('Range', range);
+      final rs = await rq.close();
+      final ct = rs.headers.contentType?.mimeType.toLowerCase() ?? '';
+      AppLog.add('CAST', 'proxy ← ${rs.statusCode} $ct len=${rs.contentLength}');
+      if (hls || ct.contains('mpegurl')) {
+        final body = await utf8.decodeStream(rs);
+        final finalUri = rs.redirects.isEmpty ? up : up.resolveUri(rs.redirects.last.location);
+        final base = 'http://$_host:${_srv!.port}';
+        final text = body.trimLeft().startsWith('#EXTM3U')
+            ? rewriteM3u8(body, finalUri, (abs) {
+                final id = _id('p:$abs', () => _Shared(remote: abs, headers: it.headers, mime: extOf(abs) == 'm3u8' ? 'application/x-mpegURL' : 'video/mp2t'));
+                return '$base/p/$id/${_name(abs)}';
+              })
+            : body;
+        final bytes = utf8.encode(text);
+        res.statusCode = rs.statusCode >= 400 ? rs.statusCode : 200;
+        res.headers.set('Content-Type', 'application/x-mpegURL');
+        res.headers.set('Cache-Control', 'no-cache');
+        _dlnaHeaders(res, 'application/x-mpegURL', it);
+        res.contentLength = bytes.length;
+        if (q.method != 'HEAD') res.add(bytes);
+        await res.close();
+        return;
+      }
+      res.statusCode = rs.statusCode;
+      final mime = (ct.isEmpty || ct.contains('octet') || ct.contains('text/plain')) ? it.mime : ct;
+      res.headers.set('Content-Type', mime);
+      res.headers.set('Accept-Ranges', 'bytes');
+      final cr = rs.headers.value('content-range');
+      if (cr != null) res.headers.set('Content-Range', cr);
+      if (rs.contentLength >= 0) res.contentLength = rs.contentLength;
+      _dlnaHeaders(res, mime, it);
+      if (q.method == 'HEAD') {
+        rs.drain<void>().catchError((_) {});
+      } else {
+        await res.addStream(rs);
+      }
+      await res.close();
+    } finally {
+      c.close();
+    }
+  }
 }
 
 /// "bytes=100-" → (100, len-1)
 (int, int)? parseRange(String? h, int len) {
   if (h == null || len <= 0) return null;
-  final m = RegExp(r'bytes=(\d*)-(\d*)').firstMatch(h);
+  final m = RegExp(r'bytes\s*=\s*(\d*)\s*-\s*(\d*)').firstMatch(h);
   if (m == null) return null;
   final a = m[1]!, b = m[2]!;
+  if (a.isEmpty && b.isEmpty) return null;
   int start, end;
   if (a.isEmpty) {
     final n = int.tryParse(b) ?? 0;
+    if (n <= 0) return null;
     start = (len - n).clamp(0, len - 1);
     end = len - 1;
   } else {
@@ -4162,7 +4890,12 @@ List<int> gmDeobfuscate(List<int> b) => [for (final x in b.reversed) x ^ 0x5B];
 class StbInfo {
   final String serial, model, ip;
   final int platform, swVersion, swSub, flags;
-  StbInfo(this.serial, this.model, this.ip, this.platform, this.swVersion, this.swSub, this.flags);
+  /// البايت 85 من بلوك الدخول: bit0 = SatFinder، bit1 = DLNA، bit2 = OTT (GsMobileLoginInfo في G-MScreen)
+  final int flags2;
+  StbInfo(this.serial, this.model, this.ip, this.platform, this.swVersion, this.swSub, this.flags, [this.flags2 = -1]);
+  /// null = مش معروف (ريسيفر اتلقط من البث بس)
+  bool? get satFinder => flags2 < 0 ? null : (flags2 & 0x01) != 0;
+  bool get spectrum => (flags & 0x80) != 0;
   bool get noFreeSlot => flags & 0x01 != 0;
   bool get useJson => flags & 0x40 != 0;
   bool get satMenu => flags & 0x04 != 0;
@@ -4196,15 +4929,25 @@ StbInfo? gmParseLoginBlock(List<int> raw) {
   }
   final model = ascii.decode(p.sublist(20, mEnd), allowInvalid: true).trim();
   final ip = '${p[71]}.${p[70]}.${p[69]}.${p[68]}';
-  return StbInfo(serial, model, ip, p[72], be(73, 2), le(80, 4), p[84]);
+  return StbInfo(serial, model, ip, p[72], be(73, 2), le(80, 4), p[84], p[85]);
 }
 
 /// تحويل الطلب لـ JSON (كل القيم نصوص) أو XML حسب الريسيفر
+/// رقم يتبعت رقم (مش نص) في JSON — G-MScreen بيبعت طلبات الـSatFinder (402) كده
+class GmNum {
+  final int v;
+  const GmNum(this.v);
+  @override
+  String toString() => '$v';
+}
+
 String gmEncode(int request, Map<String, dynamic> fields, {required bool json}) {
   if (json) {
     final m = <String, dynamic>{'request': '$request'};
     fields.forEach((k, v) {
-      if (v is List) {
+      if (v is GmNum) {
+        m[k] = v.v;
+      } else if (v is List) {
         m[k] = [for (final e in v) (e as Map).map((a, b) => MapEntry('$a', '$b'))];
       } else {
         m[k] = '$v';
@@ -4365,6 +5108,8 @@ class K {
 class GmClient extends ChangeNotifier {
   String host;
   GmClient(this.host);
+  /// الاتصال المفتوح حاليًا من تبويب الريسيفر (الريسيفر بيقبل موبايل واحد بس، فالكاست بيستخدم نفس الاتصال)
+  static GmClient? active;
   Socket? _s;
   StreamSubscription? _sub;
   Timer? _keep;
@@ -4410,8 +5155,9 @@ class GmClient extends ChangeNotifier {
     }
     info = i;
     json = i.useJson;
-    AppLog.add('STB', 'login ok model=${i.model} sn=${i.serial} platform=${i.platform} sw=${i.swVersion}.${i.swSub} flags=0x${i.flags.toRadixString(16)} ${json ? 'JSON' : 'XML'}');
+    AppLog.add('STB', 'login ok model=${i.model} sn=${i.serial} platform=${i.platform} sw=${i.swVersion}.${i.swSub} flags=0x${i.flags.toRadixString(16)} flags2=0x${i.flags2.toRadixString(16)} satfinder=${i.satFinder} ${json ? 'JSON' : 'XML'}');
     _keep = Timer.periodic(const Duration(seconds: 10), (_) => send(26, {}, reply: false).catchError((_) => null));
+    GmClient.active = this;
     notifyListeners();
     return i;
   }
@@ -4455,6 +5201,7 @@ class GmClient extends ChangeNotifier {
   }
 
   Future<void> disconnect() async {
+    if (GmClient.active == this) GmClient.active = null;
     _keep?.cancel();
     _keep = null;
     await _sub?.cancel();
@@ -4557,7 +5304,211 @@ class GmClient extends ChangeNotifier {
   }
 
   Future<void> stopStream() => send(1012, {}, reply: false);
+
+  // ---------- ضبط الطبق (SatFinder) — من G-MScreen 1.0.22176: mktvsmart.screen.satfinder.l ----------
+  /// 401 = ابدأ وضع الـSatFinder (الرد status 0 = تمام)
+  Future<void> finderStart() => send(401, {}, timeout: const Duration(seconds: 8));
+
+  /// 402 = اقفل على ترددة (الريسيفر بيعمل tune عليها)
+  Future<void> finderLock(FinderCfg c) => send(402, gmFinderLockFields(c), timeout: const Duration(seconds: 10));
+
+  /// 403 = اقرا القوة والجودة: [{"strength":N,"quality":N}] من 0 لـ 100
+  Future<SignalReading> finderSq() async => gmParseSq(await send(403, {}, timeout: const Duration(seconds: 4)));
+
+  /// 405 = اخرج من وضع الـSatFinder
+  Future<void> finderEnd() => send(405, {}, reply: false);
+
+  // ---------- تعديل القنوات — من GsChannelListFragment + JsonParser.serialize ----------
+  /// 1001 = تغيير اسم قناة
+  Future<void> renameChannel(StbChannel c, String name) => _sendLoose(1001, gmRenameFields(c, name));
+
+  /// 1002 = مسح قنوات (نهائي من على الريسيفر)
+  Future<void> deleteChannels(List<StbChannel> list) => _sendLoose(1002, gmDeleteFields(list));
+
+  /// 1050 = مؤقت النوم (0 = اقفله) — من GsParentControlActivity
+  Future<void> setSleep(int minutes) => _sendLoose(1050, gmSleepFields(minutes));
+
+  // ---- العرض على الريسيفر بطريقة G-MScreen نفسه (1063 + 31) ----
+  // من BaseCastViewModel / UrlLinkViewModel / LiveScreenActivity: 1063 = {mediaType, actionCode, url, seekTime}
+  // mediaType: 0 فيديو، 1 صورة، 2 صوت. actionCode: 0 تشغيل، 1 كمّل، 2 إيقاف مؤقت، 3 وقف، 4 تقديم (seekTime بالملي ثانية)
+  Future<void> castSend(int mediaType, int action, String url, {int seekMs = 0}) =>
+      _sendLoose(1063, gmCastFields(mediaType, action, url, seekMs));
+
+  /// 31 = حالة التشغيل (stateCode 0 شغال، 1 متوقف مؤقت، 2 واقف، 3 فاضي؛ الأوقات بالملي ثانية)
+  Future<GmCastInfo?> castInfo() async {
+    try {
+      return gmParseCastInfo(await send(31, {}, timeout: const Duration(seconds: 4)));
+    } catch (e) {
+      AppLog.add('STB', 'cast info ✗ $e');
+      return null;
+    }
+  }
+
+  // ---- المؤقتات (SubEventTimerDispFragment / SubTimerAddTimerActivity) ----
+  /// 1 = قايمة المؤقتات
+  Future<List<GmTimer>> timers() async => gmParseTimers(await send(1, {}, timeout: const Duration(seconds: 8)));
+
+  /// 11 = وقت الريسيفر
+  Future<DateTime?> stbTime() async {
+    try {
+      return gmParseStbTime(await send(11, {}, timeout: const Duration(seconds: 5)));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 1021 إضافة / 1022 تعديل. لو الريسيفر رد بـ 15 يبقى في تعارض مع مؤقت تاني ورقمه في Data
+  Future<int?> saveTimer(GmTimer t, {required bool edit}) async {
+    final req = edit ? 1022 : 1021;
+    final p = await sendPacket(req, {'array': [gmTimerFields(t)]});
+    if (p == null || p.status == 0) return null;
+    if (p.status == 15) {
+      final d = gmDecodeBody(p.body, json);
+      final m = GmClient.first(d);
+      return int.tryParse('${m['Data'] ?? ''}') ?? -1;
+    }
+    throw StateError(kStbStatus[p.status] ?? 'الريسيفر رفض المؤقت (${p.status})');
+  }
+
+  /// 1023 = استبدال المؤقت اللي متعارض (رقمه من رد 15)
+  Future<void> replaceTimer(GmTimer t, int conflictIndex) =>
+      _sendLoose(1023, {'array': [gmTimerFields(t.copyWithIndex(conflictIndex))]});
+
+  /// 1020 = مسح مؤقت (TimerIndex = ترتيبه في القايمة)
+  Future<void> deleteTimer(GmTimer t) => _sendLoose(1020, {'array': [gmTimerFields(t)]});
+
+  /// زي send بس بيرجّع الرد كله من غير ما يرمي خطأ لو الحالة مش 0 (null لو مفيش رد)
+  Future<GmPacket?> sendPacket(int request, Map<String, dynamic> fields, {Duration timeout = const Duration(seconds: 6)}) async {
+    if (_s == null) await connect();
+    final body = gmEncode(request, fields, json: json);
+    AppLog.add('STB', '→ $request $body');
+    _wait.remove(request);
+    final c = _wait[request] = Completer<GmPacket>();
+    _s!.add(gmFrame(utf8.encode(body)));
+    try {
+      return await c.future.timeout(timeout);
+    } on TimeoutException {
+      _wait.remove(request);
+      AppLog.add('STB', 'no reply to $request');
+      return null;
+    }
+  }
+
+  /// G-MScreen نفسه مش بيستنى رد على الطلبات دي — بنستنى شوية، ولو مفيش رد نكمّل
+  Future<void> _sendLoose(int req, Map<String, dynamic> f) async {
+    try {
+      await send(req, f, timeout: const Duration(seconds: 5));
+    } on TimeoutException {
+      AppLog.add('STB', 'no reply to $req (normal for G-MScreen) — continuing');
+    }
+  }
 }
+
+/// إعدادات الترددة اللي بنقيس عليها (نفس حقول DataConvertLockTpSettingInfo)
+class FinderCfg {
+  final String satName;
+  final double angle; // بالدرجات
+  final int dir; // 0 = شرق، 1 = غرب
+  final int freq; // MHz
+  final int sym; // kS/s
+  final int pol; // 0 = H، 1 = V
+  final int lnbType, lnbPower, k22, diseqc; // أرقام من القوايم اللي تحت
+  const FinderCfg({this.satName = 'Nilesat', this.angle = 7.0, this.dir = 1, this.freq = 0, this.sym = 27500, this.pol = 0, this.lnbType = 0, this.lnbPower = 0, this.k22 = 0, this.diseqc = 0});
+  FinderCfg copyWith({String? satName, double? angle, int? dir, int? freq, int? sym, int? pol, int? lnbType, int? lnbPower, int? k22, int? diseqc}) => FinderCfg(
+      satName: satName ?? this.satName, angle: angle ?? this.angle, dir: dir ?? this.dir, freq: freq ?? this.freq, sym: sym ?? this.sym, pol: pol ?? this.pol,
+      lnbType: lnbType ?? this.lnbType, lnbPower: lnbPower ?? this.lnbPower, k22: k22 ?? this.k22, diseqc: diseqc ?? this.diseqc);
+  Map<String, dynamic> toJson() => {'satName': satName, 'angle': angle, 'dir': dir, 'freq': freq, 'sym': sym, 'pol': pol, 'lnbType': lnbType, 'lnbPower': lnbPower, 'k22': k22, 'diseqc': diseqc};
+  static FinderCfg fromJson(Map m) {
+    int i(String k, int d) => int.tryParse('${m[k] ?? ''}') ?? d;
+    return FinderCfg(satName: '${m['satName'] ?? 'Nilesat'}', angle: double.tryParse('${m['angle'] ?? ''}') ?? 7.0, dir: i('dir', 1), freq: i('freq', 0), sym: i('sym', 27500), pol: i('pol', 0),
+        lnbType: i('lnbType', 0), lnbPower: i('lnbPower', 0), k22: i('k22', 0), diseqc: i('diseqc', 0));
+  }
+}
+
+// نفس القوايم اللي في G-MScreen (res/values/arrays.xml) — الريسيفر بياخد النص والرقم الاتنين
+const kLnbTypes = ['Universal', '9750/10750', '5150/5750', '5750/5150', 'Unicable A', 'Unicable B', 'Unicable C', 'Unicable D', '05150', '05750', '09750', '10600', '10700', '10750'];
+const kLnbPowers = ['13V/18V', '13V', '18V', '0V'];
+const k22kModes = ['Off', 'On', 'Auto'];
+const kDiseqcModes = ['None', 'LNB1', 'LNB2', 'LNB3', 'LNB4', 'Burst A', 'Burst B', 'Auto'];
+
+/// أشهر الأقمار اللي بتتشاف من مصر (الزاوية + الاتجاه)
+const kSatPresets = <(String, double, int)>[
+  ('Nilesat 7°W', 7.0, 1),
+  ('Eutelsat 8°W', 8.0, 1),
+  ('Badr / Arabsat 26°E', 26.0, 0),
+  ('Es\'hailSat 25.5°E', 25.5, 0),
+  ('Arabsat 30.5°E', 30.5, 0),
+  ('Hotbird 13°E', 13.0, 0),
+  ('Turksat 42°E', 42.0, 0),
+  ('Yahsat 52.5°E', 52.5, 0),
+];
+
+String _idx(List<String> l, int i) => l[i.clamp(0, l.length - 1)];
+
+Map<String, dynamic> gmFinderLockFields(FinderCfg c) => {
+      'sat_angle': GmNum((c.angle * 10).round()),
+      'sat_direction': GmNum(c.dir),
+      'cur_tuned_freq': GmNum(c.freq),
+      'request_sym': GmNum(c.sym),
+      'vertical_polor': GmNum(c.pol),
+      'lnb_type_string': _idx(kLnbTypes, c.lnbType),
+      'lnb_type_index': GmNum(c.lnbType.clamp(0, kLnbTypes.length - 1)),
+      'lnb_power_string': _idx(kLnbPowers, c.lnbPower),
+      'lnb_power_index': GmNum(c.lnbPower.clamp(0, kLnbPowers.length - 1)),
+      '22K_string': _idx(k22kModes, c.k22),
+      '22K_index': GmNum(c.k22.clamp(0, k22kModes.length - 1)),
+      'diseqc10_string': _idx(kDiseqcModes, c.diseqc),
+      'diseqc10_index': GmNum(c.diseqc.clamp(0, kDiseqcModes.length - 1)),
+    };
+
+/// رد 403: G-MScreen بيقرا "strength" و"quality" (0–100) ويعرضهم %
+SignalReading gmParseSq(dynamic r) {
+  Map? m;
+  if (r is List && r.isNotEmpty && r.first is Map) m = r.first as Map;
+  if (r is Map) m = r;
+  if (m == null) return const SignalReading();
+  double? v(String k) {
+    final d = double.tryParse('${m![k] ?? ''}');
+    return d?.clamp(0, 100).toDouble();
+  }
+
+  return SignalReading(strength: v('strength'), quality: v('quality'));
+}
+
+/// الترددة من بيانات القناة (لو الريسيفر بيبعتها في قايمة القنوات)
+FinderCfg? finderFromChannel(FinderCfg base, Map<String, dynamic> raw) {
+  int? n(List<String> ks) {
+    for (final k in ks) {
+      final x = int.tryParse('${raw[k] ?? ''}'.trim());
+      if (x != null && x > 0) return x;
+    }
+    return null;
+  }
+
+  final f = n(['Freq', 'Frequency', 'TpFreq']);
+  if (f == null) return null;
+  var sr = n(['SR', 'SymbolRate', 'Sym']) ?? base.sym;
+  if (sr > 100000) sr = sr ~/ 1000; // لو جاي بالـS/s
+  final pv = '${raw['POL'] ?? raw['Polar'] ?? raw['Pol'] ?? ''}'.trim().toUpperCase();
+  final pol = pv.startsWith('V') || pv == '1' ? 1 : (pv.startsWith('H') || pv == '0' ? 0 : base.pol);
+  return base.copyWith(freq: f > 100000 ? f ~/ 1000 : f, sym: sr, pol: pol);
+}
+
+Map<String, dynamic> gmRenameFields(StbChannel c, String name) => {
+      'array': [
+        {'TvState': c.radio ? '1' : '0', 'ProgramId': c.id, 'ProgramName': name}
+      ]
+    };
+
+Map<String, dynamic> gmDeleteFields(List<StbChannel> list) => {
+      'TvState': list.isNotEmpty && list.first.radio ? '1' : '0',
+      'array': [
+        for (final c in list) {'ProgramId': c.id}
+      ],
+      'TotalNum': '${list.length}',
+    };
+
+Map<String, dynamic> gmSleepFields(int minutes) => minutes <= 0 ? {'SleepSwitch': '0'} : {'SleepSwitch': '1', 'SleepTime': '$minutes'};
 
 /// بيسمع إعلانات الريسيفرات على UDP 25860 (الريسيفر هو اللي بيبعت، مش إحنا)
 Future<Map<String, StbInfo>> discoverReceivers({Duration wait = const Duration(seconds: 6)}) async {
@@ -4584,4 +5535,377 @@ Future<Map<String, StbInfo>> discoverReceivers({Duration wait = const Duration(s
     await Native.multicastLock(false);
   }
   return found;
+}
+
+
+// ======== كاست + مؤقتات بطريقة G-MScreen (من قراءة كود التطبيق الرسمي 1.0.22176) ========
+int gmMediaTypeFor(String mime) => mime.startsWith('image') ? 1 : mime.startsWith('audio') ? 2 : 0;
+
+/// JsonParser.serialize حالة 1063 (DataConvertCastPlayModel): الأرقام بتتبعت أرقام مش نص
+Map<String, dynamic> gmCastFields(int mediaType, int action, String url, int seekMs) => {
+      'mediaType': GmNum(mediaType),
+      'actionCode': GmNum(action),
+      'url': url,
+      'seekTime': GmNum(seekMs),
+    };
+
+class GmCastInfo {
+  final int mediaType, state, currentMs, totalMs;
+  final String title, url;
+  GmCastInfo(this.mediaType, this.state, this.currentMs, this.totalMs, this.title, this.url);
+  String get stateName => const {0: 'PLAYING', 1: 'PAUSED_PLAYBACK', 2: 'STOPPED', 3: 'NO_MEDIA_PRESENT'}[state] ?? '$state';
+}
+
+/// JsonParser.parse النوع 35 (رد طلب 31)
+GmCastInfo? gmParseCastInfo(dynamic r) {
+  final m = GmClient.first(r);
+  if (m.isEmpty) return null;
+  int i(String k, int d) => int.tryParse('${m[k] ?? ''}') ?? d;
+  return GmCastInfo(i('mediaType', -1), i('stateCode', 3), i('currentTime', 0), i('totalTime', 0), '${m['title'] ?? ''}', '${m['url'] ?? ''}');
+}
+
+class GmTimer {
+  final int index; // ترتيبه في قايمة الريسيفر
+  final String programId, programName;
+  final int month, day, startH, startM, endH, endM; // endH ممكن تبقى 24+ لو بيخلص تاني يوم
+  final int repeat; // 0 مرة، 1 يومي، 2 أسبوعي، 3 أيام الشغل، 4 الويك إند
+  final int status; // bit 2 = تسجيل، bit 8 = يقفل الريسيفر بعده
+  final int eventId;
+  const GmTimer({this.index = 0, required this.programId, this.programName = '', required this.month, required this.day, required this.startH, required this.startM, required this.endH, required this.endM, this.repeat = 0, this.status = 0, this.eventId = 0});
+  bool get record => status & 2 == 2;
+  bool get standby => status & 8 == 8;
+  GmTimer copyWithIndex(int i) => GmTimer(index: i, programId: programId, programName: programName, month: month, day: day, startH: startH, startM: startM, endH: endH, endM: endM, repeat: repeat, status: status, eventId: eventId);
+}
+
+const kTimerRepeats = ['مرة واحدة', 'يومي', 'أسبوعي', 'أيام الشغل', 'الويك إند'];
+
+/// JsonParser.serialize حالة 1020-1023 (DataConvertTimeModel) — كله نص
+Map<String, String> gmTimerFields(GmTimer t) => {
+      'TimerIndex': '${t.index}',
+      'TimerProgramId': t.programId,
+      'TimerMonth': '${t.month}',
+      'TimerDay': '${t.day}',
+      'TimerStartHour': '${t.startH}',
+      'TimerStartMin': '${t.startM}',
+      'TimerEndHour': '${t.endH}',
+      'TimerEndMin': '${t.endM}',
+      'TimerRepeat': '${t.repeat}',
+      'TimerStatus': '${t.status}',
+      'TimerEventID': '${t.eventId}',
+    };
+
+/// JsonParser.parse النوع 1 (رد طلب 1) — الترتيب هو رقم المؤقت
+List<GmTimer> gmParseTimers(dynamic r) {
+  final out = <GmTimer>[];
+  if (r is! List) return out;
+  var k = 0;
+  for (final e in r) {
+    if (e is! Map) continue;
+    int i(String key) => int.tryParse('${e[key] ?? ''}') ?? 0;
+    out.add(GmTimer(
+        index: k++,
+        programId: '${e['TimerProgramSatTpId'] ?? e['TimerProgramId'] ?? ''}',
+        programName: '${e['TimerProgramName'] ?? ''}',
+        month: i('TimerMonth'),
+        day: i('TimerDay'),
+        startH: i('TimerStartHour'),
+        startM: i('TimerStartMin'),
+        endH: i('TimerEndHour'),
+        endM: i('TimerEndMin'),
+        repeat: i('TimerRepeat'),
+        status: i('TimerStatus'),
+        eventId: i('TimerEventID')));
+  }
+  return out;
+}
+
+/// JsonParser.parse النوع 9 (رد طلب 11)
+DateTime? gmParseStbTime(dynamic r) {
+  final m = GmClient.first(r);
+  int? i(String k) => int.tryParse('${m[k] ?? ''}');
+  final y = i('StbYear'), mo = i('StbMonth'), d = i('StbDay');
+  if (y == null || mo == null || d == null || y < 2000) return null;
+  return DateTime(y, mo, d, i('StbHour') ?? 0, i('StbMin') ?? 0);
+}
+
+
+// ---------------- المؤقتات ----------------
+class TimersPage extends StatefulWidget {
+  final GmClient gm;
+  final List<StbChannel> channels;
+  final String? playingId;
+  const TimersPage({super.key, required this.gm, required this.channels, this.playingId});
+  @override
+  State<TimersPage> createState() => _TimersPageState();
+}
+
+class _TimersPageState extends State<TimersPage> {
+  List<GmTimer> list = [];
+  bool busy = true;
+  String msg = '';
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    setState(() => busy = true);
+    try {
+      list = await widget.gm.timers();
+      msg = list.isEmpty ? 'مفيش مؤقتات' : '';
+    } catch (e) {
+      msg = 'مقدرتش أقرا المؤقتات: $e';
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  String _hm(int h, int m) => '${h % 24}:${m.toString().padLeft(2, '0')}${h >= 24 ? ' (+1 يوم)' : ''}';
+
+  Future<void> edit([GmTimer? t]) async {
+    final r = await Navigator.push<GmTimer>(
+        context, MaterialPageRoute(builder: (_) => TimerEditPage(gm: widget.gm, channels: widget.channels, playingId: widget.playingId, timer: t, nextIndex: list.length)));
+    if (r == null || !mounted) return;
+    setState(() => busy = true);
+    try {
+      final conflict = await widget.gm.saveTimer(r, edit: t != null);
+      if (conflict != null && mounted) {
+        final name = (conflict >= 0 && conflict < list.length) ? '«${list[conflict].programName}» ${_hm(list[conflict].startH, list[conflict].startM)}' : 'مؤقت تاني';
+        if (await confirm(context, 'الوقت ده متعارض مع $name.\nتستبدله بالمؤقت الجديد؟')) {
+          await widget.gm.replaceTimer(r, conflict);
+        }
+      }
+      if (mounted) toast(context, 'اتحفظ ✓');
+    } catch (e) {
+      if (mounted) toast(context, 'فشل: $e');
+    }
+    await load();
+  }
+
+  Future<void> del(GmTimer t) async {
+    if (!await confirm(context, 'تمسح مؤقت «${t.programName}»؟')) return;
+    setState(() => busy = true);
+    try {
+      await widget.gm.deleteTimer(t);
+    } catch (e) {
+      if (mounted) toast(context, 'فشل: $e');
+    }
+    await load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('مؤقتات الريسيفر'), actions: [IconButton(onPressed: busy ? null : load, icon: const Icon(Icons.refresh))]),
+      floatingActionButton: FloatingActionButton.extended(onPressed: busy ? null : () => edit(), icon: const Icon(Icons.add_alarm), label: const Text('مؤقت جديد')),
+      body: busy
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(children: [
+              if (msg.isNotEmpty) Padding(padding: const EdgeInsets.all(16), child: Text(msg, style: const TextStyle(color: kMuted))),
+              for (final t in list)
+                Card(
+                  child: ListTile(
+                    leading: Icon(t.record ? Icons.fiber_manual_record : Icons.alarm, color: t.record ? Colors.redAccent : kGold),
+                    title: Text(t.programName.isEmpty ? 'قناة ${t.programId}' : t.programName, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    subtitle: Text('${t.day}/${t.month}  •  ${_hm(t.startH, t.startM)} ← ${_hm(t.endH, t.endM)}\n'
+                        '${kTimerRepeats[t.repeat.clamp(0, kTimerRepeats.length - 1)]}${t.record ? ' • تسجيل' : ''}${t.standby ? ' • يقفل بعده' : ''}'),
+                    isThreeLine: true,
+                    onTap: () => edit(t),
+                    trailing: IconButton(icon: const Icon(Icons.delete_outline), onPressed: () => del(t)),
+                  ),
+                ),
+              const SizedBox(height: 80),
+            ]),
+    );
+  }
+}
+
+class TimerEditPage extends StatefulWidget {
+  final GmClient gm;
+  final List<StbChannel> channels;
+  final String? playingId;
+  final GmTimer? timer;
+  final int nextIndex;
+  const TimerEditPage({super.key, required this.gm, required this.channels, this.playingId, this.timer, required this.nextIndex});
+  @override
+  State<TimerEditPage> createState() => _TimerEditPageState();
+}
+
+class _TimerEditPageState extends State<TimerEditPage> {
+  String programId = '', programName = '';
+  int month = 1, day = 1, sh = 0, sm = 0, eh = 0, em = 0, repeat = 0, status = 0;
+  DateTime? stbNow;
+
+  @override
+  void initState() {
+    super.initState();
+    final t = widget.timer;
+    if (t != null) {
+      programId = t.programId;
+      programName = t.programName;
+      month = t.month;
+      day = t.day;
+      sh = t.startH;
+      sm = t.startM;
+      eh = t.endH % 24;
+      em = t.endM;
+      repeat = t.repeat;
+      status = t.status;
+    } else {
+      final ch = widget.channels.where((c) => c.id == widget.playingId).firstOrNull ?? widget.channels.firstOrNull;
+      programId = ch?.id ?? '';
+      programName = ch?.name ?? '';
+      final n = DateTime.now();
+      month = n.month;
+      day = n.day;
+      sh = eh = n.hour;
+      sm = em = n.minute;
+    }
+    widget.gm.stbTime().then((d) {
+      if (d == null || !mounted) return;
+      setState(() {
+        stbNow = d;
+        if (widget.timer == null) {
+          month = d.month;
+          day = d.day;
+          sh = eh = d.hour;
+          sm = em = d.minute;
+        }
+      });
+    });
+  }
+
+  Future<void> pickChannel() async {
+    final q = TextEditingController();
+    final r = await showModalBottomSheet<StbChannel>(
+      context: context,
+      isScrollControlled: true,
+      builder: (c) => StatefulBuilder(builder: (c, ss) {
+        final f = q.text.trim().toLowerCase();
+        final shown = widget.channels.where((x) => !x.radio && (f.isEmpty || x.name.toLowerCase().contains(f))).take(300).toList();
+        return SafeArea(
+          child: SizedBox(
+            height: MediaQuery.of(c).size.height * .8,
+            child: Column(children: [
+              Padding(padding: const EdgeInsets.all(8), child: TextField(controller: q, onChanged: (_) => ss(() {}), decoration: const InputDecoration(hintText: 'دوّر على قناة', prefixIcon: Icon(Icons.search)))),
+              Expanded(
+                child: ListView(children: [for (final ch in shown) ListTile(title: Text(ch.name), onTap: () => Navigator.pop(c, ch))]),
+              ),
+            ]),
+          ),
+        );
+      }),
+    );
+    if (r != null) {
+      setState(() {
+        programId = r.id;
+        programName = r.name;
+      });
+    }
+  }
+
+  Future<void> pickDate() async {
+    final base = stbNow ?? DateTime.now();
+    final d = await showDatePicker(context: context, firstDate: DateTime(base.year, base.month, base.day), lastDate: base.add(const Duration(days: 60)), initialDate: _date());
+    if (d != null) {
+      setState(() {
+        month = d.month;
+        day = d.day;
+      });
+    }
+  }
+
+  DateTime _date() {
+    final base = stbNow ?? DateTime.now();
+    var d = DateTime(base.year, month, day);
+    if (d.isBefore(DateTime(base.year, base.month, base.day))) d = DateTime(base.year + 1, month, day);
+    final first = DateTime(base.year, base.month, base.day);
+    final last = base.add(const Duration(days: 60));
+    return d.isBefore(first) ? first : (d.isAfter(last) ? first : d);
+  }
+
+  Future<void> pickTime(bool start) async {
+    final t = await showTimePicker(context: context, initialTime: TimeOfDay(hour: start ? sh : eh, minute: start ? sm : em));
+    if (t == null) return;
+    setState(() {
+      if (start) {
+        sh = t.hour;
+        sm = t.minute;
+      } else {
+        eh = t.hour;
+        em = t.minute;
+      }
+    });
+  }
+
+  void save() {
+    if (programId.isEmpty) {
+      toast(context, 'اختار القناة');
+      return;
+    }
+    // زي M() في G-MScreen: لازم البداية تكون بعد وقت الريسيفر (للمؤقت اللي مرة واحدة)
+    final now = stbNow ?? DateTime.now();
+    final start = DateTime(_date().year, month, day, sh, sm);
+    if (repeat == 0 && start.isBefore(now)) {
+      toast(context, 'الوقت ده فات — اختار وقت بعد ${now.hour}:${now.minute.toString().padLeft(2, '0')}');
+      return;
+    }
+    Navigator.pop(
+        context,
+        GmTimer(
+            index: widget.timer?.index ?? widget.nextIndex,
+            programId: programId,
+            programName: programName,
+            month: month,
+            day: day,
+            startH: sh,
+            startM: sm,
+            endH: eh,
+            endM: em,
+            repeat: repeat,
+            status: status,
+            eventId: widget.timer?.eventId ?? 0));
+  }
+
+  String _hm(int h, int m) => '$h:${m.toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.timer == null ? 'مؤقت جديد' : 'تعديل المؤقت')),
+      body: ListView(children: [
+        if (stbNow != null)
+          Padding(padding: const EdgeInsets.all(12), child: Text('وقت الريسيفر: ${stbNow!.day}/${stbNow!.month} ${_hm(stbNow!.hour, stbNow!.minute)}', style: const TextStyle(color: kMuted))),
+        ListTile(leading: const Icon(Icons.tv), title: const Text('القناة'), subtitle: Text(programName.isEmpty ? programId : programName), onTap: pickChannel),
+        ListTile(leading: const Icon(Icons.event), title: const Text('اليوم'), subtitle: Text('$day/$month'), onTap: pickDate),
+        ListTile(leading: const Icon(Icons.play_circle_outline), title: const Text('البداية'), subtitle: Text(_hm(sh, sm)), onTap: () => pickTime(true)),
+        ListTile(
+            leading: const Icon(Icons.stop_circle_outlined),
+            title: const Text('النهاية'),
+            subtitle: Text('${_hm(eh, em)}${(eh * 60 + em) <= (sh * 60 + sm) ? '  (اليوم اللي بعده)' : ''}'),
+            onTap: () => pickTime(false)),
+        ListTile(
+          leading: const Icon(Icons.repeat),
+          title: const Text('التكرار'),
+          trailing: DropdownButton<int>(
+            value: repeat.clamp(0, kTimerRepeats.length - 1),
+            items: [for (var i = 0; i < kTimerRepeats.length; i++) DropdownMenuItem(value: i, child: Text(kTimerRepeats[i]))],
+            onChanged: (v) => setState(() => repeat = v ?? 0),
+          ),
+        ),
+        SwitchListTile(
+            secondary: const Icon(Icons.fiber_manual_record, color: Colors.redAccent),
+            title: const Text('تسجيل (محتاج فلاشة/هارد في الريسيفر)'),
+            value: status & 2 == 2,
+            onChanged: (v) => setState(() => status = v ? status | 2 : status & ~2)),
+        SwitchListTile(
+            secondary: const Icon(Icons.power_settings_new),
+            title: const Text('يرجع standby بعد ما يخلص'),
+            value: status & 8 == 8,
+            onChanged: (v) => setState(() => status = v ? status | 8 : status & ~8)),
+        Padding(padding: const EdgeInsets.all(16), child: FilledButton.icon(onPressed: save, icon: const Icon(Icons.save), label: const Text('احفظ على الريسيفر'))),
+      ]),
+    );
+  }
 }
