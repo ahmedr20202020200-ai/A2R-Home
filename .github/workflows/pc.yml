@@ -1,0 +1,46 @@
+name: Build A2R PC (Windows)
+
+on:
+  push:
+    branches: [ '**' ]
+    paths:
+      - 'pc_agent.py'
+      - '.github/workflows/pc.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  pc:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools (نسخ متثبتة)
+        run: python -m pip install pyinstaller==6.11.1 mss==10.0.0 pillow==11.1.0
+
+      - name: Check code
+        run: python -m py_compile pc_agent.py
+
+      - name: Build A2R-PC.exe
+        run: pyinstaller --onefile --noconsole --name A2R-PC --hidden-import mss.windows pc_agent.py
+
+      - name: Upload exe (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: A2R-PC-1.0.${{ github.run_number }}
+          path: dist/A2R-PC.exe
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pc-v1.0.${{ github.run_number }}
+          name: A2R PC v1.0.${{ github.run_number }}
+          files: dist/A2R-PC.exe
