@@ -63,7 +63,7 @@ class A2RHome extends StatelessWidget {
       locale: const Locale('ar', 'EG'),
       supportedLocales: const [Locale('ar', 'EG')],
       localizationsDelegates: GlobalMaterialLocalizations.delegates,
-      builder: (c, w) => Directionality(textDirection: TextDirection.rtl, child: w!),
+      builder: (c, w) => Directionality(textDirection: TextDirection.rtl, child: AppLockGate(child: w!)),
       theme: ThemeData(
         colorScheme: scheme,
         useMaterial3: true,
@@ -277,6 +277,10 @@ class _ShellState extends State<Shell> {
     // المنبهات بتتمسح لو التطبيق اتحدّث — نرجّعها
     Schedule.rearm();
     Quota.rearm();
+    NetWatch.rearm();
+    ShareIn.init(context, (t) {
+      if (mounted) setState(() => tab = t);
+    });
   }
 
   @override
@@ -581,15 +585,23 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           if (pw != null) await _login(router!.host, pw, quiet: true);
         }
         st = await router!.status();
+        unawaited(NetLog.sample(st, source: 'app'));
         final list = await router!.stations();
         try {
           blockedMacs = (await router!.blockList()).macs;
         } catch (_) {}
+        unawaited(DeviceWatch.update({for (final s in list) s.mac.isNotEmpty ? s.mac : s.ip}));
         for (final s in list) {
           final key = s.ip.isEmpty ? s.mac : s.ip;
           final h = hosts.putIfAbsent(key, () => LanHost(key, source: 'router'));
           h.mac = s.mac;
-          if (s.hostname.isNotEmpty) h.name = s.hostname;
+          if (!isBadHostName(s.hostname)) {
+            h.name = s.hostname;
+            h.nameSrc = 'router';
+            unawaited(NameCache.put(s.mac.isNotEmpty ? s.mac : s.ip, s.hostname, 'router'));
+          } else if (isBadHostName(h.name)) {
+            h.name = '';
+          }
           h.wifi = s.wifi;
           h.connectTime = s.connectTime;
           h.vendor = Oui.vendorOf(s.mac);
@@ -601,10 +613,28 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       }
     }
     if (!quiet || router == null) await scan(silentNotify: before.isEmpty);
+    // v5: الأجهزة اللي الراوتر رجّعلها "--" → NetBIOS / mDNS / DNS / المحفوظ
+    try {
+      if (Oui.table.isEmpty && !Store.p.containsKey('oui_auto_tried')) {
+        await Store.p.setBool('oui_auto_tried', true);
+        unawaited(Oui.download().then((_) {
+          for (final h in hosts.values) {
+            h.vendor = Oui.vendorOf(h.mac);
+          }
+          if (mounted) setState(() {});
+        }).catchError((e) {
+          AppLog.add('LAN', 'OUI auto ✗ $e');
+        }));
+      }
+      final n = await resolveMissingNames(hosts.values.toList(), routerIp: router?.host ?? net?.gateway);
+      if (n > 0) AppLog.add('NAMES', 'لقيت $n اسم زيادة');
+    } catch (e) {
+      AppLog.add('NAMES', 'resolve ✗ $e');
+    }
     _checkNew(before);
     // v4: سجل الأجهزة + الباقة + المواعيد
     try {
-      await DeviceHistory.update([for (final h in hosts.values) (key: h.mac.isNotEmpty ? h.mac : h.ip, name: label(h), ip: h.ip)]);
+      await DeviceHistory.update([for (final h in hosts.values) (key: h.mac.isNotEmpty ? h.mac : h.ip, name: (Store.deviceNames[h.mac] ?? (isBadHostName(h.name) ? '' : h.name)), ip: h.ip)]);
       if (router != null) {
         final total = (int.tryParse('${st['monthly_tx_bytes'] ?? ''}') ?? 0) + (int.tryParse('${st['monthly_rx_bytes'] ?? ''}') ?? 0);
         await Quota.sample(total);
@@ -645,7 +675,11 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       if (mounted) setState(() {});
     });
     for (final h in res) {
-      if (h.name.isNotEmpty && (hosts[h.ip]?.name ?? '').isEmpty) hosts[h.ip]!.name = h.name;
+      final t = hosts[h.ip];
+      if (t != null && !isBadHostName(h.name) && isBadHostName(t.name)) {
+        t.name = cleanHostName(h.name);
+        t.nameSrc = h.nameSrc.isEmpty ? 'netbios' : h.nameSrc;
+      }
     }
     if (mounted) setState(() => scanning = false);
   }
@@ -660,7 +694,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     final fresh = hosts.values.where((h) => !known.contains(h.mac.isNotEmpty ? h.mac : h.ip) && h.ip != net?.ip).toList();
     for (final h in fresh) {
       h.isNew = true;
-      final n = Store.deviceNames[h.mac] ?? (h.name.isEmpty ? h.ip : h.name);
+      final n = label(h);
       Native.notify('جهاز جديد على الشبكة', '$n — ${h.ip}${h.mac.isEmpty ? '' : ' — ${h.mac}'}');
     }
     if (fresh.isNotEmpty) Store.addKnown(keys);
@@ -668,7 +702,13 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
 
   String label(LanHost h) {
     final names = Store.deviceNames;
-    return names[h.mac] ?? names[h.ip] ?? (h.name.isNotEmpty ? h.name : h.ip);
+    final custom = names[h.mac] ?? names[h.ip];
+    if (custom != null && custom.trim().isNotEmpty) return custom;
+    if (!isBadHostName(h.name)) return h.name;
+    final c = NameCache.of(h.mac.isNotEmpty ? h.mac : h.ip);
+    if (c != null) return c.name;
+    final isMe = h.ip == net?.ip, isGw = h.ip == (router?.host ?? net?.gateway);
+    return fallbackDeviceName(guessDeviceType(h.name, h.vendor, h.openPorts, isGateway: isGw, isMe: isMe), h.vendor);
   }
 
   int ipNum(String ip) {
@@ -684,6 +724,18 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       onRefresh: refresh,
       child: ListView(children: [
         _infoCard(),
+        Card(
+          child: ListTile(
+            leading: const Icon(Icons.wifi_tethering_rounded, color: kGold),
+            title: const Text('الأكسس بوينت (TOTOLINK)'),
+            subtitle: Text('${TotoStore.ip}${TotoStore.macs.isEmpty ? '' : ' • ${TotoStore.macs.length} جهاز عليه'}', style: const TextStyle(fontSize: 12)),
+            trailing: const Icon(Icons.chevron_left_rounded),
+            onTap: () async {
+              await Navigator.push(context, MaterialPageRoute(builder: (_) => TotoPage(router: router, hosts: hosts.values.toList(), labelOf: label)));
+              if (mounted) setState(() {});
+            },
+          ),
+        ),
         _routerCard(),
         Padding(
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
@@ -720,6 +772,12 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           ActionChip(avatar: const Icon(Icons.network_ping, size: 18), label: const Text('Ping'), onPressed: () => _pingAsk()),
           ActionChip(avatar: const Icon(Icons.power_settings_new, size: 18), label: const Text('تشغيل جهاز (WOL)'), onPressed: () => _wol(null)),
           ActionChip(avatar: const Icon(Icons.qr_code_2_rounded, size: 18), label: const Text('QR الواي فاي'), onPressed: _qr),
+          ActionChip(avatar: const Icon(Icons.monitor_heart_rounded, size: 18), label: const Text('مراقبة الأجهزة'), onPressed: () async {
+            await Navigator.push(context, MaterialPageRoute(builder: (_) => DeviceWatchPage(hosts: hosts.values.toList(), labelOf: label)));
+            if (mounted) setState(() {});
+          }),
+          ActionChip(avatar: const Icon(Icons.show_chart_rounded, size: 18), label: const Text('سجل الإشارة والسرعة'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SignalHistoryPage()))),
+          ActionChip(avatar: const Icon(Icons.settings_backup_restore_rounded, size: 18), label: const Text('نسخة احتياطية + قفل'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BackupPage()))),
           ActionChip(avatar: const Icon(Icons.schedule_rounded, size: 18), label: const Text('مواعيد الحظر'), onPressed: () async {
             await Navigator.push(context, MaterialPageRoute(builder: (_) => SchedulePage(router: router, devices: [
                   for (final h in hosts.values)
@@ -797,6 +855,9 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
                 PopupMenuItem(value: 'qr', child: Text('QR الواي فاي (للضيوف)')),
                 PopupMenuItem(value: 'wifi_off', child: Text('قفل الواي فاي (تجريبي)')),
                 PopupMenuItem(value: 'wifi_on', child: Text('فتح الواي فاي (تجريبي)')),
+                PopupMenuItem(value: 'dns', child: Text('DNS الراوتر (تجريبي)')),
+                PopupMenuItem(value: 'signal', child: Text('سجل الإشارة + الانقطاعات')),
+                PopupMenuItem(value: 'place', child: Text('مكان الراوتر (أحسن إشارة)')),
                 PopupMenuItem(value: 'reboot', child: Text('ريستارت الراوتر')),
                 PopupMenuItem(value: 'login', child: Text('تغيير العنوان/الباسورد')),
                 PopupMenuItem(value: 'logout', child: Text('امسح الباسورد')),
@@ -862,6 +923,12 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           if (!on && !await confirm(context, 'لو قفلت الواي فاي الموبايل ده هيفصل كمان (لو متوصل بالواي فاي). متأكد؟')) return;
           final res = await r.set('SET_WIFI_INFO', {'wifiEnabled': on ? '1' : '0'});
           if (mounted) toast(context, 'رد الراوتر: ${res['result']}');
+        case 'dns':
+          await Navigator.push(context, MaterialPageRoute(builder: (_) => RouterDnsPage(router: r)));
+        case 'signal':
+          await Navigator.push(context, MaterialPageRoute(builder: (_) => const SignalHistoryPage()));
+        case 'place':
+          await Navigator.push(context, MaterialPageRoute(builder: (_) => RouterPlacePage(router: r)));
         case 'reboot':
           if (!await confirm(context, 'ريستارت للراوتر؟ النت هيقطع دقيقة أو اتنين.')) return;
           final ok = await r.reboot();
@@ -884,7 +951,10 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       type,
       if (h.mac.isNotEmpty) h.mac,
       if (h.vendor.isNotEmpty) h.vendor,
+      if (h.vendor.isEmpty && isRandomMac(h.mac)) 'MAC عشوائي',
+      if (h.nameSrc.isNotEmpty && !Store.deviceNames.containsKey(h.mac)) 'الاسم ${kNameSrcAr[h.nameSrc] ?? h.nameSrc}',
       if (h.source != 'scan') (h.wifi ? 'واي فاي' : 'كابل'),
+      if (h.mac.isNotEmpty && TotoStore.macs.contains(h.mac)) 'عن طريق الأكسس',
       if (h.connectTime.isNotEmpty) 'متصل من ${_dur(h.connectTime)}',
     ].join(' • ');
     return Card(
@@ -975,6 +1045,20 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
             Navigator.pop(c);
             _ping(h.ip);
           }),
+          if (!isMe)
+            ListTile(
+              leading: Icon(DeviceWatch.has(h.mac.isNotEmpty ? h.mac : h.ip) ? Icons.visibility_off_rounded : Icons.visibility_rounded, color: kGold),
+              title: Text(DeviceWatch.has(h.mac.isNotEmpty ? h.mac : h.ip) ? 'بطّل مراقبة الجهاز ده' : 'راقب الجهاز ده (إشعار لما يدخل/يخرج)'),
+              onTap: () async {
+                Navigator.pop(c);
+                final k = h.mac.isNotEmpty ? h.mac : h.ip;
+                final on = !DeviceWatch.has(k);
+                await DeviceWatch.set(k, on ? label(h) : null, ip: h.ip);
+                if (on) await Native.askNotifyPermission();
+                if (mounted) toast(context, on ? 'هبعتلك إشعار لما «${label(h)}» يدخل أو يخرج من الشبكة' : 'اتشال من المراقبة');
+                setState(() {});
+              },
+            ),
           ListTile(leading: const Icon(Icons.lan), title: const Text('فحص البورتات'), onTap: () async {
             Navigator.pop(c);
             toast(context, 'بفحص…');
@@ -1066,6 +1150,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       v.value = await speedTest(onTick: (m) {
         if (!done) v.value = m;
       });
+      await SpeedLog.add(v.value);
     } catch (e) {
       if (mounted) toast(context, 'فشل الاختبار: $e');
     }
@@ -1329,24 +1414,23 @@ class CastState extends ChangeNotifier {
     try {
       // الصور: بنحوّلها JPEG ≤1920 بكسل (HEIC/PNG/WebP/صور 12 ميجا الريسيفر مش بيقدر يفتحها)
       final img = q.file != null && isImagePath(q.file!.path) ? await prepareCastImage(q.file!) : null;
-      final mime = img != null ? 'image/jpeg' : (q.file != null ? mimeOf(q.file!.path) : q.mime ?? await probeMime(q.url, q.headers));
-      final url = img != null ? await _shareFile(img) : await _urlFor(q);
+      if (img != null) {
+        await _castImage(img, q.title, my);
+        return;
+      }
+      final mime = q.file != null ? mimeOf(q.file!.path) : q.mime ?? await probeMime(q.url, q.headers);
+      final url = await _urlFor(q);
       _note('بشغّل "${q.title}" ${way == CastWay.gm ? 'بطريقة G-MScreen' : 'على ${current!.name}'}${q.viaPhone ? ' عبر الموبايل' : ''}…');
-      if (mime.startsWith('image')) {
-        await _sendImage(url, q.title);
-      } else if (way == CastWay.gm) {
+      if (way == CastWay.gm) {
         _gmMedia = gmMediaTypeFor(mime);
         _gmUrl = url;
         await gm!.castSend(_gmMedia, 0, url);
       } else {
         await client!.load(url, q.title, subtitle: q.subtitle, mime: mime);
       }
-      if (mime.startsWith('image')) {
-        _watchImage(my, url);
-      } else {
-        _note('اتبعت للشاشة — مستني يبدأ…');
-        _watchStart(my, i);
-      }
+      _note('اتبعت للشاشة — مستني يبدأ…');
+      unawaited(CastHistory.add(q));
+      _watchStart(my, i);
     } catch (e) {
       AppLog.add('CAST', 'play ✗ $e');
       // زي Web Video Caster: لو الرابط المباشر اترفض نجرب عبر الموبايل
@@ -1373,76 +1457,159 @@ class CastState extends ChangeNotifier {
     }
   }
 
-  Future<String> _shareFile(File f) async {
-    final ip = await phoneIpFor(_targetIp());
-    if (ip == null) throw StateError('الموبايل لازم يكون على نفس الواي فاي بتاع الشاشة');
-    final url = await MediaServer.I.share(f, ip);
-    MediaServer.I.fetched.remove(MediaServer.idOfUrl(url));
-    return url;
-  }
-
   /// null = لسه منعرفش، true = الـDLNA بيعرض صور، false = الصور بتشتغل بطريقة G-MScreen بس
   bool? dlnaImagesOk;
 
-  /// يبعت صورة (رابطها جاهز على سيرفر الموبايل) بالطريقة اللي اشتغلت قبل كده
-  Future<void> _sendImage(String url, String title) async {
-    final g = gm;
-    final useGm = g != null && (way == CastWay.gm || client == null || dlnaImagesOk == false);
-    if (useGm) {
-      await g.castSend(1, 0, url);
-    } else {
-      if (client == null) throw StateError('اختار الشاشة الأول (أو اتصل بالريسيفر من تبويب الريسيفر)');
-      await client!.load(url, title, mime: 'image/jpeg');
-    }
+  // ---- v5: تشغيل تلقائي للي بعده + تكرار + مؤقت إيقاف ----
+  bool autoNext = Store.p.getBool('cast_autonext') ?? true;
+  /// 'off' | 'one' | 'all'
+  String repeat = Store.p.getString('cast_repeat') ?? 'off';
+  DateTime? sleepAt;
+  bool sleepEndOfItem = false;
+  Timer? _sleepT;
+
+  void setAutoNext(bool v) {
+    autoNext = v;
+    Store.p.setBool('cast_autonext', v);
+    notifyListeners();
   }
 
-  /// عرض صورة واحدة (للعرض العادي وللـ Slideshow) — نفس المسار المتصلّح
+  void cycleRepeat() {
+    repeat = nextRepeat(repeat);
+    Store.p.setString('cast_repeat', repeat);
+    notifyListeners();
+  }
+
+  /// minutes = 0 → إلغاء، -1 → بعد ما اللي شغال يخلص
+  void setSleep(int minutes) {
+    _sleepT?.cancel();
+    sleepAt = null;
+    sleepEndOfItem = minutes == -1;
+    if (minutes > 0) {
+      sleepAt = DateTime.now().add(Duration(minutes: minutes));
+      _sleepT = Timer(Duration(minutes: minutes), () async {
+        sleepAt = null;
+        _note('مؤقت الإيقاف: وقفت العرض ⏹');
+        try {
+          await stop();
+        } catch (_) {}
+      });
+    }
+    notifyListeners();
+  }
+
+  Future<void> _onEnded() async {
+    final next = nextQueueIndex(playing, queue.length, autoNext: autoNext, repeat: repeat, sleepAfter: sleepEndOfItem);
+    if (sleepEndOfItem) {
+      sleepEndOfItem = false;
+      _note('مؤقت الإيقاف: خلص اللي كان شغال — وقفت ⏹');
+      try {
+        await stop();
+      } catch (_) {}
+      return;
+    }
+    if (next != null) await playIndex(next);
+  }
+
+  /// عرض صورة واحدة (للعرض العادي وللـ Slideshow)
   Future<void> showImage(File f, {String? title}) async {
     final img = await prepareCastImage(f);
-    final url = await _shareFile(img);
     final my = ++_seq;
-    await _sendImage(url, title ?? f.uri.pathSegments.last);
-    _watchImage(my, url);
+    await _castImage(img, title ?? f.uri.pathSegments.last, my);
   }
 
-  /// الصورة: مفيش PLAYING دايمًا — بنشوف هل الريسيفر طلب الصورة من الموبايل فعلًا
-  void _watchImage(int my, String url) {
-    final id = MediaServer.idOfUrl(url);
-    final usedGm = gm != null && (way == CastWay.gm || client == null || dlnaImagesOk == false);
-    _note('الصورة اتبعتت — بستنى الشاشة تحمّلها…');
-    Future(() async {
-      bool got() => id != null && MediaServer.I.fetched.contains(id);
-      for (var k = 0; k < 8; k++) {
-        await Future.delayed(const Duration(seconds: 1));
-        if (my != _seq) return;
-        if (got()) {
-          if (!usedGm) dlnaImagesOk = true;
-          _note('الصورة ظهرت على الشاشة ✓ (الريسيفر حمّلها${usedGm ? ' بطريقة G-MScreen' : ''})');
-          return;
-        }
+  /// v5: الصورة — G-MScreen الأول لو هي اللي نجحت قبل كده، وإلا سلّم تجارب DLNA، وآخر حاجة G-MScreen
+  Future<bool> _castImage(File img, String title, int my) async {
+    final gmFirst = gm != null && (way == CastWay.gm || dlnaImagesOk == false);
+    if (gmFirst && await _gmImage(img, my)) return true;
+    if (my != _seq) return false;
+    var tried = 0;
+    if (client != null) {
+      final r = await _imageLadder(img, title, my);
+      if (r.$1) return true;
+      tried = r.$2;
+    }
+    if (my != _seq) return false;
+    if (!gmFirst && await _gmImage(img, my, auto: true)) return true;
+    if (my != _seq) return false;
+    _note(tried == 0 ? kImageUnsupportedAr : imageAllFailedAr(tried));
+    return false;
+  }
+
+  Future<bool> _waitFetch(String? id, int my, int seconds) async {
+    for (var k = 0; k < seconds * 4; k++) {
+      await Future.delayed(const Duration(milliseconds: 250));
+      if (my != _seq) return false;
+      if (id != null && MediaServer.I.fetched.contains(id)) return true;
+    }
+    return false;
+  }
+
+  /// (نجحت؟، عدد التجارب)
+  Future<(bool, int)> _imageLadder(File img, String title, int my) async {
+    final c = client!;
+    final ip = await phoneIpFor(current!.ip);
+    if (ip == null) throw StateError('الموبايل لازم يكون على نفس الواي فاي بتاع الشاشة');
+    final r = await runImageLadder(
+      order: imgLadderOrder(preferredId: ImgStore.preferred, learned: ImgStore.learned),
+      share: (v, n) => MediaServer.I.shareImage(img, ip, v, '${v.id}-$my-$n'),
+      load: (url, v) => c.loadImage(url, title, v),
+      waitFetch: (url, v) => _waitFetch(MediaServer.idOfUrl(url), my, v.play == 'none' ? 5 : 4),
+      note: _note,
+      cancelled: () => my != _seq,
+      stop: c.stop,
+    );
+    if (r.$1 != null) {
+      if (r.$1!.id != 'wvc') ImgStore.preferred = r.$1!.id;
+      dlnaImagesOk = true;
+      _note('الصورة ظهرت ✓ (تجربة ${r.$2}: ${r.$1!.label}) — الطريقة دي اتحفظت للمرات الجاية');
+      return (true, r.$2);
+    }
+    return (false, r.$2);
+  }
+
+  /// G-MScreen: لو تبويب الريسيفر مش متصل وفي ريسيفر محفوظ → نتصل في الخلفية
+  Future<bool> _gmImage(File img, int my, {bool auto = false}) async {
+    var g = gm;
+    GmClient? mine;
+    if (g == null && auto && Store.receiverIp != null) {
+      _note('بجرب طريقة G-MScreen (بتصل بالريسيفر في الخلفية)…');
+      final c = GmClient(Store.receiverIp!);
+      try {
+        await c.connect();
+        g = c;
+        mine = c;
+      } catch (e) {
+        AppLog.add('CAST', 'gm auto-connect ✗ $e');
+        return false;
       }
-      if (my != _seq) return;
-      final g = gm;
-      if (!usedGm && g != null) {
-        _note('الريسيفر مطلبش الصورة بالـDLNA — بجرب طريقة G-MScreen…');
+    }
+    if (g == null) return false;
+    var ok = false;
+    try {
+      final ip = await phoneIpFor(g.host);
+      if (ip == null) return false;
+      final url = await MediaServer.I.shareImage(img, ip, kImgLadder.first, 'gm-$my');
+      _note('بجرب طريقة G-MScreen…');
+      await g.castSend(1, 0, url);
+      if (await _waitFetch(MediaServer.idOfUrl(url), my, 6)) {
+        dlnaImagesOk = false;
+        _note('الصورة ظهرت ✓ (بطريقة G-MScreen — الصور الجاية هتتبعت بيها على طول)');
+        ok = true;
+        return true;
+      }
+      AppLog.add('CAST', 'gm image: الريسيفر مطلبش الصورة');
+    } catch (e) {
+      AppLog.add('CAST', 'gm image ✗ $e');
+    } finally {
+      // الريسيفر بيقبل موبايل واحد: لو اتصلنا إحنا وفشل نسيب المكان لتبويب الريسيفر/G-MScreen
+      if (!ok && mine != null) {
         try {
-          await g.castSend(1, 0, url);
-          for (var k = 0; k < 6; k++) {
-            await Future.delayed(const Duration(seconds: 1));
-            if (my != _seq) return;
-            if (got()) {
-              dlnaImagesOk = false;
-              _note('الصورة ظهرت ✓ (بطريقة G-MScreen — الصور الجاية هتتبعت بيها على طول)');
-              return;
-            }
-          }
-        } catch (e) {
-          AppLog.add('CAST', 'gm image ✗ $e');
-        }
+          await mine.disconnect();
+        } catch (_) {}
       }
-      if (my != _seq) return;
-      _note(kImageUnsupportedAr);
-    });
+    }
+    return false;
   }
 
   /// لو الشاشة مبدأتش خلال 12 ثانية والرابط مباشر → نعيده عبر الموبايل
@@ -1520,7 +1687,7 @@ class CastState extends ChangeNotifier {
         state = s.mediaType == -1 ? 'NO_MEDIA_PRESENT' : s.stateName;
         _saveResume();
         notifyListeners();
-        if (ended && playing + 1 < queue.length) await playIndex(playing + 1);
+        if (ended) await _onEnded();
         return;
       }
       final c = client;
@@ -1532,7 +1699,7 @@ class CastState extends ChangeNotifier {
       state = s.state;
       _saveResume();
       notifyListeners();
-      if (ended && playing + 1 < queue.length) await playIndex(playing + 1);
+      if (ended) await _onEnded();
     } catch (_) {}
   }
 }
@@ -1737,9 +1904,20 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
               label: const Text('عرض صور'),
               onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SlideshowPage())),
             ),
+            FilledButton.tonalIcon(
+              icon: const Icon(Icons.history_rounded),
+              label: const Text('اللي اتعرض قبل كده'),
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const CastHistoryPage())),
+            ),
+            FilledButton.tonalIcon(
+              icon: const Icon(Icons.school_rounded),
+              label: const Text('تعلّم من Web Video Caster'),
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LearnPage())),
+            ),
           ]),
         ),
         if (cs.playing >= 0 && cs.playing < cs.queue.length) _remote(),
+        if (cs.queue.isNotEmpty) CastExtrasBar(cs: cs),
         Padding(
           padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
           child: Row(children: [
@@ -2033,7 +2211,9 @@ List<BrowserEntry> historyAdd(List<BrowserEntry> l, BrowserEntry e, {int max = 1
 }
 
 class BrowserPage extends StatefulWidget {
-  const BrowserPage({super.key});
+  /// v5: يفتح على رابط معيّن (من المشاركة أو صفحة DNS الراوتر)
+  final String? initialUrl;
+  const BrowserPage({super.key, this.initialUrl});
   @override
   State<BrowserPage> createState() => _BrowserPageState();
 }
@@ -2202,7 +2382,7 @@ class _BrowserPageState extends State<BrowserPage> {
           if (mounted) setState(() {});
         },
       ))
-      ..loadRequest(Uri.parse(Store.homePage));
+      ..loadRequest(Uri.parse(widget.initialUrl ?? Store.homePage));
   }
 
   void go(String s) {
@@ -2556,8 +2736,12 @@ class ReceiverPage extends StatefulWidget {
   State<ReceiverPage> createState() => _ReceiverPageState();
 }
 
-class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClientMixin {
+class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   GmClient? gm;
+  /// v5: مجموعة مفضلة مختارة كفلتر
+  String? group;
+  /// v5: كنا متصلين قبل ما التطبيق يروح الخلفية → نرجع نتصل لوحدنا
+  bool _wasConnected = false;
   String msg = '';
   bool busy = false;
   Map<String, StbInfo> found = {};
@@ -2590,6 +2774,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   void initState() {
     super.initState();
     kOpenChannel.addListener(_openFromShortcut);
+    WidgetsBinding.instance.addObserver(this);
     if (notifRemote) Native4.remoteNotif(true);
     if (kOpenChannel.value != null) WidgetsBinding.instance.addPostFrameCallback((_) => _openFromShortcut());
   }
@@ -2597,8 +2782,37 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   @override
   void dispose() {
     kOpenChannel.removeListener(_openFromShortcut);
+    WidgetsBinding.instance.removeObserver(this);
     gm?.disconnect();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.paused) _wasConnected = connected || _wasConnected;
+    if (s == AppLifecycleState.resumed && StbPrefs.autoReconnect && !busy && !connected && Store.receiverIp != null && (_wasConnected || gm != null)) {
+      AppLog.add('STB', 'رجوع للتطبيق → بعيد الاتصال بالريسيفر');
+      connect(Store.receiverIp!).then((_) {
+        if (connected && mounted) toast(context, 'رجعت اتصلت بالريسيفر ✓');
+      });
+    }
+  }
+
+  void _recent(StbChannel ch) {
+    StbPrefs.addRecent(ch);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _zapTo(StbChannel ch) async {
+    HapticFeedback.lightImpact();
+    try {
+      await gm!.zap(ch);
+      playingId = ch.id;
+      _recent(ch);
+      setState(() {});
+    } catch (e) {
+      if (mounted) toast(context, 'مقدرتش أغير القناة: $e');
+    }
   }
 
   /// اختصار قناة من الشاشة الرئيسية: نتصل لو مش متصلين وبعدين نغيّر القناة
@@ -2617,6 +2831,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     try {
       await gm!.zap(ch);
       setState(() => playingId = id);
+      _recent(ch);
       AppLog.add('STB', 'shortcut zap $d');
     } catch (e) {
       if (mounted) toast(context, '$e');
@@ -2699,6 +2914,8 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       msg = 'بتصل بـ $ip…';
     });
     await gm?.disconnect();
+    // لو الكاست فتح اتصال في الخلفية (الريسيفر بيقبل موبايل واحد) نقفله الأول
+    if (GmClient.active != null && GmClient.active != gm) await GmClient.active!.disconnect();
     final c = GmClient(ip);
     c.onNotify = (t) {
       AppLog.add('STB', 'notify $t');
@@ -2724,6 +2941,8 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
 
   Future<void> _refreshPlaying() async {
     playingId = await gm?.playingId();
+    final ch = channels.where((c) => c.id == playingId).firstOrNull;
+    if (ch != null) StbPrefs.addRecent(ch);
     if (mounted) setState(() {});
   }
 
@@ -3011,6 +3230,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
         .where((c) =>
             c.radio == radio &&
             (!favOnly || f.contains(c.id) || c.fav) &&
+            (group == null || StbPrefs.groupHas(group!, c)) &&
             (!hdOnly || c.hd) &&
             (!ftaOnly || !c.scrambled) &&
             (q.isEmpty || c.name.toLowerCase().contains(q.toLowerCase()) || '${c.index + 1}' == q.trim()))
@@ -3030,8 +3250,33 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
           _filterChip('المفضلة', favOnly, (v) => setState(() => favOnly = v), icon: Icons.star_rounded),
           _filterChip('HD', hdOnly, (v) => setState(() => hdOnly = v)),
           _filterChip('مفتوحة', ftaOnly, (v) => setState(() => ftaOnly = v), icon: Icons.lock_open_rounded),
+          for (final g in StbPrefs.groups) _filterChip(g.name, group == g.name, (v) => setState(() => group = v ? g.name : null), icon: Icons.folder_special_rounded),
+          ActionChip(
+            avatar: const Icon(Icons.create_new_folder_rounded, size: 18),
+            label: const Text('المجموعات'),
+            onPressed: () async {
+              await Navigator.push(context, MaterialPageRoute(builder: (_) => StbGroupsPage(channels: channels)));
+              if (group != null && !StbPrefs.groups.any((g) => g.name == group)) group = null;
+              if (mounted) setState(() {});
+            },
+          ),
         ]),
       ),
+      if (q.isEmpty && StbPrefs.recent.isNotEmpty && connected)
+        SizedBox(
+          height: 44,
+          child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 12), children: [
+            const Padding(padding: EdgeInsets.only(top: 12, left: 6, right: 6), child: Text('آخر قنوات:', style: TextStyle(fontSize: 12, color: kMuted))),
+            for (final r in StbPrefs.recent.where((r) => r.radio == radio))
+              Padding(
+                padding: const EdgeInsetsDirectional.only(end: 6),
+                child: ActionChip(
+                  label: Text(r.name, style: TextStyle(fontSize: 12, color: r.id == playingId ? kGold : null)),
+                  onPressed: () => _zapTo(channels.where((c) => c.id == r.id && c.radio == r.radio).firstOrNull ?? StbChannel(r.id, r.name, r.radio, 0, const {})),
+                ),
+              ),
+          ]),
+        ),
       Expanded(
         child: channels.isEmpty
             ? EmptyState(
@@ -3080,22 +3325,22 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                             ),
                             IconButton(
                               visualDensity: VisualDensity.compact,
+                              icon: Icon(StbPrefs.groupsOf(ch).isEmpty ? Icons.folder_open_rounded : Icons.folder_special_rounded, color: kMuted),
+                              tooltip: 'مجموعات',
+                              onPressed: () async {
+                                await pickStbGroups(context, ch);
+                                if (mounted) setState(() {});
+                              },
+                            ),
+                            IconButton(
+                              visualDensity: VisualDensity.compact,
                               icon: const Icon(Icons.play_circle_outline_rounded, color: kMuted),
                               tooltip: 'اتفرج على الموبايل',
                               onPressed: () => watch(ch),
                             ),
                           ]),
                           onLongPress: () => _details(ch),
-                          onTap: () async {
-                            HapticFeedback.lightImpact();
-                            try {
-                              await gm!.zap(ch);
-                              playingId = ch.id;
-                              setState(() {});
-                            } catch (e) {
-                              if (mounted) toast(context, 'مقدرتش أغير القناة: $e');
-                            }
-                          },
+                          onTap: () => _zapTo(ch),
                         ),
                       );
                     },
@@ -4582,6 +4827,8 @@ class LanHost {
   bool isNew = false;
   bool blocked = false;
   int? pingMs;
+  /// الاسم جه منين: router / netbios / mdns / dns / cache
+  String nameSrc = '';
   LanHost(this.ip, {this.name = '', this.mac = '', this.vendor = '', this.source = 'scan'});
 }
 
@@ -4841,7 +5088,17 @@ Future<List<LanHost>> scanLan(String prefix, {void Function(LanHost h)? onFound,
   await Future.wait(List.generate(parallel, (_) => worker()));
   // الأسماء
   await Future.wait(found.map((h) async {
-    h.name = await netbiosName(h.ip) ?? await reverseName(h.ip) ?? h.name;
+    final nb = await netbiosName(h.ip);
+    if (nb != null && !isBadHostName(nb)) {
+      h.name = nb;
+      h.nameSrc = 'netbios';
+      return;
+    }
+    final rv = await reverseName(h.ip);
+    if (rv != null && !isBadHostName(cleanHostName(rv))) {
+      h.name = cleanHostName(rv);
+      h.nameSrc = 'dns';
+    }
   }));
   AppLog.add('LAN', 'scan done: ${found.length} hosts');
   return found;
@@ -5301,6 +5558,28 @@ class DlnaClient {
     }
   }
 
+  /// v5: صورة بطريقة إرسال معيّنة (من سلّم التجارب)
+  Future<void> loadImage(String url, String title, ImgVariant v) async {
+    try {
+      await av('Stop');
+    } catch (_) {}
+    if (v.play == 'wait') {
+      for (var k = 0; k < 6; k++) {
+        final st = await transportState();
+        if (st == 'STOPPED' || st == 'NO_MEDIA_PRESENT' || st.isEmpty) break;
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+    }
+    await av('SetAVTransportURI', {'CurrentURI': url, 'CurrentURIMetaData': buildImageDidl(url, title, v)});
+    if (v.play == 'none') return;
+    await Future.delayed(Duration(milliseconds: v.play == 'wait' ? 1000 : 500));
+    try {
+      await play();
+    } catch (e) {
+      AppLog.add('CAST', 'Play للصورة اترفض: $e');
+    }
+  }
+
   Future<String> transportState() async {
     try {
       return (soapValue(await av('GetTransportInfo'), 'CurrentTransportState') ?? '').trim();
@@ -5399,7 +5678,9 @@ class _Shared {
   final Map<String, String> headers;
   final String mime;
   String? subtitleUrl;
-  _Shared({this.file, this.remote, this.headers = const {}, required this.mime, this.subtitleUrl});
+  /// للصور (v5): طريقة الإرسال اللي بتحدد هيدرز الرد
+  final ImgVariant? img;
+  _Shared({this.file, this.remote, this.headers = const {}, required this.mime, this.subtitleUrl, this.img});
 }
 
 /// سيرفر صغير جوه الموبايل: بيقدّم ملفات الموبايل، وبيعدّي روابط النت اللي محتاجة هيدرز/HTTPS (زي وضع الـproxy في Web Video Caster)
@@ -5412,6 +5693,8 @@ class MediaServer {
   String _host = '';
   /// الملفات اللي الشاشة طلبتها فعلًا (علشان نعرف لو الريسيفر رفض الصورة من غير ما يطلبها)
   final Set<String> fetched = {};
+  /// الملفات اللي الشاشة عملتلها HEAD بس
+  final Set<String> headed = {};
   static String? idOfUrl(String url) {
     final s = Uri.tryParse(url)?.pathSegments ?? const [];
     return s.length >= 2 && (s[0] == 'f' || s[0] == 'p') ? s[1] : null;
@@ -5444,6 +5727,15 @@ class MediaServer {
     return '$b/f/$id/${_name(f.path)}';
   }
 
+  /// صورة بطريقة إرسال معيّنة — رابط جديد لكل تجربة علشان نعرف التجربة دي بالذات اتطلبت ولا لأ
+  Future<String> shareImage(File f, String phoneIp, ImgVariant v, String tag) async {
+    final b = await _base(phoneIp);
+    final id = _id('img:${f.path}:$tag', () => _Shared(file: f, mime: 'image/jpeg', img: v));
+    fetched.remove(id);
+    headed.remove(id);
+    return imgUrlFor(b, id, _name(f.path), v.url);
+  }
+
   Future<String> proxy(String url, Map<String, String> headers, String phoneIp, {String? mime}) async {
     final b = await _base(phoneIp);
     final id = _id('p:$url', () => _Shared(remote: url, headers: Map.of(headers), mime: mime ?? mimeOf(url)));
@@ -5454,6 +5746,8 @@ class MediaServer {
     final s = await HttpServer.bind(InternetAddress.anyIPv4, 0);
     s.autoCompress = false;
     s.idleTimeout = const Duration(seconds: 60);
+    // دارت بيزوّد هيدرز (x-frame-options, x-content-type-options...) الريسيفرات الرخيصة مش بتحبها
+    s.defaultResponseHeaders.clear();
     AppLog.add('CAST', 'media server on port ${s.port}');
     s.listen((q) => _handle(q), onError: (e) => AppLog.add('CAST', 'server error $e'));
     return s;
@@ -5477,6 +5771,7 @@ class MediaServer {
         return;
       }
       if (q.method == 'GET') fetched.add(seg[1]);
+      if (q.method == 'HEAD') headed.add(seg[1]);
       AppLog.add('CAST', 'serve ${q.method} /${seg[0]}/${seg[1]} from ${q.connectionInfo?.remoteAddress.address} range=${q.headers.value('range')}');
       if (it.file != null) {
         await _serveFile(q, it);
@@ -5495,9 +5790,24 @@ class MediaServer {
     final res = q.response;
     final f = it.file!;
     final len = await f.length();
-    res.headers.set('Content-Type', it.mime);
-    res.headers.set('Accept-Ranges', 'bytes');
-    _dlnaHeaders(res, it.mime, it);
+    final iv = it.img;
+    if (iv != null && iv.hdr != 'lower') {
+      // v5: هيدرز بالحروف الصح ومن غير هيدرز دارت الزيادة (x-frame-options...)
+      for (final h in ['x-frame-options', 'x-xss-protection', 'x-content-type-options']) {
+        res.headers.removeAll(h);
+      }
+      res.headers.set('Content-Type', 'image/jpeg', preserveHeaderCase: true);
+      res.headers.set('Accept-Ranges', 'bytes', preserveHeaderCase: true);
+      res.headers.set('Date', HttpDate.format(DateTime.now()), preserveHeaderCase: true);
+      res.headers.set('Server', 'Linux/3.0 UPnP/1.0 DLNADOC/1.50 A2RHome/1.0', preserveHeaderCase: true);
+      for (final (k, v) in imgServeHeaders(iv)) {
+        res.headers.set(k, v, preserveHeaderCase: true);
+      }
+    } else {
+      res.headers.set('Content-Type', it.mime);
+      res.headers.set('Accept-Ranges', 'bytes');
+      _dlnaHeaders(res, it.mime, it);
+    }
     final range = parseRange(q.headers.value('range'), len);
     if (q.headers.value('range') != null && range == null) {
       res.statusCode = HttpStatus.requestedRangeNotSatisfiable;
@@ -5507,11 +5817,14 @@ class MediaServer {
     }
     if (range != null) {
       res.statusCode = HttpStatus.partialContent;
-      res.headers.set('Content-Range', 'bytes ${range.$1}-${range.$2}/$len');
+      final exact = iv != null && iv.hdr != 'lower';
+      res.headers.set('Content-Range', 'bytes ${range.$1}-${range.$2}/$len', preserveHeaderCase: exact);
       res.contentLength = range.$2 - range.$1 + 1;
+      if (exact) res.headers.set('Content-Length', '${range.$2 - range.$1 + 1}', preserveHeaderCase: true);
       if (q.method != 'HEAD') await res.addStream(f.openRead(range.$1, range.$2 + 1));
     } else {
       res.contentLength = len;
+      if (iv != null && iv.hdr != 'lower') res.headers.set('Content-Length', '$len', preserveHeaderCase: true);
       if (q.method != 'HEAD') await res.addStream(f.openRead());
     }
     await res.close();
@@ -6860,6 +7173,7 @@ class Native4 {
     _ch.setMethodCallHandler((c) async {
       if (c.method == 'openChannel') await openChannel('${c.arguments}');
       if (c.method == 'notifKey') await notifKey((c.arguments as num).toInt());
+      if (c.method == 'shareIn') await ShareIn.handle('${c.arguments}');
       return null;
     });
   }
@@ -6902,7 +7216,12 @@ class Bg {
       case 'rearm':
         await Schedule.rearm();
         await Quota.rearm();
+        await NetWatch.rearm();
         return 'rearm';
+      case 'watch':
+        final r = await NetWatch.backgroundCheck();
+        await NetWatch.rearm();
+        return r;
       case 'key':
         final ip = Store.receiverIp;
         if (ip == null) return 'مفيش ريسيفر محفوظ';
@@ -7178,7 +7497,7 @@ class Quota {
       // سجل الأجهزة كمان (كل ساعة)
       try {
         final list = await r.stations();
-        await DeviceHistory.update([for (final s in list) (key: s.mac.isEmpty ? s.ip : s.mac, name: s.hostname, ip: s.ip)]);
+        await DeviceHistory.update([for (final s in list) (key: s.mac.isEmpty ? s.ip : s.mac, name: isBadHostName(s.hostname) ? (NameCache.of(s.mac.isEmpty ? s.ip : s.mac)?.name ?? '') : s.hostname, ip: s.ip)]);
       } catch (_) {}
       return 'استهلاك ${fmtBytes(used)} (${pct.toStringAsFixed(0)}%)';
     } finally {
@@ -7204,11 +7523,12 @@ Map<String, DevSeen> historyUpdate(Map<String, DevSeen> h, List<({String key, St
     if (p.key.isEmpty) continue;
     final e = out[p.key];
     if (e == null) {
-      out[p.key] = DevSeen(p.name, p.ip, t, t, 1);
+      out[p.key] = DevSeen(isBadHostName(p.name) ? '' : p.name, p.ip, t, t, 1);
     } else {
       if (t - e.last > gap.inMilliseconds) e.joins++;
       e.last = t;
-      if (p.name.isNotEmpty) e.name = p.name;
+      if (!isBadHostName(p.name)) e.name = p.name;
+      if (isBadHostName(e.name)) e.name = '';
       if (p.ip.isNotEmpty) e.ip = p.ip;
     }
   }
@@ -8152,6 +8472,7 @@ class _PcPageState extends State<PcPage> with AutomaticKeepAliveClientMixin {
   Future<void> _check() async {
     try {
       final i = await pc!.info();
+      unawaited(PcWake.learn(pc!));
       setState(() => msg = '${i['name']} • ${pc!.host}');
     } on PcAuthError {
       await PcSaved.clear();
@@ -8160,7 +8481,9 @@ class _PcPageState extends State<PcPage> with AutomaticKeepAliveClientMixin {
         msg = 'الكمبيوتر لغى الربط — اربط تاني';
       });
     } catch (e) {
-      setState(() => msg = 'الكمبيوتر مش بيرد — شغّل A2R PC عليه (${pc!.host})');
+      setState(() => msg = PcWake.macs.isEmpty
+          ? 'الكمبيوتر مش بيرد — شغّل A2R PC عليه (${pc!.host})'
+          : 'الكمبيوتر مش بيرد — لو مقفول جرّب «شغّل الكمبيوتر» من القايمة (⋮)');
     }
   }
 
@@ -8237,10 +8560,12 @@ class _PcPageState extends State<PcPage> with AutomaticKeepAliveClientMixin {
             onSelected: (v) {
               if (v == 'check') _check();
               if (v == 'unpair') unpair();
+              if (v == 'wol') PcWake.wake(context);
             },
-            itemBuilder: (c) => const [
-              PopupMenuItem(value: 'check', child: Text('اتأكد من الاتصال')),
-              PopupMenuItem(value: 'unpair', child: Text('الغي الربط')),
+            itemBuilder: (c) => [
+              const PopupMenuItem(value: 'check', child: Text('اتأكد من الاتصال')),
+              if (PcWake.macs.isNotEmpty) const PopupMenuItem(value: 'wol', child: Text('شغّل الكمبيوتر (Wake-on-LAN)')),
+              const PopupMenuItem(value: 'unpair', child: Text('الغي الربط')),
             ],
           ),
         ),
@@ -8560,6 +8885,7 @@ class _PcMousePadState extends State<PcMousePad> {
         ),
         TextButton(onPressed: () => widget.pc.power('cancel').catchError(widget.onErr), child: const Text('إلغاء الإطفاء')),
       ]),
+      PcExtras(pc: widget.pc, onErr: widget.onErr),
     ]);
   }
 }
@@ -8816,5 +9142,3933 @@ class _PcFilesViewState extends State<PcFilesView> {
               ]),
       ),
     ]);
+  }
+}
+
+// ======== cast_images_v5.dart ========
+// الصور على الريسيفر: سلّم تجارب (كل تجربة بطريقة إرسال مختلفة) + الطريقة اللي نجحت بتتحفظ
+// السبب: في سجل أحمد الريسيفر عمل HEAD للصورة ومطلبهاش (GET) أبدًا، و Web Video Caster بيعرضها عادي.
+
+const String kImgFlagsInteractive = 'DLNA.ORG_FLAGS=00F00000000000000000000000000000';
+const String kImgFlagsStreaming = 'DLNA.ORG_FLAGS=01700000000000000000000000000000';
+
+/// طريقة واحدة لإرسال صورة
+class ImgVariant {
+  final String id;
+  final String label;
+  /// upnp:class
+  final String cls;
+  /// 'full' = JPEG_LRG + أعلام Interactive | 'plain' = * | 'pn' = JPEG_LRG بس | 'stream' = أعلام زي الفيديو | 'custom'
+  final String pi;
+  /// نبعت وصف (DIDL) ولا CurrentURIMetaData فاضي
+  final bool meta;
+  /// 'play' = Play بعد نص ثانية | 'wait' = نستنى STOPPED وبعدين ثانية وبعدين Play | 'none' = من غير Play
+  final String play;
+  /// هيدرز رد السيرفر: 'lower' (زي v4) | 'dlna' (Interactive بحروف صح) | 'plain' (من غير DLNA) | 'stream' (زي الفيديو) | 'custom'
+  final String hdr;
+  /// 'ext' = .../اسم.jpg | 'noext' = /f/ID | 'query' = /f/ID?f=img.jpg
+  final String url;
+  /// للطريقة المتعلّمة من Web Video Caster: الوصف كامل فيه {URL}
+  final String? customMeta;
+  final String? customPi;
+  final Map<String, String>? customHeaders;
+  const ImgVariant(this.id, this.label,
+      {this.cls = 'object.item.imageItem.photo',
+      this.pi = 'plain',
+      this.meta = true,
+      this.play = 'play',
+      this.hdr = 'plain',
+      this.url = 'ext',
+      this.customMeta,
+      this.customPi,
+      this.customHeaders});
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'label': label,
+        'cls': cls,
+        'pi': pi,
+        'meta': meta,
+        'play': play,
+        'hdr': hdr,
+        'url': url,
+        if (customMeta != null) 'customMeta': customMeta,
+        if (customPi != null) 'customPi': customPi,
+        if (customHeaders != null) 'customHeaders': customHeaders,
+      };
+
+  static ImgVariant? fromJson(Object? j) {
+    if (j is! Map) return null;
+    try {
+      return ImgVariant(j['id'] as String, (j['label'] ?? j['id']) as String,
+          cls: (j['cls'] ?? 'object.item.imageItem.photo') as String,
+          pi: (j['pi'] ?? 'plain') as String,
+          meta: j['meta'] != false,
+          play: (j['play'] ?? 'play') as String,
+          hdr: (j['hdr'] ?? 'plain') as String,
+          url: (j['url'] ?? 'ext') as String,
+          customMeta: j['customMeta'] as String?,
+          customPi: j['customPi'] as String?,
+          customHeaders: j['customHeaders'] == null ? null : Map<String, String>.from(j['customHeaders'] as Map));
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// الترتيب: الأبسط (زي أغلب تطبيقات الكاست) الأول، وآخر واحدة هي طريقة v4 اللي فشلت (للمقارنة بس)
+const List<ImgVariant> kImgLadder = [
+  // الأول: نفس وصف v4 بالظبط بس هيدرز الرد بالحروف الصح ومن غير هيدرز دارت الزيادة
+  // (سجل أحمد: الريسيفر عمل HEAD وبعدين سكت — غالبًا مفهمش هيدرز الرد اللي كانت كلها حروف صغيرة)
+  ImgVariant('dlna', 'DLNA كامل بحروف صح', pi: 'full', hdr: 'dlna', play: 'play'),
+  ImgVariant('plain', 'وصف بسيط + هيدرز عادية', pi: 'plain', hdr: 'plain', play: 'wait'),
+  ImgVariant('stream', 'زي الفيديو (Streaming)', pi: 'stream', hdr: 'stream', play: 'play'),
+  ImgVariant('noplay', 'من غير Play', pi: 'plain', hdr: 'plain', play: 'none'),
+  ImgVariant('nometa', 'من غير وصف', meta: false, hdr: 'plain', play: 'wait'),
+  ImgVariant('item', 'imageItem + JPEG_LRG', cls: 'object.item.imageItem', pi: 'pn', hdr: 'dlna', play: 'play'),
+  ImgVariant('noext', 'رابط من غير امتداد', pi: 'plain', hdr: 'plain', url: 'noext', play: 'wait'),
+  ImgVariant('query', 'رابط ?f=img.jpg', pi: 'plain', hdr: 'stream', url: 'query', play: 'play'),
+  ImgVariant('v4', 'طريقة v4 القديمة', pi: 'full', hdr: 'lower', play: 'play'),
+];
+
+/// ترتيب التجارب: المتعلّمة من WVC → اللي نجحت آخر مرة → الباقي
+List<ImgVariant> imgLadderOrder({String? preferredId, ImgVariant? learned}) {
+  final out = <ImgVariant>[];
+  if (learned != null) out.add(learned);
+  final pref = kImgLadder.where((v) => v.id == preferredId);
+  out.addAll(pref.where((v) => !out.any((o) => o.id == v.id)));
+  out.addAll(kImgLadder.where((v) => !out.any((o) => o.id == v.id)));
+  return out;
+}
+
+String imgProtocolInfo(ImgVariant v) {
+  switch (v.pi) {
+    case 'full':
+      return 'http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kImgFlagsInteractive';
+    case 'pn':
+      return 'http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG';
+    case 'stream':
+      return 'http-get:*:image/jpeg:DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kImgFlagsStreaming';
+    case 'custom':
+      return v.customPi ?? 'http-get:*:image/jpeg:*';
+    default:
+      return 'http-get:*:image/jpeg:*';
+  }
+}
+
+/// وصف الصورة (DIDL-Lite) حسب الطريقة
+String buildImageDidl(String url, String title, ImgVariant v) {
+  if (!v.meta) return '';
+  if (v.customMeta != null && v.customMeta!.isNotEmpty) {
+    return v.customMeta!.replaceAll('{URL}', xmlEsc(url)).replaceAll('{TITLE}', xmlEsc(title));
+  }
+  return '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+      'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+      'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">'
+      '<item id="1" parentID="0" restricted="1"><dc:title>${xmlEsc(title)}</dc:title>'
+      '<upnp:class>${v.cls}</upnp:class>'
+      '<res protocolInfo="${xmlEsc(imgProtocolInfo(v))}">${xmlEsc(url)}</res>'
+      '</item></DIDL-Lite>';
+}
+
+/// هيدرز رد سيرفر الموبايل للصورة (بالحروف زي ما هي: بعض الريسيفرات بتقارن الاسم بالحروف)
+List<(String, String)> imgServeHeaders(ImgVariant v) {
+  switch (v.hdr) {
+    case 'dlna':
+      return [
+        ('transferMode.dlna.org', 'Interactive'),
+        ('contentFeatures.dlna.org', 'DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kImgFlagsInteractive'),
+      ];
+    case 'stream':
+      return [
+        ('transferMode.dlna.org', 'Streaming'),
+        ('contentFeatures.dlna.org', 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;$kImgFlagsStreaming'),
+      ];
+    case 'custom':
+      return (v.customHeaders ?? const {}).entries.map((e) => (e.key, e.value)).toList();
+    default:
+      return const [];
+  }
+}
+
+String imgUrlFor(String base, String id, String name, String mode) {
+  switch (mode) {
+    case 'noext':
+      return '$base/f/$id';
+    case 'query':
+      return '$base/f/$id?f=img.jpg';
+    default:
+      return '$base/f/$id/$name';
+  }
+}
+
+/// سلّم التجارب نفسه (منفصل علشان يتختبر): بيرجّع الطريقة اللي نجحت (أو null) وعدد التجارب
+Future<(ImgVariant?, int)> runImageLadder({
+  required List<ImgVariant> order,
+  required Future<String> Function(ImgVariant v, int n) share,
+  required Future<void> Function(String url, ImgVariant v) load,
+  required Future<bool> Function(String url, ImgVariant v) waitFetch,
+  void Function(String msg)? note,
+  bool Function()? cancelled,
+  Future<void> Function()? stop,
+}) async {
+  for (var n = 0; n < order.length; n++) {
+    if (cancelled?.call() ?? false) return (null, n);
+    final v = order[n];
+    note?.call('صورة: تجربة ${n + 1} من ${order.length} (${v.label})…');
+    AppLog.add('CAST', 'صورة: تجربة ${n + 1} من ${order.length} [${v.id}] class=${v.cls} pi=${imgProtocolInfo(v)} meta=${v.meta} play=${v.play} hdr=${v.hdr} url=${v.url}');
+    final url = await share(v, n);
+    final id = MediaServer.idOfUrl(url);
+    try {
+      await load(url, v);
+    } catch (e) {
+      AppLog.add('CAST', 'صورة: تجربة ${n + 1} (${v.id}) ✗ الريسيفر رفض: $e');
+      continue;
+    }
+    if (await waitFetch(url, v)) {
+      AppLog.add('CAST', 'صورة: تجربة ${n + 1} (${v.id}) ✓ الريسيفر طلب الصورة (GET)');
+      return (v, n + 1);
+    }
+    if (cancelled?.call() ?? false) return (null, n + 1);
+    AppLog.add('CAST',
+        'صورة: تجربة ${n + 1} (${v.id}) ✗ ${id != null && MediaServer.I.headed.contains(id) ? 'الريسيفر عمل HEAD بس ومطلبش الصورة' : 'الريسيفر مطلبش حاجة'}');
+  }
+  try {
+    await stop?.call();
+  } catch (_) {}
+  return (null, order.length);
+}
+
+String xmlUnesc(String s) => s
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&#39;', "'")
+    .replaceAll('&amp;', '&');
+
+String learnedCountAr(int n) => n == 1 ? 'طريقة واحدة' : '$n طرق';
+
+String imageAllFailedAr(int n) =>
+    'الريسيفر مرضيش يحمّل الصورة بأي طريقة من ${learnedCountAr(n)} جرّبتهم. Web Video Caster بيعرض صور على نفس الريسيفر، '
+    'يعني العيب في طريقة الإرسال مش في الريسيفر: افتح «تعلّم من Web Video Caster» هنا في الكاست، ابعت صورة منه، وبعدين ابعتلي السجل.';
+
+// ---------- «تعلّم من Web Video Caster»: شاشة DLNA وهمية على الموبايل ----------
+
+/// (service, action) من هيدر SOAPACTION أو من البودي
+(String, String) parseSoapAction(String? soapActionHeader, String body) {
+  final h = (soapActionHeader ?? '').replaceAll('"', '').trim();
+  final m = RegExp(r'service:(\w+):\d+#(\w+)').firstMatch(h);
+  if (m != null) return (m[1]!, m[2]!);
+  final b = RegExp(r'<(?:\w+:)?(\w+)\s+xmlns(?::\w+)?="urn:schemas-upnp-org:service:(\w+):\d+"').firstMatch(body);
+  if (b != null) return (b[2]!, b[1]!);
+  return ('', '');
+}
+
+const String kLearnSink = 'http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG,http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_MED,'
+    'http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_SM,http-get:*:image/jpeg:*,http-get:*:image/png:*,http-get:*:image/gif:*,'
+    'http-get:*:video/mp4:*,http-get:*:video/x-matroska:*,http-get:*:video/mpeg:*,http-get:*:video/mp2t:*,'
+    'http-get:*:application/x-mpegURL:*,http-get:*:application/vnd.apple.mpegurl:*,http-get:*:audio/mpeg:*,http-get:*:audio/mp4:*';
+
+/// حالة الشاشة الوهمية (علشان GetTransportInfo وغيره)
+class LearnState {
+  String state = 'NO_MEDIA_PRESENT';
+  String uri = '';
+  String metaEsc = '';
+  int volume = 30;
+  bool mute = false;
+}
+
+/// رد الشاشة الوهمية على أي أمر SOAP
+String learnSoapReply(String service, String action, String body, LearnState st) {
+  String v(String tag) => soapValue(body, tag) ?? '';
+  final out = <String, String>{};
+  switch (action) {
+    case 'SetAVTransportURI':
+      st.uri = xmlUnesc(v('CurrentURI')).trim();
+      st.metaEsc = v('CurrentURIMetaData');
+      st.state = 'STOPPED';
+      break;
+    case 'Play':
+      st.state = 'PLAYING';
+      break;
+    case 'Pause':
+      st.state = 'PAUSED_PLAYBACK';
+      break;
+    case 'Stop':
+      st.state = 'STOPPED';
+      break;
+    case 'GetTransportInfo':
+      out.addAll({'CurrentTransportState': st.state, 'CurrentTransportStatus': 'OK', 'CurrentSpeed': '1'});
+      break;
+    case 'GetPositionInfo':
+      out.addAll({
+        'Track': '1',
+        'TrackDuration': '00:00:00',
+        'TrackMetaData': xmlUnesc(st.metaEsc),
+        'TrackURI': st.uri,
+        'RelTime': '00:00:00',
+        'AbsTime': '00:00:00',
+        'RelCount': '0',
+        'AbsCount': '0',
+      });
+      break;
+    case 'GetMediaInfo':
+      out.addAll({
+        'NrTracks': st.uri.isEmpty ? '0' : '1',
+        'MediaDuration': '00:00:00',
+        'CurrentURI': st.uri,
+        'CurrentURIMetaData': xmlUnesc(st.metaEsc),
+        'NextURI': '',
+        'NextURIMetaData': '',
+        'PlayMedium': 'NETWORK',
+        'RecordMedium': 'NOT_IMPLEMENTED',
+        'WriteStatus': 'NOT_IMPLEMENTED',
+      });
+      break;
+    case 'GetCurrentTransportActions':
+      out['Actions'] = 'Play,Stop,Pause,Seek';
+      break;
+    case 'GetTransportSettings':
+      out.addAll({'PlayMode': 'NORMAL', 'RecQualityMode': 'NOT_IMPLEMENTED'});
+      break;
+    case 'GetDeviceCapabilities':
+      out.addAll({'PlayMedia': 'NETWORK', 'RecMedia': 'NOT_IMPLEMENTED', 'RecQualityModes': 'NOT_IMPLEMENTED'});
+      break;
+    case 'GetVolume':
+      out['CurrentVolume'] = '${st.volume}';
+      break;
+    case 'SetVolume':
+      st.volume = int.tryParse(v('DesiredVolume')) ?? st.volume;
+      break;
+    case 'GetMute':
+      out['CurrentMute'] = st.mute ? '1' : '0';
+      break;
+    case 'SetMute':
+      st.mute = v('DesiredMute') == '1' || v('DesiredMute').toLowerCase() == 'true';
+      break;
+    case 'GetProtocolInfo':
+      out.addAll({'Source': '', 'Sink': kLearnSink});
+      break;
+    case 'GetCurrentConnectionIDs':
+      out['ConnectionIDs'] = '0';
+      break;
+    case 'GetCurrentConnectionInfo':
+      out.addAll({
+        'RcsID': '0',
+        'AVTransportID': '0',
+        'ProtocolInfo': '',
+        'PeerConnectionManager': '',
+        'PeerConnectionID': '-1',
+        'Direction': 'Input',
+        'Status': 'OK',
+      });
+      break;
+  }
+  final a = out.entries.map((e) => '<${e.key}>${xmlEsc(e.value)}</${e.key}>').join();
+  return '<?xml version="1.0" encoding="utf-8"?>'
+      '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+      '<s:Body><u:${action}Response xmlns:u="urn:schemas-upnp-org:service:$service:1">$a</u:${action}Response></s:Body></s:Envelope>';
+}
+
+String learnDescXml(String uuid) => '<?xml version="1.0" encoding="utf-8"?>'
+    '<root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">'
+    '<specVersion><major>1</major><minor>0</minor></specVersion><device>'
+    '<deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>'
+    '<friendlyName>A2R تعلّم</friendlyName><manufacturer>A2R</manufacturer><modelName>A2R Learn</modelName>'
+    '<modelNumber>1</modelNumber><UDN>$uuid</UDN><dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC>'
+    '<serviceList>'
+    '${_learnSvc('AVTransport')}${_learnSvc('RenderingControl')}${_learnSvc('ConnectionManager')}'
+    '</serviceList></device></root>';
+
+String _learnSvc(String s) => '<service><serviceType>urn:schemas-upnp-org:service:$s:1</serviceType>'
+    '<serviceId>urn:upnp-org:serviceId:$s</serviceId><SCPDURL>/learn/$s.xml</SCPDURL>'
+    '<controlURL>/learn/$s/control</controlURL><eventSubURL>/learn/$s/event</eventSubURL></service>';
+
+const Map<String, List<String>> _kLearnActions = {
+  'AVTransport': [
+    'SetAVTransportURI:InstanceID,CurrentURI,CurrentURIMetaData:',
+    'SetNextAVTransportURI:InstanceID,NextURI,NextURIMetaData:',
+    'GetMediaInfo:InstanceID:NrTracks,MediaDuration,CurrentURI,CurrentURIMetaData,NextURI,NextURIMetaData,PlayMedium,RecordMedium,WriteStatus',
+    'GetTransportInfo:InstanceID:CurrentTransportState,CurrentTransportStatus,CurrentSpeed',
+    'GetPositionInfo:InstanceID:Track,TrackDuration,TrackMetaData,TrackURI,RelTime,AbsTime,RelCount,AbsCount',
+    'GetDeviceCapabilities:InstanceID:PlayMedia,RecMedia,RecQualityModes',
+    'GetTransportSettings:InstanceID:PlayMode,RecQualityMode',
+    'GetCurrentTransportActions:InstanceID:Actions',
+    'Stop:InstanceID:',
+    'Play:InstanceID,Speed:',
+    'Pause:InstanceID:',
+    'Seek:InstanceID,Unit,Target:',
+    'Next:InstanceID:',
+    'Previous:InstanceID:',
+  ],
+  'RenderingControl': [
+    'ListPresets:InstanceID:CurrentPresetNameList',
+    'SelectPreset:InstanceID,PresetName:',
+    'GetVolume:InstanceID,Channel:CurrentVolume',
+    'SetVolume:InstanceID,Channel,DesiredVolume:',
+    'GetMute:InstanceID,Channel:CurrentMute',
+    'SetMute:InstanceID,Channel,DesiredMute:',
+  ],
+  'ConnectionManager': [
+    'GetProtocolInfo::Source,Sink',
+    'GetCurrentConnectionIDs::ConnectionIDs',
+    'GetCurrentConnectionInfo:ConnectionID:RcsID,AVTransportID,ProtocolInfo,PeerConnectionManager,PeerConnectionID,Direction,Status',
+  ],
+};
+
+/// وصف الخدمة (SCPD) — متغير حالة لكل اسم معامل (string) علشان أي برنامج كاست يقبله
+String learnScpd(String service) {
+  final acts = _kLearnActions[service] ?? const [];
+  final vars = <String>{};
+  final sb = StringBuffer('<?xml version="1.0" encoding="utf-8"?><scpd xmlns="urn:schemas-upnp-org:service-1-0">'
+      '<specVersion><major>1</major><minor>0</minor></specVersion><actionList>');
+  for (final a in acts) {
+    final p = a.split(':');
+    sb.write('<action><name>${p[0]}</name><argumentList>');
+    for (final (dir, list) in [('in', p[1]), ('out', p[2])]) {
+      for (final n in list.split(',').where((x) => x.isNotEmpty)) {
+        vars.add('A_ARG_$n');
+        sb.write('<argument><name>$n</name><direction>$dir</direction><relatedStateVariable>A_ARG_$n</relatedStateVariable></argument>');
+      }
+    }
+    sb.write('</argumentList></action>');
+  }
+  sb.write('</actionList><serviceStateTable>');
+  sb.write('<stateVariable sendEvents="yes"><name>LastChange</name><dataType>string</dataType></stateVariable>');
+  for (final v in vars) {
+    sb.write('<stateVariable sendEvents="no"><name>$v</name><dataType>string</dataType></stateVariable>');
+  }
+  sb.write('</serviceStateTable></scpd>');
+  return sb.toString();
+}
+
+/// رد على M-SEARCH (لو نوع البحث يخصنا) — أو null
+List<String> learnSsdpReplies(String msg, String location, String uuid) {
+  final first = msg.split(RegExp(r'\r?\n')).first.toUpperCase();
+  if (!first.startsWith('M-SEARCH')) return const [];
+  final st = parseHttpHeaders(msg)['ST'] ?? '';
+  const types = [
+    'upnp:rootdevice',
+    'urn:schemas-upnp-org:device:MediaRenderer:1',
+    'urn:schemas-upnp-org:service:AVTransport:1',
+    'urn:schemas-upnp-org:service:RenderingControl:1',
+    'urn:schemas-upnp-org:service:ConnectionManager:1',
+  ];
+  final List<String> hit;
+  if (st == 'ssdp:all') {
+    hit = types;
+  } else if (st == uuid) {
+    hit = [uuid];
+  } else if (types.contains(st)) {
+    hit = [st];
+  } else {
+    return const [];
+  }
+  return hit
+      .map((t) => 'HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nDATE: ${HttpDate.format(DateTime.now())}\r\nEXT:\r\n'
+          'LOCATION: $location\r\nSERVER: Android/1.0 UPnP/1.0 A2RLearn/1.0\r\nST: $t\r\n'
+          'USN: ${t == uuid ? uuid : '$uuid::$t'}\r\n\r\n')
+      .toList();
+}
+
+/// اللي اتسجّل من آخر صورة WVC بعتها
+class LearnedCast {
+  String uri = '';
+  String metaEsc = '';
+  bool sentPlay = false;
+  final List<String> actions = [];
+  /// هيدرز رد سيرفر WVC بالحروف زي ما هي (من HEAD)
+  Map<String, String> headHeaders = {};
+  String headStatus = '';
+  String getStatus = '';
+  Map<String, String> getHeaders = {};
+
+  String get meta => xmlUnesc(metaEsc);
+  String? get protocolInfo => RegExp(r'protocolInfo="([^"]*)"').firstMatch(meta)?.group(1);
+  String? get upnpClass => RegExp(r'<upnp:class>([^<]*)</upnp:class>').firstMatch(meta)?.group(1);
+  bool get looksImage => (protocolInfo ?? '').contains('image/') || (upnpClass ?? '').contains('imageItem') || _hdr('content-type').startsWith('image');
+
+  String _hdr(String name) {
+    for (final m in [headHeaders, getHeaders]) {
+      for (final e in m.entries) {
+        if (e.key.toLowerCase() == name) return e.value;
+      }
+    }
+    return '';
+  }
+
+  /// نحوّلها لطريقة إرسال نستخدمها مع الريسيفر الحقيقي
+  ImgVariant toVariant() {
+    var tmpl = meta;
+    if (uri.isNotEmpty) tmpl = tmpl.replaceAll(xmlEsc(uri), '{URL}').replaceAll(uri, '{URL}');
+    final hdrs = <String, String>{};
+    for (final m in [getHeaders, headHeaders]) {
+      for (final e in m.entries) {
+        final k = e.key.toLowerCase();
+        if (k.endsWith('.dlna.org') || k == 'captioninfo.sec' || k == 'realtimeinfo.dlna.org') hdrs[e.key] = e.value;
+      }
+    }
+    final path = Uri.tryParse(uri)?.path ?? '';
+    final hasExt = RegExp(r'\.(jpe?g|png|gif|webp)$', caseSensitive: false).hasMatch(path);
+    return ImgVariant('wvc', 'طريقة Web Video Caster',
+        meta: metaEsc.trim().isNotEmpty,
+        pi: 'custom',
+        customPi: protocolInfo,
+        customMeta: tmpl.trim().isEmpty ? null : tmpl,
+        hdr: 'custom',
+        customHeaders: hdrs,
+        play: sentPlay ? 'wait' : 'none',
+        url: hasExt ? 'ext' : 'noext');
+  }
+
+  String summaryAr() {
+    final b = StringBuffer();
+    b.writeln('الأوامر: ${actions.join(' ← ')}');
+    b.writeln('الرابط: $uri');
+    b.writeln('protocolInfo: ${protocolInfo ?? '(مفيش وصف)'}');
+    b.writeln('upnp:class: ${upnpClass ?? '-'}');
+    b.writeln('Play: ${sentPlay ? 'اتبعت' : 'متبعتش'}');
+    if (headStatus.isNotEmpty) b.writeln('HEAD: $headStatus');
+    headHeaders.forEach((k, v) => b.writeln('  $k: $v'));
+    if (getStatus.isNotEmpty) b.writeln('GET: $getStatus');
+    getHeaders.forEach((k, v) => b.writeln('  $k: $v'));
+    return b.toString().trim();
+  }
+}
+
+/// يقرا الهيدرز بالحروف زي ما هي (HttpClient بتاع دارت بيصغّرها، فبنستخدم socket)
+Future<(String, Map<String, String>)> rawHttpHeaders(String url, String method, {Map<String, String> extra = const {}}) async {
+  final u = Uri.parse(url);
+  final s = await Socket.connect(u.host, u.hasPort ? u.port : 80, timeout: const Duration(seconds: 5));
+  try {
+    final path = u.hasQuery ? '${u.path}?${u.query}' : (u.path.isEmpty ? '/' : u.path);
+    final req = StringBuffer('$method $path HTTP/1.1\r\nHost: ${u.host}:${u.port}\r\nUser-Agent: $kDlnaUa\r\n'
+        'getcontentFeatures.dlna.org: 1\r\nConnection: close\r\n');
+    extra.forEach((k, v) => req.write('$k: $v\r\n'));
+    req.write('\r\n');
+    s.write(req.toString());
+    await s.flush();
+    final buf = <int>[];
+    final done = Completer<void>();
+    late StreamSubscription sub;
+    sub = s.listen((d) {
+      buf.addAll(d);
+      if (latin1.decode(buf, allowInvalid: true).contains('\r\n\r\n') && !done.isCompleted) done.complete();
+    }, onDone: () {
+      if (!done.isCompleted) done.complete();
+    }, onError: (_) {
+      if (!done.isCompleted) done.complete();
+    });
+    await done.future.timeout(const Duration(seconds: 6), onTimeout: () {});
+    await sub.cancel();
+    return parseRawHead(utf8.decode(buf, allowMalformed: true));
+  } finally {
+    s.destroy();
+  }
+}
+
+(String, Map<String, String>) parseRawHead(String txt) {
+  final end = txt.indexOf('\r\n\r\n');
+  final head = end >= 0 ? txt.substring(0, end) : txt;
+  final lines = head.split('\r\n');
+  final out = <String, String>{};
+  for (final l in lines.skip(1)) {
+    final i = l.indexOf(':');
+    if (i > 0) out[l.substring(0, i).trim()] = l.substring(i + 1).trim();
+  }
+  return (lines.isEmpty ? '' : lines.first.trim(), out);
+}
+
+/// الشاشة الوهمية «A2R تعلّم»: Web Video Caster يشوفها كشاشة DLNA، ولما يبعتلها صورة بنسجّل هو بيبعت إيه بالظبط
+class LearnRenderer extends ChangeNotifier {
+  LearnRenderer._();
+  static final LearnRenderer I = LearnRenderer._();
+  bool on = false;
+  String status = '';
+  HttpServer? _http;
+  RawDatagramSocket? _udp;
+  Timer? _alive;
+  String _location = '';
+  final LearnState st = LearnState();
+  LearnedCast? last;
+  final List<String> events = [];
+  String get uuid => 'uuid:a2r-learn-${md5Hex(Store.clientUuid).substring(0, 12)}';
+
+  void _ev(String s) {
+    events.insert(0, '${DateTime.now().toIso8601String().substring(11, 19)} $s');
+    if (events.length > 40) events.removeLast();
+    AppLog.add('LEARN', s);
+    notifyListeners();
+  }
+
+  Future<void> start() async {
+    if (on) return;
+    final ip = await phoneIpFor(Store.receiverIp);
+    if (ip == null || !_isLan(ip)) {
+      status = 'الموبايل لازم يكون على واي فاي البيت';
+      notifyListeners();
+      return;
+    }
+    try {
+      _http = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      _http!.autoCompress = false;
+      _http!.listen(_onHttp, onError: (e) => AppLog.add('LEARN', 'http error $e'));
+      _location = 'http://$ip:${_http!.port}/learn/desc.xml';
+      await Native.multicastLock(true);
+      try {
+        _udp = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 1900, reuseAddress: true, reusePort: true);
+      } catch (_) {
+        _udp = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 1900, reuseAddress: true);
+      }
+      _udp!.multicastLoopback = true;
+      try {
+        _udp!.joinMulticast(InternetAddress('239.255.255.250'));
+      } catch (e) {
+        AppLog.add('LEARN', 'joinMulticast ✗ $e');
+      }
+      _udp!.listen(_onUdp);
+      on = true;
+      status = 'شغالة: افتح Web Video Caster ودوّر على شاشة «A2R تعلّم» وابعتلها صورة';
+      _ev('بدأت — $_location');
+      _notify('ssdp:alive');
+      _alive = Timer.periodic(const Duration(seconds: 8), (_) => _notify('ssdp:alive'));
+    } catch (e) {
+      status = 'مقدرتش أشغّلها: $e';
+      AppLog.add('LEARN', 'start ✗ $e');
+      await stop();
+    }
+    notifyListeners();
+  }
+
+  static bool _isLan(String ip) =>
+      ip.startsWith('192.168.') || ip.startsWith('10.') || RegExp(r'^172\.(1[6-9]|2\d|3[01])\.').hasMatch(ip);
+
+  void _notify(String nts) {
+    final u = _udp;
+    if (u == null) return;
+    const types = [
+      'upnp:rootdevice',
+      'urn:schemas-upnp-org:device:MediaRenderer:1',
+      'urn:schemas-upnp-org:service:AVTransport:1',
+      'urn:schemas-upnp-org:service:RenderingControl:1',
+      'urn:schemas-upnp-org:service:ConnectionManager:1',
+    ];
+    for (final t in [uuid, ...types]) {
+      final msg = 'NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: $_location\r\n'
+          'NT: $t\r\nNTS: $nts\r\nSERVER: Android/1.0 UPnP/1.0 A2RLearn/1.0\r\nUSN: ${t == uuid ? uuid : '$uuid::$t'}\r\n\r\n';
+      try {
+        u.send(utf8.encode(msg), InternetAddress('239.255.255.250'), 1900);
+      } catch (_) {}
+    }
+  }
+
+  void _onUdp(RawSocketEvent e) {
+    if (e != RawSocketEvent.read) return;
+    final d = _udp?.receive();
+    if (d == null) return;
+    final msg = utf8.decode(d.data, allowMalformed: true);
+    final replies = learnSsdpReplies(msg, _location, uuid);
+    if (replies.isEmpty) return;
+    AppLog.add('LEARN', 'M-SEARCH من ${d.address.address}:${d.port} ST=${parseHttpHeaders(msg)['ST']}');
+    Future.delayed(const Duration(milliseconds: 60), () {
+      for (final r in replies) {
+        try {
+          _udp?.send(utf8.encode(r), d.address, d.port);
+        } catch (_) {}
+      }
+    });
+  }
+
+  Future<void> _onHttp(HttpRequest q) async {
+    final res = q.response;
+    final p = q.uri.path;
+    final from = q.connectionInfo?.remoteAddress.address ?? '?';
+    try {
+      if (!_isLan(from) && from != '127.0.0.1') {
+        res.statusCode = 403;
+        await res.close();
+        return;
+      }
+      if (q.method == 'SUBSCRIBE' || q.method == 'UNSUBSCRIBE') {
+        res.headers.set('SID', 'uuid:a2r-learn-sub-1', preserveHeaderCase: true);
+        res.headers.set('TIMEOUT', 'Second-1800', preserveHeaderCase: true);
+        await res.close();
+        return;
+      }
+      if (p == '/learn/desc.xml') {
+        _ev('${q.headers.value('user-agent') ?? from} فتح وصف الشاشة');
+        return await _xml(res, learnDescXml(uuid));
+      }
+      final m = RegExp(r'^/learn/(\w+)\.xml$').firstMatch(p);
+      if (m != null) return await _xml(res, learnScpd(m[1]!));
+      final c = RegExp(r'^/learn/(\w+)/control$').firstMatch(p);
+      if (c != null && q.method == 'POST') {
+        final body = await utf8.decodeStream(q);
+        final (svc0, action) = parseSoapAction(q.headers.value('soapaction'), body);
+        final svc = svc0.isEmpty ? c[1]! : svc0;
+        AppLog.add('LEARN', '← $action\n${body.length > 3000 ? body.substring(0, 3000) : body}');
+        _record(action, body);
+        return await _xml(res, learnSoapReply(svc, action, body, st));
+      }
+      res.statusCode = 404;
+      await res.close();
+    } catch (e) {
+      AppLog.add('LEARN', 'http ✗ $e');
+      try {
+        await res.close();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _xml(HttpResponse res, String xml) async {
+    final b = utf8.encode(xml);
+    res.headers.set('Content-Type', 'text/xml; charset="utf-8"', preserveHeaderCase: true);
+    res.headers.set('Server', 'Android/1.0 UPnP/1.0 A2RLearn/1.0', preserveHeaderCase: true);
+    res.contentLength = b.length;
+    res.add(b);
+    await res.close();
+  }
+
+  void _record(String action, String body) {
+    if (action.startsWith('Get')) return;
+    if (action == 'SetAVTransportURI') {
+      final lc = LearnedCast();
+      lc.actions.add(action);
+      lc.uri = xmlUnesc(soapValue(body, 'CurrentURI') ?? '').trim();
+      lc.metaEsc = soapValue(body, 'CurrentURIMetaData') ?? '';
+      last = lc;
+      _ev('WVC بعت رابط: ${lc.uri}');
+      AppLog.add('LEARN', 'SetAVTransportURI كامل:\n$body');
+      _probe(lc);
+    } else if (last != null) {
+      last!.actions.add(action);
+      if (action == 'Play') last!.sentPlay = true;
+      _ev('WVC بعت $action');
+    } else {
+      _ev('WVC بعت $action');
+    }
+    notifyListeners();
+  }
+
+  Future<void> _probe(LearnedCast lc) async {
+    if (!lc.uri.startsWith('http')) return;
+    try {
+      final (s, h) = await rawHttpHeaders(lc.uri, 'HEAD');
+      lc.headStatus = s;
+      lc.headHeaders = h;
+      AppLog.add('LEARN', 'HEAD ${lc.uri} → $s\n${h.entries.map((e) => '${e.key}: ${e.value}').join('\n')}');
+    } catch (e) {
+      lc.headStatus = 'فشل: $e';
+    }
+    try {
+      final (s, h) = await rawHttpHeaders(lc.uri, 'GET');
+      lc.getStatus = s;
+      lc.getHeaders = h;
+      AppLog.add('LEARN', 'GET ${lc.uri} → $s\n${h.entries.map((e) => '${e.key}: ${e.value}').join('\n')}');
+    } catch (e) {
+      lc.getStatus = 'فشل: $e';
+    }
+    AppLog.add('LEARN', 'الخلاصة:\n${lc.summaryAr()}');
+    notifyListeners();
+  }
+
+  Future<void> stop() async {
+    _alive?.cancel();
+    _alive = null;
+    if (_udp != null) {
+      _notify('ssdp:byebye');
+      _udp?.close();
+      _udp = null;
+      await Native.multicastLock(false);
+    }
+    await _http?.close(force: true);
+    _http = null;
+    if (on) _ev('وقفت');
+    on = false;
+    status = '';
+    notifyListeners();
+  }
+}
+
+class ImgStore {
+  static String? get preferred => Store.p.getString('img_variant');
+  static set preferred(String? v) => v == null ? Store.p.remove('img_variant') : Store.p.setString('img_variant', v);
+  static ImgVariant? get learned {
+    final s = Store.p.getString('img_learned');
+    if (s == null) return null;
+    try {
+      return ImgVariant.fromJson(jsonDecode(s));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static set learned(ImgVariant? v) => v == null ? Store.p.remove('img_learned') : Store.p.setString('img_learned', jsonEncode(v.toJson()));
+}
+
+class LearnPage extends StatefulWidget {
+  const LearnPage({super.key});
+  @override
+  State<LearnPage> createState() => _LearnPageState();
+}
+
+class _LearnPageState extends State<LearnPage> {
+  final lr = LearnRenderer.I;
+  bool sending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    lr.addListener(_up);
+  }
+
+  void _up() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    lr.removeListener(_up);
+    lr.stop(); // بتقفل لوحدها أول ما تخرج من الشاشة
+    super.dispose();
+  }
+
+  Future<void> _copy() async {
+    final lc = lr.last;
+    if (lc == null) return;
+    final v = lc.toVariant();
+    ImgStore.learned = v;
+    ImgStore.preferred = null;
+    CastState.I.dlnaImagesOk = null;
+    AppLog.add('LEARN', 'اتحفظت طريقة WVC: ${jsonEncode(v.toJson())}');
+    if (mounted) toast(context, 'اتحفظت — الصور الجاية هتتبعت للريسيفر بطريقة Web Video Caster الأول');
+    setState(() {});
+  }
+
+  /// نبعت نفس أوامر WVC بالظبط (بنفس رابط WVC) للريسيفر الحقيقي
+  Future<void> _replay() async {
+    final lc = lr.last;
+    final c = CastState.I.client;
+    if (lc == null) return;
+    if (c == null) {
+      toast(context, 'اختار الريسيفر في الكاست الأول');
+      return;
+    }
+    setState(() => sending = true);
+    try {
+      try {
+        await c.av('Stop');
+      } catch (_) {}
+      await c.av('SetAVTransportURI', {'CurrentURI': lc.uri, 'CurrentURIMetaData': lc.meta});
+      if (lc.sentPlay) {
+        await Future.delayed(const Duration(milliseconds: 700));
+        try {
+          await c.play();
+        } catch (e) {
+          AppLog.add('LEARN', 'replay Play ✗ $e');
+        }
+      }
+      if (mounted) toast(context, 'اتبعت للريسيفر بنفس أوامر WVC — بص على الشاشة (وسيب WVC مفتوح علشان الرابط بتاعه)');
+    } catch (e) {
+      if (mounted) toast(context, 'الريسيفر رفض: ${castErrorAr(e)}');
+    }
+    if (mounted) setState(() => sending = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final lc = lr.last;
+    final saved = ImgStore.learned;
+    return Scaffold(
+      appBar: AppBar(title: const Text('تعلّم من Web Video Caster')),
+      body: ListView(padding: const EdgeInsets.all(12), children: [
+        const Text(
+            'الفكرة: الموبايل بيعمل نفسه شاشة اسمها «A2R تعلّم». افتح Web Video Caster، اختار الشاشة دي، وابعت صورة. '
+            'هنسجّل هو بيبعت إيه بالظبط، وبعدين نبعت الصور للريسيفر بنفس الطريقة.\n'
+            'شغالة على واي فاي البيت بس، وبتقفل لوحدها لما تخرج من الصفحة.',
+            style: TextStyle(fontSize: 13)),
+        const SizedBox(height: 8),
+        SwitchListTile(
+          value: lr.on,
+          title: const Text('شغّل الشاشة الوهمية'),
+          subtitle: Text(lr.status.isEmpty ? 'مقفولة' : lr.status, style: const TextStyle(fontSize: 12)),
+          onChanged: (v) => v ? lr.start() : lr.stop(),
+        ),
+        if (saved != null)
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.check_circle, color: kGold),
+              title: const Text('في طريقة WVC محفوظة'),
+              subtitle: Text(saved.customPi ?? '-', style: const TextStyle(fontSize: 11)),
+              trailing: TextButton(
+                  onPressed: () => setState(() => ImgStore.learned = null), child: const Text('امسحها')),
+            ),
+          ),
+        if (lc != null) ...[
+          const SizedBox(height: 8),
+          Text(lc.looksImage ? 'اتسجّلت صورة من WVC ✓' : 'اتسجّل ملف من WVC (مش باين إنه صورة — ابعت صورة)',
+              style: const TextStyle(fontWeight: FontWeight.bold, color: kGold)),
+          const SizedBox(height: 6),
+          SelectableText(lc.summaryAr(), style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+          const SizedBox(height: 10),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            FilledButton.icon(onPressed: _copy, icon: const Icon(Icons.copy_all), label: const Text('انسخ الطريقة دي')),
+            FilledButton.tonalIcon(
+                onPressed: sending ? null : _replay,
+                icon: const Icon(Icons.cast),
+                label: const Text('ابعتها للريسيفر بنفس أوامر WVC')),
+          ]),
+        ],
+        const SizedBox(height: 12),
+        if (lr.events.isNotEmpty) const Text('اللي حصل:', style: TextStyle(fontWeight: FontWeight.bold)),
+        for (final e in lr.events) Text(e, style: const TextStyle(fontSize: 11, color: kMuted)),
+        const SizedBox(height: 12),
+        const Text('بعد ما تخلص ابعتلي السجل (من شاشة السجل ← مشاركة).', style: TextStyle(fontSize: 12, color: kMuted)),
+      ]),
+    );
+  }
+}
+
+// ======== names_v5.dart ========
+// أسماء الأجهزة: الراوتر بيرجّع "--" لأجهزة كتير، فبنكمّل: NetBIOS ← mDNS ← DNS عكسي ← الشركة + النوع
+
+/// أسماء مالهاش معنى من الراوتر/الشبكة
+bool isBadHostName(String? s) {
+  final t = (s ?? '').trim().toLowerCase();
+  if (t.isEmpty) return true;
+  const bad = {'--', '-', '*', '?', 'unknown', 'null', '(null)', 'none', 'n/a', 'localhost', 'anonymous', 'android', 'espressif'};
+  if (bad.contains(t)) return true;
+  if (RegExp(r'^[-*_.\s]+$').hasMatch(t)) return true;
+  if (RegExp(r'^\d{1,3}([.-]\d{1,3}){3}$').hasMatch(t)) return true; // عنوان IP مش اسم
+  if (RegExp(r'^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$').hasMatch(t)) return true; // MAC مش اسم
+  return false;
+}
+
+/// نضّف الاسم: شيل .local و .lan والدومين بتاع الراوتر
+String cleanHostName(String s) {
+  var t = s.trim();
+  if (t.endsWith('.')) t = t.substring(0, t.length - 1);
+  for (final suf in ['.local', '.lan', '.home', '.localdomain', '.router']) {
+    if (t.toLowerCase().endsWith(suf)) t = t.substring(0, t.length - suf.length);
+  }
+  return t;
+}
+
+/// اسم الجهاز لما مفيش اسم: «موبايل Samsung» / «كمبيوتر» / «(اسم مش معروف)»
+String fallbackDeviceName(String type, String vendor) {
+  final v = vendor.startsWith('MAC عشوائي') ? '' : vendor.split(RegExp(r'[,(]')).first.trim();
+  final shortV = v.split(' ').take(2).join(' ');
+  final typed = type == 'جهاز' || type.isEmpty ? '' : type;
+  if (typed.isNotEmpty && shortV.isNotEmpty) return '$typed $shortV';
+  if (shortV.isNotEmpty) return 'جهاز $shortV';
+  if (typed.isNotEmpty) return typed;
+  return '(اسم مش معروف)';
+}
+
+/// 192.168.7.5 → 5.7.168.192.in-addr.arpa
+String reverseArpa(String ip) => '${ip.split('.').reversed.join('.')}.in-addr.arpa';
+
+/// سؤال mDNS (PTR) — qu=true يطلب الرد مباشر للموبايل
+List<int> mdnsPtrQuery(String name, {int id = 0, bool qu = true}) {
+  final b = BytesBuilder();
+  b.add([id >> 8 & 0xFF, id & 0xFF, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+  for (final l in name.split('.')) {
+    final e = utf8.encode(l);
+    b.addByte(e.length);
+    b.add(e);
+  }
+  b.addByte(0);
+  b.add([0x00, 0x0C, qu ? 0x80 : 0x00, 0x01]);
+  return b.toBytes();
+}
+
+/// يقرا اسم DNS (فيه ضغط بالمؤشرات)
+(String, int) _dnsName(List<int> d, int off) {
+  final parts = <String>[];
+  var jumped = false, ret = off, guard = 0;
+  while (off < d.length && guard++ < 64) {
+    final l = d[off];
+    if (l == 0) {
+      off++;
+      break;
+    }
+    if (l & 0xC0 == 0xC0) {
+      if (off + 1 >= d.length) break;
+      if (!jumped) ret = off + 2;
+      off = ((l & 0x3F) << 8) | d[off + 1];
+      jumped = true;
+      continue;
+    }
+    if (off + 1 + l > d.length) break;
+    parts.add(utf8.decode(d.sublist(off + 1, off + 1 + l), allowMalformed: true));
+    off += 1 + l;
+  }
+  return (parts.join('.'), jumped ? ret : off);
+}
+
+/// رد mDNS/DNS → أول اسم PTR يخص العنوان المطلوب (أو أي A record اسمه .local للعنوان ده)
+String? parseMdnsPtr(List<int> d, String arpa) {
+  if (d.length < 12) return null;
+  final qd = d[4] << 8 | d[5], an = d[6] << 8 | d[7], ns = d[8] << 8 | d[9], ar = d[10] << 8 | d[11];
+  var off = 12;
+  for (var i = 0; i < qd; i++) {
+    off = _dnsName(d, off).$2 + 4;
+  }
+  final ip = arpa.replaceAll('.in-addr.arpa', '').split('.').reversed.join('.');
+  String? aName;
+  for (var i = 0; i < an + ns + ar && off + 10 <= d.length; i++) {
+    final (name, o) = _dnsName(d, off);
+    off = o;
+    if (off + 10 > d.length) break;
+    final type = d[off] << 8 | d[off + 1];
+    final rdlen = d[off + 8] << 8 | d[off + 9];
+    final rd = off + 10;
+    if (rd + rdlen > d.length) break;
+    if (type == 12 && name.toLowerCase() == arpa.toLowerCase()) {
+      final n = _dnsName(d, rd).$1;
+      if (n.isNotEmpty) return n;
+    }
+    if (type == 1 && rdlen == 4 && d.sublist(rd, rd + 4).join('.') == ip && name.isNotEmpty) aName ??= name;
+    off = rd + rdlen;
+  }
+  return aName;
+}
+
+/// mDNS: بنسأل الجهاز نفسه على 5353 + المجموعة 224.0.0.251 (الرد بييجي للموبايل مباشر)
+Future<String?> mdnsName(String ip, {Duration timeout = const Duration(milliseconds: 1200)}) async {
+  RawDatagramSocket? s;
+  try {
+    s = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    final arpa = reverseArpa(ip);
+    final q = mdnsPtrQuery(arpa, id: 0);
+    for (final to in [ip, '224.0.0.251']) {
+      try {
+        s.send(q, InternetAddress(to), 5353);
+      } catch (_) {}
+    }
+    final c = Completer<String?>();
+    final sub = s.listen((e) {
+      if (e != RawSocketEvent.read) return;
+      final dg = s!.receive();
+      if (dg == null || c.isCompleted) return;
+      final n = parseMdnsPtr(dg.data, arpa);
+      if (n != null && !isBadHostName(cleanHostName(n))) c.complete(cleanHostName(n));
+    }, onError: (_) {});
+    final r = await c.future.timeout(timeout, onTimeout: () => null);
+    await sub.cancel();
+    return r;
+  } catch (_) {
+    return null;
+  } finally {
+    s?.close();
+  }
+}
+
+/// DNS عكسي عن طريق الراوتر مباشرة (port 53) — بعض الراوترات بتعرف أسماء DHCP
+Future<String?> routerDnsName(String ip, String routerIp, {Duration timeout = const Duration(milliseconds: 900)}) async {
+  RawDatagramSocket? s;
+  try {
+    s = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    final arpa = reverseArpa(ip);
+    final q = mdnsPtrQuery(arpa, id: 0x5a5a, qu: false);
+    q[2] = 0x01; // recursion desired
+    s.send(q, InternetAddress(routerIp), 53);
+    final c = Completer<String?>();
+    final sub = s.listen((e) {
+      if (e != RawSocketEvent.read) return;
+      final dg = s!.receive();
+      if (dg == null || c.isCompleted) return;
+      final n = parseMdnsPtr(dg.data, arpa);
+      c.complete(n == null || isBadHostName(cleanHostName(n)) ? null : cleanHostName(n));
+    }, onError: (_) {});
+    final r = await c.future.timeout(timeout, onTimeout: () => null);
+    await sub.cancel();
+    return r;
+  } catch (_) {
+    return null;
+  } finally {
+    s?.close();
+  }
+}
+
+/// كاش الأسماء لكل MAC (علشان الاسم ميختفيش لو مرة الراوتر رجّع "--")
+class NameCache {
+  static Map<String, Map<String, String>> get all {
+    try {
+      return (jsonDecode(Store.p.getString('name_cache') ?? '{}') as Map)
+          .map((k, v) => MapEntry('$k', Map<String, String>.from(v as Map)));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static ({String name, String src})? of(String key) {
+    final e = all[key];
+    if (e == null || isBadHostName(e['n'])) return null;
+    return (name: e['n']!, src: e['s'] ?? '');
+  }
+
+  static Future<void> put(String key, String name, String src) async {
+    if (key.isEmpty || isBadHostName(name)) return;
+    final a = all;
+    a[key] = {'n': name, 's': src};
+    await Store.p.setString('name_cache', jsonEncode(a));
+  }
+}
+
+const Map<String, String> kNameSrcAr = {
+  'router': 'من الراوتر',
+  'netbios': 'من ويندوز (NetBIOS)',
+  'mdns': 'من mDNS',
+  'dns': 'من DNS الراوتر',
+  'cache': 'محفوظ من قبل',
+  'custom': 'اسمك',
+};
+
+/// يدوّر على أسماء الأجهزة اللي ملهاش اسم — كله بالتوازي وبحد أقصى للوقت
+Future<int> resolveMissingNames(Iterable<LanHost> hosts, {String? routerIp}) async {
+  var found = 0;
+  await Future.wait(hosts.where((h) => isBadHostName(h.name) && h.ip.isNotEmpty).map((h) async {
+    final key = h.mac.isNotEmpty ? h.mac : h.ip;
+    String? n;
+    var src = '';
+    final results = await Future.wait([
+      netbiosName(h.ip),
+      mdnsName(h.ip),
+      if (routerIp != null) routerDnsName(h.ip, routerIp) else Future.value(null),
+      reverseName(h.ip),
+    ]).timeout(const Duration(seconds: 3), onTimeout: () => [null, null, null, null]);
+    const srcs = ['netbios', 'mdns', 'dns', 'dns'];
+    for (var i = 0; i < results.length; i++) {
+      final r = results[i];
+      if (r != null && !isBadHostName(cleanHostName(r))) {
+        n = cleanHostName(r);
+        src = srcs[i];
+        break;
+      }
+    }
+    if (n == null) {
+      final c = NameCache.of(key);
+      if (c != null) {
+        n = c.name;
+        src = 'cache';
+      }
+    } else {
+      await NameCache.put(key, n, src);
+    }
+    AppLog.add('NAMES', '${h.ip} ${h.mac} → ${n ?? '(مفيش)'} ${src.isEmpty ? '' : '[$src]'} netbios=${results[0]} mdns=${results[1]} dns=${results[2]} rev=${results[3]}');
+    if (n != null) {
+      h.name = n;
+      h.nameSrc = src;
+      found++;
+    }
+  }));
+  return found;
+}
+
+// ======== features_v5.dart ========
+// v5: DNS الراوتر، سجل الإشارة/الانقطاعات/السرعة، مكان الراوتر، مراقبة الأجهزة، سجل الكاست، مؤقت/تكرار،
+// المشاركة من أي تطبيق، مجموعات القنوات، إضافات الكمبيوتر، نسخة احتياطية، قفل بالرقم السري
+
+// ---------------- أدوات عامة ----------------
+bool isIpv4(String s) {
+  final p = s.trim().split('.');
+  if (p.length != 4) return false;
+  for (final x in p) {
+    if (x.isEmpty || x.length > 3 || !RegExp(r'^\d+$').hasMatch(x)) return false;
+    final n = int.parse(x);
+    if (n > 255) return false;
+    if (x.length > 1 && x.startsWith('0')) return false;
+  }
+  return p.first != '0';
+}
+
+String dayKeyOf(int ms) {
+  final d = DateTime.fromMillisecondsSinceEpoch(ms);
+  return '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+}
+
+String hhmm(int ms) {
+  final d = DateTime.fromMillisecondsSinceEpoch(ms);
+  return '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+}
+
+String durAr(Duration d) {
+  if (d.inSeconds < 60) return '${d.inSeconds} ثانية';
+  if (d.inMinutes < 60) return '${d.inMinutes} دقيقة';
+  final h = d.inHours, m = d.inMinutes % 60;
+  return m == 0 ? '$h ساعة' : '$h ساعة و$m دقيقة';
+}
+
+List<dynamic> _jsonList(String key) {
+  try {
+    final v = jsonDecode(Store.p.getString(key) ?? '[]');
+    return v is List ? v : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+Map<String, dynamic> _jsonMap(String key) {
+  try {
+    final v = jsonDecode(Store.p.getString(key) ?? '{}');
+    return v is Map ? Map<String, dynamic>.from(v) : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+// ---------------- DNS الراوتر ----------------
+// الدليل: مكتبة zte-cpe-rs (اتجربت على ZTE MF289F) وسكريبت Miononno المشهور لراوترات ZTE:
+//   goformId=ROUTER_DNS_SETTING  dns_mode=manual|auto  prefer_dns_manual  standby_dns_manual  (+AD)
+// وقراية القيم: cmd=dns_mode,prefer_dns_manual,standby_dns_manual
+// مش متجرّب على MF286R1 بتاع أحمد → «تجريبي»: بنقرا الأول، وبعد التغيير بنقرا تاني ونقارن، والقديم محفوظ للتراجع.
+class DnsPreset {
+  final String name, primary, secondary, note;
+  const DnsPreset(this.name, this.primary, this.secondary, [this.note = '']);
+}
+
+const List<DnsPreset> kDnsPresets = [
+  DnsPreset('Google', '8.8.8.8', '8.8.4.4', 'سريع ومستقر'),
+  DnsPreset('Cloudflare', '1.1.1.1', '1.0.0.1', 'سريع'),
+  DnsPreset('AdGuard', '94.140.14.14', '94.140.15.15', 'يمنع إعلانات'),
+  DnsPreset('Cloudflare Family', '1.1.1.3', '1.0.0.3', 'يحجب مواقع الكبار'),
+  DnsPreset('Quad9', '9.9.9.9', '149.112.112.112', 'بيحجب مواقع ضارة'),
+];
+
+const List<String> kDnsReadCmds = ['dns_mode', 'prefer_dns_manual', 'standby_dns_manual', 'prefer_dns_auto', 'standby_dns_auto', 'wan_ipaddr'];
+
+/// (الوضع، الأساسي، الاحتياطي) من رد الراوتر
+({String mode, String primary, String secondary, bool supported}) parseRouterDns(Map<String, dynamic> j) {
+  final mode = '${j['dns_mode'] ?? ''}'.trim().toLowerCase();
+  final manual = mode == 'manual';
+  final p = '${j[manual ? 'prefer_dns_manual' : 'prefer_dns_auto'] ?? ''}'.trim();
+  final s = '${j[manual ? 'standby_dns_manual' : 'standby_dns_auto'] ?? ''}'.trim();
+  return (mode: mode, primary: p, secondary: s, supported: mode == 'manual' || mode == 'auto');
+}
+
+Map<String, String> routerDnsFields(String? primary, String? secondary) => {
+      'dns_mode': primary == null ? 'auto' : 'manual',
+      'prefer_dns_manual': primary ?? '',
+      'standby_dns_manual': secondary ?? '',
+    };
+
+/// القراية بعد التغيير طابقت المطلوب؟
+bool routerDnsApplied(Map<String, dynamic> j, String? primary, String? secondary) {
+  final r = parseRouterDns(j);
+  if (primary == null) return r.mode == 'auto';
+  return r.mode == 'manual' && '${j['prefer_dns_manual'] ?? ''}'.trim() == primary && '${j['standby_dns_manual'] ?? ''}'.trim() == (secondary ?? '');
+}
+
+String dnsLabel(String mode, String p, String s) {
+  if (mode == 'auto') return 'تلقائي من الشبكة${p.isNotEmpty ? ' ($p${s.isNotEmpty ? ' / $s' : ''})' : ''}';
+  if (mode == 'manual') {
+    final k = kDnsPresets.where((x) => x.primary == p).firstOrNull;
+    return '${k?.name ?? 'يدوي'}: $p${s.isNotEmpty ? ' / $s' : ''}';
+  }
+  return 'مش معروف';
+}
+
+class RouterDnsPage extends StatefulWidget {
+  final ZteRouter router;
+  const RouterDnsPage({super.key, required this.router});
+  @override
+  State<RouterDnsPage> createState() => _RouterDnsPageState();
+}
+
+class _RouterDnsPageState extends State<RouterDnsPage> {
+  Map<String, dynamic> raw = {};
+  bool loading = true, busy = false;
+  String msg = '';
+  final pC = TextEditingController(), sC = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _read();
+  }
+
+  Future<void> _read() async {
+    setState(() => loading = true);
+    try {
+      raw = await widget.router.get(kDnsReadCmds);
+      AppLog.add('DNS', 'قراية: ${jsonEncode(raw)}');
+    } catch (e) {
+      msg = 'مقدرتش أقرا الـ DNS: $e';
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  ({String? p, String? s})? get _prev {
+    final m = _jsonMap('dns_prev');
+    if (m.isEmpty) return null;
+    return (p: m['p'] as String?, s: m['s'] as String?);
+  }
+
+  Future<void> _apply(String? p, String? s, {bool undo = false}) async {
+    if (p != null && (!isIpv4(p) || (s != null && s.isNotEmpty && !isIpv4(s)))) {
+      toast(context, 'اكتب عنوان صحيح زي 8.8.8.8');
+      return;
+    }
+    final target = p == null ? 'تلقائي من الشبكة' : '$p${(s ?? '').isNotEmpty ? ' / $s' : ''}';
+    if (!await confirm(context, 'تغيّر DNS الراوتر لـ $target؟\n\nده هيأثر على كل الأجهزة. الأمر ده «تجريبي» على راوترك — هقرا القيمة بعد التغيير وأقولك لو اتطبقت، وتقدر ترجع بدوسة.')) return;
+    final cur = parseRouterDns(raw);
+    setState(() => busy = true);
+    try {
+      if (!undo) {
+        await Store.p.setString('dns_prev', jsonEncode(cur.mode == 'manual' ? {'p': '${raw['prefer_dns_manual'] ?? ''}', 's': '${raw['standby_dns_manual'] ?? ''}'} : {'p': null, 's': null}));
+      }
+      final res = await widget.router.set('ROUTER_DNS_SETTING', routerDnsFields(p, p == null ? null : (s ?? '')));
+      AppLog.add('DNS', 'رد التغيير: ${jsonEncode(res)}');
+      await Future.delayed(const Duration(seconds: 2));
+      raw = await widget.router.get(kDnsReadCmds);
+      AppLog.add('DNS', 'قراية بعد التغيير: ${jsonEncode(raw)}');
+      final ok = routerDnsApplied(raw, p, p == null ? null : (s ?? ''));
+      msg = ok
+          ? 'اتطبق ✓ — الأجهزة هتاخد الـ DNS الجديد لما تفصل وتوصل الواي فاي (أو بعد شوية)'
+          : 'الراوتر رد بـ «${res['result'] ?? '?'}» بس القراية مش مطابقة — يمكن الفيرموير ده مش بيقبل الأمر. جرّب من صفحة الراوتر (الزرار تحت) وابعتلي السجل.';
+    } catch (e) {
+      msg = 'خطأ: $e';
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final d = parseRouterDns(raw);
+    final prev = _prev;
+    return Scaffold(
+      appBar: AppBar(title: const Text('DNS الراوتر (تجريبي)')),
+      body: loading
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(padding: const EdgeInsets.all(12), children: [
+              Card(
+                child: ListTile(
+                  leading: const Icon(Icons.dns_rounded, color: kGold),
+                  title: Text(d.supported ? dnsLabel(d.mode, d.primary, d.secondary) : 'الراوتر مرجّعش إعداد الـ DNS'),
+                  subtitle: const Text('الـ DNS الحالي للراوتر (لكل الأجهزة)', style: TextStyle(fontSize: 12, color: kMuted)),
+                  trailing: IconButton(icon: const Icon(Icons.refresh_rounded), onPressed: _read),
+                ),
+              ),
+              if (msg.isNotEmpty) Padding(padding: const EdgeInsets.all(8), child: Text(msg, style: const TextStyle(color: kGold))),
+              if (busy) const LinearProgressIndicator(),
+              if (!d.supported)
+                const Padding(
+                  padding: EdgeInsets.all(8),
+                  child: Text('الراوتر مرجّعش dns_mode، فمش هبعت أوامر تغيير متخمّنة. غيّره من صفحة الراوتر نفسها:', style: TextStyle(color: kMuted)),
+                )
+              else ...[
+                const SectionTitle('اختار', icon: Icons.tune_rounded),
+                ListTile(
+                  leading: const Icon(Icons.autorenew_rounded),
+                  title: const Text('تلقائي من الشبكة (اتصالات)'),
+                  onTap: busy ? null : () => _apply(null, null),
+                ),
+                for (final x in kDnsPresets)
+                  ListTile(
+                    leading: Icon(x.primary == d.primary && d.mode == 'manual' ? Icons.radio_button_checked : Icons.radio_button_off, color: kGold),
+                    title: Text(x.name),
+                    subtitle: Text('${x.primary} / ${x.secondary}${x.note.isEmpty ? '' : ' — ${x.note}'}', textDirection: TextDirection.ltr, textAlign: TextAlign.right),
+                    onTap: busy ? null : () => _apply(x.primary, x.secondary),
+                  ),
+                const SectionTitle('يدوي', icon: Icons.edit_rounded),
+                Row(children: [
+                  Expanded(child: TextField(controller: pC, keyboardType: TextInputType.number, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'الأساسي'))),
+                  const SizedBox(width: 8),
+                  Expanded(child: TextField(controller: sC, keyboardType: TextInputType.number, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'الاحتياطي'))),
+                ]),
+                const SizedBox(height: 8),
+                FilledButton(onPressed: busy ? null : () => _apply(pC.text.trim(), sC.text.trim()), child: const Text('طبّق')),
+                if (prev != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.undo_rounded),
+                      label: Text('ارجع للقديم (${prev.p == null ? 'تلقائي' : '${prev.p} / ${prev.s ?? ''}'})'),
+                      onPressed: busy ? null : () => _apply(prev.p, prev.s, undo: true),
+                    ),
+                  ),
+              ],
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.open_in_browser_rounded),
+                label: const Text('افتح صفحة الراوتر'),
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BrowserPage(initialUrl: widget.router.base))),
+              ),
+              const SectionTitle('DNS للموبايل ده بس', icon: Icons.smartphone_rounded),
+              const Text(
+                  'لو عايز تغيّر للموبايل ده بس من غير الراوتر: الإعدادات ← الشبكة والإنترنت ← DNS الخاص (Private DNS) ← اكتب مثلًا dns.adguard-dns.com (يمنع إعلانات) أو one.one.one.one',
+                  style: TextStyle(color: kMuted, fontSize: 13, height: 1.6)),
+              const SizedBox(height: 6),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.settings_rounded),
+                label: const Text('افتح إعدادات الشبكة'),
+                onPressed: () async {
+                  final ok = await Native5.openSettings('android.settings.WIRELESS_SETTINGS');
+                  if (!ok && context.mounted) toast(context, 'مقدرتش أفتح الإعدادات — افتحها بنفسك');
+                },
+              ),
+            ]),
+    );
+  }
+}
+
+class Native5 {
+  static const _ch = MethodChannel('a2r/native');
+  static Future<bool> openSettings(String action) async {
+    try {
+      return await _ch.invokeMethod('openSettings', {'action': action}) == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<String?> initialShare() async {
+    try {
+      return await _ch.invokeMethod<String>('initialShare');
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+// ---------------- سجل الإشارة + الانقطاعات + السرعة ----------------
+bool pppConnected(String s) {
+  final t = s.toLowerCase();
+  return t == 'ppp_connected' || t == 'ipv6_connected' || t == 'ipv4_ipv6_connected' || t == 'connected';
+}
+
+/// خطوة واحدة في سجل الانقطاع: بيرجع (فتح انقطاع جديد من، انقطاع اتقفل (من، لـ))
+({int? openStart, (int, int)? closed}) outageStep(int? openStart, bool nowConnected, int t) {
+  if (!nowConnected) return (openStart: openStart ?? t, closed: null);
+  if (openStart != null) return (openStart: null, closed: (openStart, t));
+  return (openStart: null, closed: null);
+}
+
+class NetLog {
+  static List<(int, int, int)> get signal => [
+        for (final e in _jsonList('net_sig'))
+          if (e is List && e.length >= 3) ((e[0] as num).toInt(), (e[1] as num).toInt(), (e[2] as num).toInt())
+      ];
+  static List<(int, int)> get outages => [
+        for (final e in _jsonList('net_out'))
+          if (e is List && e.length >= 2) ((e[0] as num).toInt(), (e[1] as num).toInt())
+      ];
+  static int? get openOutage => Store.p.getInt('net_out_open');
+
+  /// عينة من رد status: RSRP + الإشارة + حالة الاتصال (مرة كل دقيقة بالكتير)
+  static Future<void> sample(Map<String, dynamic> st, {String source = 'app'}) async {
+    final t = DateTime.now().millisecondsSinceEpoch;
+    final rsrp = int.tryParse('${st['lte_rsrp'] ?? ''}'.trim());
+    final bar = int.tryParse('${st['signalbar'] ?? ''}'.trim()) ?? -1;
+    final last = Store.p.getInt('net_sig_last') ?? 0;
+    if (rsrp != null && t - last >= 55000) {
+      final l = _jsonList('net_sig');
+      l.add([t, rsrp, bar]);
+      while (l.length > 3000) {
+        l.removeAt(0);
+      }
+      await Store.p.setString('net_sig', jsonEncode(l));
+      await Store.p.setInt('net_sig_last', t);
+    }
+    final ppp = '${st['ppp_status'] ?? ''}'.trim();
+    if (ppp.isEmpty) return;
+    final r = outageStep(openOutage, pppConnected(ppp), t);
+    if (r.openStart != null && openOutage == null) AppLog.add('NET', 'النت قطع ($ppp) [$source]');
+    if (r.openStart == null) {
+      await Store.p.remove('net_out_open');
+    } else {
+      await Store.p.setInt('net_out_open', r.openStart!);
+    }
+    if (r.closed != null) {
+      final l = _jsonList('net_out');
+      l.add([r.closed!.$1, r.closed!.$2]);
+      while (l.length > 500) {
+        l.removeAt(0);
+      }
+      await Store.p.setString('net_out', jsonEncode(l));
+      AppLog.add('NET', 'النت رجع بعد ${durAr(Duration(milliseconds: r.closed!.$2 - r.closed!.$1))} [$source]');
+    }
+  }
+}
+
+class SpeedLog {
+  static List<(int, double)> get all => [
+        for (final e in _jsonList('speed_log'))
+          if (e is List && e.length >= 2) ((e[0] as num).toInt(), (e[1] as num).toDouble())
+      ];
+  static Future<void> add(double mbps) async {
+    if (mbps <= 0) return;
+    final l = _jsonList('speed_log')..add([DateTime.now().millisecondsSinceEpoch, double.parse(mbps.toStringAsFixed(2))]);
+    while (l.length > 200) {
+      l.removeAt(0);
+    }
+    await Store.p.setString('speed_log', jsonEncode(l));
+  }
+}
+
+/// رسم خطي بسيط (من غير مكتبات)
+class MiniChart extends StatelessWidget {
+  final List<(int, double)> points;
+  final double? minY, maxY;
+  final double height;
+  final String unit;
+  const MiniChart({super.key, required this.points, this.minY, this.maxY, this.height = 160, this.unit = ''});
+  @override
+  Widget build(BuildContext context) {
+    if (points.length < 2) {
+      return SizedBox(height: height, child: const Center(child: Text('لسه مفيش بيانات كفاية', style: TextStyle(color: kMuted))));
+    }
+    return SizedBox(height: height, width: double.infinity, child: CustomPaint(painter: _ChartPainter(points, minY, maxY, unit)));
+  }
+}
+
+class _ChartPainter extends CustomPainter {
+  final List<(int, double)> pts;
+  final double? minY, maxY;
+  final String unit;
+  _ChartPainter(this.pts, this.minY, this.maxY, this.unit);
+  @override
+  void paint(Canvas c, Size s) {
+    final lo = minY ?? pts.map((e) => e.$2).reduce(min);
+    var hi = maxY ?? pts.map((e) => e.$2).reduce(max);
+    if (hi <= lo) hi = lo + 1;
+    final t0 = pts.first.$1, t1 = pts.last.$1 == t0 ? t0 + 1 : pts.last.$1;
+    const padL = 34.0, padB = 16.0;
+    final w = s.width - padL, h = s.height - padB;
+    final grid = Paint()
+      ..color = kLine
+      ..strokeWidth = 1;
+    final tp = TextPainter(textDirection: TextDirection.ltr);
+    for (var i = 0; i <= 4; i++) {
+      final y = h * i / 4;
+      c.drawLine(Offset(padL, y), Offset(s.width, y), grid);
+      tp.text = TextSpan(text: (hi - (hi - lo) * i / 4).toStringAsFixed(0), style: const TextStyle(fontSize: 9, color: kMuted));
+      tp.layout();
+      tp.paint(c, Offset(0, y - 6));
+    }
+    final path = Path();
+    for (var i = 0; i < pts.length; i++) {
+      final x = padL + w * (pts[i].$1 - t0) / (t1 - t0);
+      final y = h - h * ((pts[i].$2.clamp(lo, hi) - lo) / (hi - lo));
+      i == 0 ? path.moveTo(x, y) : path.lineTo(x, y);
+    }
+    c.drawPath(
+        path,
+        Paint()
+          ..color = kGold
+          ..strokeWidth = 2
+          ..style = PaintingStyle.stroke);
+    for (final (i, t) in [(0, t0), (1, t1)]) {
+      tp.text = TextSpan(text: hhmm(t), style: const TextStyle(fontSize: 9, color: kMuted));
+      tp.layout();
+      tp.paint(c, Offset(i == 0 ? padL : s.width - tp.width, h + 3));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _ChartPainter o) => o.pts != pts;
+}
+
+/// يجمع الانقطاعات حسب اليوم (الأحدث الأول)
+Map<String, List<(int, int)>> outagesByDay(List<(int, int)> l) {
+  final out = <String, List<(int, int)>>{};
+  for (final e in l.reversed) {
+    out.putIfAbsent(dayKeyOf(e.$1), () => []).add(e);
+  }
+  return out;
+}
+
+class SignalHistoryPage extends StatefulWidget {
+  const SignalHistoryPage({super.key});
+  @override
+  State<SignalHistoryPage> createState() => _SignalHistoryPageState();
+}
+
+class _SignalHistoryPageState extends State<SignalHistoryPage> {
+  int hours = 24;
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final sig = NetLog.signal.where((e) => now - e.$1 <= hours * 3600000).map((e) => (e.$1, e.$2.toDouble())).toList();
+    final outs = NetLog.outages;
+    final open = NetLog.openOutage;
+    final sp = SpeedLog.all;
+    final byDay = outagesByDay(outs);
+    return DefaultTabController(
+      length: 3,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('سجل الشبكة'),
+          bottom: const TabBar(tabs: [Tab(text: 'الإشارة'), Tab(text: 'الانقطاعات'), Tab(text: 'السرعة')]),
+        ),
+        body: TabBarView(children: [
+          ListView(padding: const EdgeInsets.all(12), children: [
+            Wrap(spacing: 8, children: [
+              for (final hh in [6, 24, 72]) ChoiceChip(label: Text('$hh ساعة'), selected: hours == hh, onSelected: (_) => setState(() => hours = hh)),
+            ]),
+            const SizedBox(height: 8),
+            const Text('RSRP (كل ما يقرب من -70 أحسن)', style: TextStyle(color: kMuted, fontSize: 12)),
+            MiniChart(points: sig, minY: -125, maxY: -65),
+            if (sig.isNotEmpty)
+              Text('أقل: ${sig.map((e) => e.$2).reduce(min).toStringAsFixed(0)} • أعلى: ${sig.map((e) => e.$2).reduce(max).toStringAsFixed(0)} • متوسط: ${(sig.map((e) => e.$2).reduce((a, b) => a + b) / sig.length).toStringAsFixed(0)}',
+                  style: const TextStyle(fontSize: 13)),
+            const SizedBox(height: 12),
+            SwitchListTile(
+              value: NetWatch.enabled,
+              title: const Text('سجّل في الخلفية كل ربع ساعة تقريبًا'),
+              subtitle: const Text('بيدخل الراوتر من الخلفية — التطبيق مفتوح بيسجّل كل دقيقة لوحده', style: TextStyle(fontSize: 12, color: kMuted)),
+              onChanged: (v) async {
+                await NetWatch.setEnabled(v);
+                setState(() {});
+              },
+            ),
+          ]),
+          ListView(padding: const EdgeInsets.all(12), children: [
+            if (open != null)
+              Card(
+                color: kBad.withValues(alpha: 0.15),
+                child: ListTile(leading: const Icon(Icons.wifi_off_rounded, color: kBad), title: Text('النت قاطع من ${hhmm(open)}'), subtitle: Text(durAr(Duration(milliseconds: now - open)))),
+              ),
+            if (byDay.isEmpty && open == null) const EmptyState(icon: Icons.check_circle_rounded, title: 'مفيش انقطاعات متسجلة'),
+            for (final e in byDay.entries) ...[
+              SectionTitle('${e.key} — ${e.value.length} مرة، ${durAr(Duration(milliseconds: e.value.fold<int>(0, (a, x) => a + x.$2 - x.$1)))}', icon: Icons.calendar_today_rounded),
+              for (final o in e.value) ListTile(dense: true, leading: const Icon(Icons.portable_wifi_off_rounded, color: kBad), title: Text('${hhmm(o.$1)} ← ${hhmm(o.$2)}'), trailing: Text(durAr(Duration(milliseconds: o.$2 - o.$1)))),
+            ],
+            const Padding(
+              padding: EdgeInsets.all(8),
+              child: Text('بيتسجل من حالة الاتصال في الراوتر (ppp_status) وإنت فاتح التطبيق أو من التسجيل في الخلفية — الانقطاعات الأقصر من فترة التسجيل ممكن متظهرش.',
+                  style: TextStyle(fontSize: 12, color: kMuted)),
+            ),
+          ]),
+          ListView(padding: const EdgeInsets.all(12), children: [
+            const Text('سرعة التنزيل (ميجابت/ث) — من زرار «سرعة النت»', style: TextStyle(color: kMuted, fontSize: 12)),
+            MiniChart(points: sp, minY: 0),
+            for (final s in sp.reversed.take(50)) ListTile(dense: true, title: Text('${s.$2.toStringAsFixed(1)} ميجابت/ث'), trailing: Text('${dayKeyOf(s.$1)} ${hhmm(s.$1)}')),
+          ]),
+        ]),
+      ),
+    );
+  }
+}
+
+/// RSRP → 0..100 (للصوت والمؤشر)
+double rsrpQuality(int rsrp) => ((rsrp + 120) / 50 * 100).clamp(0, 100).toDouble();
+
+class RouterPlacePage extends StatefulWidget {
+  final ZteRouter router;
+  const RouterPlacePage({super.key, required this.router});
+  @override
+  State<RouterPlacePage> createState() => _RouterPlacePageState();
+}
+
+class _RouterPlacePageState extends State<RouterPlacePage> {
+  Timer? poll, beep;
+  int? rsrp, best;
+  String bar = '', net = '';
+  bool sound = true;
+  final List<(int, double)> trail = [];
+
+  @override
+  void initState() {
+    super.initState();
+    poll = Timer.periodic(const Duration(milliseconds: 1500), (_) => _tick());
+    _tick();
+  }
+
+  @override
+  void dispose() {
+    poll?.cancel();
+    beep?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _tick() async {
+    try {
+      final j = await widget.router.get(['lte_rsrp', 'signalbar', 'network_type']);
+      final v = int.tryParse('${j['lte_rsrp'] ?? ''}'.trim());
+      if (!mounted) return;
+      setState(() {
+        rsrp = v;
+        bar = '${j['signalbar'] ?? ''}';
+        net = '${j['network_type'] ?? ''}';
+        if (v != null) {
+          if (best == null || v > best!) best = v;
+          trail.add((DateTime.now().millisecondsSinceEpoch, v.toDouble()));
+          if (trail.length > 120) trail.removeAt(0);
+        }
+      });
+      _beep();
+    } catch (_) {}
+  }
+
+  void _beep() {
+    beep?.cancel();
+    if (!sound || rsrp == null) return;
+    beep = Timer.periodic(Duration(milliseconds: beepIntervalMs(rsrpQuality(rsrp!))), (_) => SystemSound.play(SystemSoundType.click));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final q = rsrp == null ? 0.0 : rsrpQuality(rsrp!);
+    final col = q >= 70 ? kOk : (q >= 40 ? kGold : kBad);
+    return Scaffold(
+      appBar: AppBar(title: const Text('مكان الراوتر'), actions: [
+        IconButton(
+          icon: Icon(sound ? Icons.volume_up_rounded : Icons.volume_off_rounded),
+          onPressed: () {
+            setState(() => sound = !sound);
+            _beep();
+          },
+        ),
+      ]),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        const Text('لف بالراوتر في الأوضة (جنب الشباك/أعلى مكان) — الصوت بيسرع كل ما الإشارة تتحسن. خلي كل مكان 10 ثواني علشان القراية تثبت.',
+            style: TextStyle(color: kMuted, height: 1.5)),
+        const SizedBox(height: 20),
+        Center(
+          child: SizedBox(
+            width: 220,
+            height: 220,
+            child: Stack(alignment: Alignment.center, children: [
+              SizedBox(width: 220, height: 220, child: CircularProgressIndicator(value: q / 100, strokeWidth: 16, color: col, backgroundColor: kSurface2)),
+              Column(mainAxisSize: MainAxisSize.min, children: [
+                Text(rsrp == null ? '—' : '$rsrp', style: TextStyle(fontSize: 56, fontWeight: FontWeight.w800, color: col)),
+                const Text('RSRP dBm', style: TextStyle(color: kMuted)),
+                Text('$bar/5  $net', style: const TextStyle(fontSize: 13)),
+              ]),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Text('أحسن قراية: ${best ?? '—'}', textAlign: TextAlign.center, style: const TextStyle(fontSize: 18, color: kGold)),
+        const SizedBox(height: 12),
+        MiniChart(points: trail, minY: -125, maxY: -65, height: 120),
+      ]),
+    );
+  }
+}
+
+// ---------------- مراقبة الأجهزة ----------------
+class DeviceWatch {
+  static Map<String, dynamic> get all => _jsonMap('dev_watch');
+  static bool has(String k) => all.containsKey(k);
+
+  static Future<void> set(String key, String? name, {String ip = ''}) async {
+    final a = all;
+    if (name == null) {
+      a.remove(key);
+    } else {
+      a[key] = {'n': name, 'ip': ip, 'on': null, 't': 0};
+    }
+    await Store.p.setString('dev_watch', jsonEncode(a));
+    await NetWatch.rearm();
+  }
+
+  static List<dynamic> get events => _jsonList('dev_watch_ev');
+
+  /// present = مفاتيح الأجهزة اللي في قايمة الراوتر دلوقتي. بيرجّع التغييرات (للاختبار)
+  static Future<List<(String, bool)>> update(Set<String> present) async {
+    final a = all;
+    if (a.isEmpty) return const [];
+    final ch = watchChanges(a, present);
+    if (ch.isEmpty) return ch;
+    final t = DateTime.now().millisecondsSinceEpoch;
+    final ev = events;
+    for (final (k, on) in ch) {
+      final e = Map<String, dynamic>.from(a[k] as Map);
+      final first = e['on'] == null;
+      e['on'] = on;
+      e['t'] = t;
+      a[k] = e;
+      if (!first) {
+        ev.add([t, k, e['n'], on]);
+        Native.notify(on ? 'دخل الشبكة: ${e['n']}' : 'خرج من الشبكة: ${e['n']}', '${hhmm(t)}${on ? ' — متوصل دلوقتي' : ' — مش ظاهر في الراوتر'}');
+        AppLog.add('WATCH', '${e['n']} ${on ? 'دخل' : 'خرج'}');
+      }
+    }
+    while (ev.length > 300) {
+      ev.removeAt(0);
+    }
+    await Store.p.setString('dev_watch', jsonEncode(a));
+    await Store.p.setString('dev_watch_ev', jsonEncode(ev));
+    return ch;
+  }
+}
+
+/// التغييرات بين المحفوظ واللي ظاهر دلوقتي
+List<(String, bool)> watchChanges(Map<String, dynamic> watched, Set<String> present) {
+  final out = <(String, bool)>[];
+  for (final e in watched.entries) {
+    final on = present.contains(e.key);
+    final was = (e.value as Map)['on'];
+    if (was != on) out.add((e.key, on));
+  }
+  return out;
+}
+
+class NetWatch {
+  static bool get enabled => Store.p.getBool('netwatch_on') ?? false;
+  static Future<void> setEnabled(bool v) async {
+    await Store.p.setBool('netwatch_on', v);
+    await rearm();
+  }
+
+  static Future<String> rearm() async {
+    if (!enabled && DeviceWatch.all.isEmpty) {
+      await Native4.cancelAlarm(1003);
+      return 'off';
+    }
+    await Native4.setAlarm(1003, DateTime.now().add(const Duration(minutes: 15)), {'type': 'watch'}, exact: false);
+    return 'كل ربع ساعة';
+  }
+
+  static Future<String> backgroundCheck() async {
+    final r = await Bg.router();
+    if (r == null) return 'مقدرتش أدخل الراوتر';
+    try {
+      final st = await r.status();
+      await NetLog.sample(st, source: 'bg');
+      if (DeviceWatch.all.isNotEmpty) {
+        final list = await r.stations();
+        await DeviceWatch.update({for (final s in list) s.mac.isNotEmpty ? s.mac : s.ip});
+      }
+      return 'RSRP ${st['lte_rsrp']} ${st['ppp_status']}';
+    } finally {
+      r.close();
+    }
+  }
+}
+
+class DeviceWatchPage extends StatefulWidget {
+  final List<LanHost> hosts;
+  final String Function(LanHost) labelOf;
+  const DeviceWatchPage({super.key, required this.hosts, required this.labelOf});
+  @override
+  State<DeviceWatchPage> createState() => _DeviceWatchPageState();
+}
+
+class _DeviceWatchPageState extends State<DeviceWatchPage> {
+  Timer? t;
+  final Map<String, List<(int, double)>> lat = {};
+  final Map<String, int?> lastMs = {};
+
+  @override
+  void initState() {
+    super.initState();
+    t = Timer.periodic(const Duration(seconds: 5), (_) => _ping());
+    _ping();
+  }
+
+  @override
+  void dispose() {
+    t?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _ping() async {
+    final w = DeviceWatch.all;
+    await Future.wait(w.entries.map((e) async {
+      final ip = widget.hosts.where((h) => (h.mac.isNotEmpty ? h.mac : h.ip) == e.key).firstOrNull?.ip ?? '${(e.value as Map)['ip'] ?? ''}';
+      if (ip.isEmpty) return;
+      final ms = await pingOnce(ip);
+      lastMs[e.key] = ms;
+      final l = lat.putIfAbsent(e.key, () => []);
+      l.add((DateTime.now().millisecondsSinceEpoch, (ms ?? -1).toDouble()));
+      if (l.length > 60) l.removeAt(0);
+    }));
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final w = DeviceWatch.all;
+    final ev = DeviceWatch.events.reversed.take(60).toList();
+    return Scaffold(
+      appBar: AppBar(title: const Text('مراقبة الأجهزة')),
+      body: ListView(padding: const EdgeInsets.all(12), children: [
+        const Text('إشعار لما جهاز يدخل أو يخرج من الشبكة (حسب قايمة الراوتر — بيتأخر دقايق لحد ما الراوتر يحس إن الجهاز خرج). في الخلفية بيتشيّك كل ربع ساعة تقريبًا.',
+            style: TextStyle(color: kMuted, fontSize: 12, height: 1.5)),
+        if (w.isEmpty) const EmptyState(icon: Icons.visibility_rounded, title: 'مفيش أجهزة متراقبة — اختار من تحت أو من قايمة الجهاز'),
+        for (final e in w.entries)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(children: [
+                  Icon(Icons.circle, size: 12, color: (e.value as Map)['on'] == true ? kOk : ((e.value as Map)['on'] == false ? kBad : kMuted)),
+                  const SizedBox(width: 6),
+                  Expanded(child: Text('${(e.value as Map)['n']}', style: const TextStyle(fontWeight: FontWeight.w700))),
+                  Text(lastMs[e.key] == null ? 'مبيردش على ping' : '${lastMs[e.key]} ms', style: const TextStyle(fontSize: 12, color: kMuted)),
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline_rounded),
+                    onPressed: () async {
+                      await DeviceWatch.set(e.key, null);
+                      setState(() {});
+                    },
+                  ),
+                ]),
+                MiniChart(points: (lat[e.key] ?? []).where((x) => x.$2 >= 0).toList(), minY: 0, height: 70),
+                const Text('ملحوظة: الموبايلات النايمة ساعات مبتردش على ping وهي متوصلة', style: TextStyle(fontSize: 11, color: kMuted)),
+              ]),
+            ),
+          ),
+        const SectionTitle('ضيف جهاز', icon: Icons.add_rounded),
+        for (final h in widget.hosts.where((h) => !w.containsKey(h.mac.isNotEmpty ? h.mac : h.ip)))
+          ListTile(
+            dense: true,
+            title: Text(widget.labelOf(h)),
+            subtitle: Text(h.ip, textDirection: TextDirection.ltr, textAlign: TextAlign.right),
+            trailing: const Icon(Icons.add_circle_outline_rounded, color: kGold),
+            onTap: () async {
+              await DeviceWatch.set(h.mac.isNotEmpty ? h.mac : h.ip, widget.labelOf(h), ip: h.ip);
+              await Native.askNotifyPermission();
+              setState(() {});
+            },
+          ),
+        if (ev.isNotEmpty) const SectionTitle('آخر الأحداث', icon: Icons.history_rounded),
+        for (final x in ev)
+          if (x is List && x.length >= 4)
+            ListTile(
+              dense: true,
+              leading: Icon(x[3] == true ? Icons.login_rounded : Icons.logout_rounded, color: x[3] == true ? kOk : kBad),
+              title: Text('${x[2]} ${x[3] == true ? 'دخل' : 'خرج'}'),
+              trailing: Text('${dayKeyOf((x[0] as num).toInt())} ${hhmm((x[0] as num).toInt())}', style: const TextStyle(fontSize: 12)),
+            ),
+      ]),
+    );
+  }
+}
+
+// ---------------- الكاست: سجل + تكرار + مؤقت ----------------
+String nextRepeat(String r) => r == 'off' ? 'all' : (r == 'all' ? 'one' : 'off');
+
+/// اللي يشتغل بعد ما الحالي يخلص (null = نقف)
+int? nextQueueIndex(int playing, int len, {required bool autoNext, required String repeat, bool sleepAfter = false}) {
+  if (sleepAfter || len == 0 || playing < 0) return null;
+  if (repeat == 'one') return playing;
+  if (!autoNext) return null;
+  if (playing + 1 < len) return playing + 1;
+  if (repeat == 'all') return 0;
+  return null;
+}
+
+class CastHistory {
+  static List<Map<String, dynamic>> get all => [
+        for (final e in _jsonList('cast_hist'))
+          if (e is Map) Map<String, dynamic>.from(e)
+      ];
+
+  static Map<String, dynamic> entryOf(QueueItem q, int t) => {
+        't': t,
+        'title': q.title,
+        'url': q.file == null ? q.url : '',
+        'file': q.file?.path ?? '',
+        if (q.mime != null) 'mime': q.mime,
+        if (q.headers.isNotEmpty) 'h': q.headers,
+        if (q.viaPhone) 'via': true,
+      };
+
+  static List<Map<String, dynamic>> addTo(List<Map<String, dynamic>> l, Map<String, dynamic> e, {int max = 60}) {
+    final key = '${e['file']}|${e['url']}';
+    final out = l.where((x) => '${x['file']}|${x['url']}' != key).toList()..add(e);
+    while (out.length > max) {
+      out.removeAt(0);
+    }
+    return out;
+  }
+
+  static Future<void> add(QueueItem q) async {
+    // الروابط المؤقتة (يوتيوب googlevideo) بتبوظ بعد شوية — مش بنحفظها
+    if (q.file == null && q.url.contains('googlevideo.com')) return;
+    await Store.p.setString('cast_hist', jsonEncode(addTo(all, entryOf(q, DateTime.now().millisecondsSinceEpoch))));
+  }
+
+  static QueueItem? toItem(Map<String, dynamic> e) {
+    final f = '${e['file'] ?? ''}';
+    if (f.isNotEmpty) {
+      final file = File(f);
+      if (!file.existsSync()) return null;
+      return QueueItem('${e['title']}', f, file: file);
+    }
+    final u = '${e['url'] ?? ''}';
+    if (u.isEmpty) return null;
+    return QueueItem('${e['title']}', u,
+        mime: e['mime'] as String?, headers: e['h'] is Map ? Map<String, String>.from(e['h'] as Map) : const {}, viaPhone: e['via'] == true);
+  }
+}
+
+class CastHistoryPage extends StatefulWidget {
+  const CastHistoryPage({super.key});
+  @override
+  State<CastHistoryPage> createState() => _CastHistoryPageState();
+}
+
+class _CastHistoryPageState extends State<CastHistoryPage> {
+  @override
+  Widget build(BuildContext context) {
+    final l = CastHistory.all.reversed.toList();
+    return Scaffold(
+      appBar: AppBar(title: const Text('اللي اتعرض قبل كده'), actions: [
+        if (l.isNotEmpty)
+          IconButton(
+            icon: const Icon(Icons.delete_sweep_rounded),
+            onPressed: () async {
+              if (!await confirm(context, 'تمسح السجل؟')) return;
+              await Store.p.remove('cast_hist');
+              setState(() {});
+            },
+          ),
+      ]),
+      body: l.isEmpty
+          ? const EmptyState(icon: Icons.history_rounded, title: 'لسه معرضتش حاجة')
+          : ListView(children: [
+              for (final e in l)
+                ListTile(
+                  leading: Icon('${e['file']}'.isNotEmpty ? Icons.phone_android_rounded : Icons.link_rounded, color: kGold),
+                  title: Text('${e['title']}', maxLines: 1, overflow: TextOverflow.ellipsis),
+                  subtitle: Text('${dayKeyOf((e['t'] as num).toInt())} ${hhmm((e['t'] as num).toInt())}', style: const TextStyle(fontSize: 12)),
+                  trailing: const Icon(Icons.cast_rounded),
+                  onTap: () async {
+                    final q = CastHistory.toItem(e);
+                    if (q == null) {
+                      toast(context, 'الملف مبقاش موجود على الموبايل');
+                      return;
+                    }
+                    Navigator.pop(context);
+                    try {
+                      await CastState.I.add(q);
+                    } catch (_) {}
+                  },
+                ),
+            ]),
+    );
+  }
+}
+
+class CastExtrasBar extends StatelessWidget {
+  final CastState cs;
+  const CastExtrasBar({super.key, required this.cs});
+
+  Future<void> _sleep(BuildContext context) async {
+    final v = await showModalBottomSheet<int>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: Wrap(children: [
+          const ListTile(title: Text('وقّف العرض بعد…')),
+          for (final m in [15, 30, 45, 60, 90, 120]) ListTile(title: Text('$m دقيقة'), onTap: () => Navigator.pop(c, m)),
+          ListTile(title: const Text('لما اللي شغال يخلص'), onTap: () => Navigator.pop(c, -1)),
+          if (cs.sleepAt != null || cs.sleepEndOfItem) ListTile(title: const Text('إلغاء المؤقت', style: TextStyle(color: kBad)), onTap: () => Navigator.pop(c, 0)),
+        ]),
+      ),
+    );
+    if (v != null) cs.setSleep(v);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final rep = cs.repeat;
+    final sleepTxt = cs.sleepEndOfItem
+        ? 'بعد اللي شغال'
+        : (cs.sleepAt == null ? 'مؤقت' : '${max(0, cs.sleepAt!.difference(DateTime.now()).inMinutes)} د');
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      child: Wrap(spacing: 8, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: [
+        FilterChip(label: const Text('اللي بعده لوحده'), selected: cs.autoNext, onSelected: cs.setAutoNext),
+        ActionChip(
+          avatar: Icon(rep == 'one' ? Icons.repeat_one_rounded : Icons.repeat_rounded, size: 18, color: rep == 'off' ? kMuted : kGold),
+          label: Text(rep == 'off' ? 'من غير تكرار' : (rep == 'all' ? 'كرر القايمة' : 'كرر ده')),
+          onPressed: cs.cycleRepeat,
+        ),
+        ActionChip(
+          avatar: Icon(Icons.bedtime_rounded, size: 18, color: cs.sleepAt != null || cs.sleepEndOfItem ? kGold : kMuted),
+          label: Text(sleepTxt),
+          onPressed: () => _sleep(context),
+        ),
+      ]),
+    );
+  }
+}
+
+// ---------------- «شارك لـ A2R Home» من أي تطبيق ----------------
+final RegExp _kDirectMedia = RegExp(r'\.(mp4|m4v|mkv|webm|mov|avi|ts|m3u8|mp3|m4a|aac|flac|jpe?g|png|gif|webp)(\?|$)', caseSensitive: false);
+
+/// أول رابط في النص المتشارك
+String? firstUrl(String text) => RegExp(r'https?://[^\s<>"]+').firstMatch(text)?.group(0);
+
+bool isDirectMediaUrl(String u) => _kDirectMedia.hasMatch(Uri.tryParse(u)?.path ?? u);
+
+class ShareIn {
+  static BuildContext Function()? _ctx;
+  static void Function(int tab)? _goTab;
+  static void init(BuildContext ctx, void Function(int tab) goTab) {
+    final st = ctx;
+    _ctx = () => st;
+    _goTab = goTab;
+    Native5.initialShare().then((s) {
+      if (s != null && s.isNotEmpty) handle(s);
+    });
+  }
+
+  static Future<void> handle(String json) async {
+    Map<String, dynamic> d;
+    try {
+      d = Map<String, dynamic>.from(jsonDecode(json) as Map);
+    } catch (_) {
+      return;
+    }
+    AppLog.add('SHARE', 'وصل: ${json.length > 300 ? json.substring(0, 300) : json}');
+    final ctx = _ctx?.call();
+    if (ctx == null || !ctx.mounted) return;
+    final files = [
+      for (final f in (d['files'] as List? ?? const []))
+        if (f is Map && '${f['path']}'.isNotEmpty) File('${f['path']}')
+    ];
+    final cs = CastState.I;
+    if (files.isNotEmpty) {
+      _goTab?.call(1);
+      if (cs.current == null && cs.gm == null) await cs.discover();
+      var first = true;
+      for (final f in files) {
+        try {
+          await cs.add(QueueItem(f.uri.pathSegments.last, f.path, file: f), playNow: first);
+        } catch (e) {
+          AppLog.add('SHARE', 'cast ✗ $e');
+        }
+        first = false;
+      }
+      return;
+    }
+    final url = firstUrl('${d['text'] ?? ''}');
+    if (url == null) {
+      if (ctx.mounted) toast(ctx, 'اللي اتشارك مفيهوش رابط');
+      return;
+    }
+    if (!ctx.mounted) return;
+    final pc = PcSaved.get();
+    final pick = await showModalBottomSheet<String>(
+      context: ctx,
+      builder: (c) => SafeArea(
+        child: Wrap(children: [
+          ListTile(title: Text(url, maxLines: 2, overflow: TextOverflow.ellipsis, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12))),
+          ListTile(leading: const Icon(Icons.cast_rounded, color: kGold), title: const Text('اعرضه على التلفزيون'), onTap: () => Navigator.pop(c, 'tv')),
+          ListTile(leading: const Icon(Icons.public_rounded), title: const Text('افتحه في متصفح التطبيق (يلقط الفيديو)'), onTap: () => Navigator.pop(c, 'web')),
+          if (pc != null) ListTile(leading: const Icon(Icons.desktop_windows_rounded), title: Text('افتحه على الكمبيوتر (${pc.name})'), onTap: () => Navigator.pop(c, 'pc')),
+        ]),
+      ),
+    );
+    if (pick == null || !ctx.mounted) return;
+    if (pick == 'pc' && pc != null) {
+      final c = PcClient(pc.host, token: pc.token);
+      try {
+        await c.openUrl(url);
+        if (ctx.mounted) toast(ctx, 'اتفتح على الكمبيوتر ✓');
+      } catch (e) {
+        if (ctx.mounted) toast(ctx, '$e'.replaceFirst('Bad state: ', ''));
+      } finally {
+        c.close();
+      }
+      return;
+    }
+    _goTab?.call(1);
+    if (pick == 'tv' && isDirectMediaUrl(url)) {
+      if (cs.current == null && cs.gm == null) await cs.discover();
+      try {
+        await cs.add(QueueItem(Uri.tryParse(url)?.pathSegments.where((x) => x.isNotEmpty).lastOrNull ?? url, url));
+      } catch (_) {}
+      return;
+    }
+    // صفحة (يوتيوب/موقع): المتصفح بيلقط الفيديو وفيه زرار الكاست واختيار الجودة
+    if (ctx.mounted) await Navigator.push(ctx, MaterialPageRoute(builder: (_) => BrowserPage(initialUrl: url)));
+  }
+}
+
+// ---------------- الريسيفر: آخر القنوات + مجموعات ----------------
+class StbGroup {
+  String name;
+  List<String> keys;
+  StbGroup(this.name, this.keys);
+  Map<String, dynamic> toJson() => {'n': name, 'k': keys};
+}
+
+String stbKey(StbChannel c) => '${c.radio ? 1 : 0}:${c.id}';
+
+/// بيقرا ملف المجموعات (تصدير A2R Home أو قايمة بسيطة) — بيرجع null لو الملف مش مفهوم
+List<StbGroup>? parseStbGroups(String text) {
+  try {
+    final d = jsonDecode(text);
+    final list = d is Map ? d['groups'] : d;
+    if (list is! List) return null;
+    return [
+      for (final g in list)
+        if (g is Map && '${g['n'] ?? ''}'.trim().isNotEmpty) StbGroup('${g['n']}'.trim(), [for (final k in (g['k'] as List? ?? const [])) '$k'])
+    ];
+  } catch (_) {
+    return null;
+  }
+}
+
+List<StbGroup> mergeStbGroups(List<StbGroup> mine, List<StbGroup> incoming) {
+  final out = [for (final g in mine) StbGroup(g.name, [...g.keys])];
+  for (final g in incoming) {
+    final ex = out.where((x) => x.name == g.name).firstOrNull;
+    if (ex == null) {
+      out.add(StbGroup(g.name, [...g.keys]));
+    } else {
+      for (final k in g.keys) {
+        if (!ex.keys.contains(k)) ex.keys.add(k);
+      }
+    }
+  }
+  return out;
+}
+
+class StbPrefs {
+  static bool get autoReconnect => Store.p.getBool('stb_autoreconnect') ?? true;
+  static set autoReconnect(bool v) => Store.p.setBool('stb_autoreconnect', v);
+
+  static List<({String id, String name, bool radio})> get recent => [
+        for (final e in _jsonList('stb_recent'))
+          if (e is Map) (id: '${e['id']}', name: '${e['n']}', radio: e['r'] == true)
+      ];
+
+  static void addRecent(StbChannel c) {
+    final l = recent.where((e) => !(e.id == c.id && e.radio == c.radio)).toList();
+    l.insert(0, (id: c.id, name: c.name, radio: c.radio));
+    Store.p.setString('stb_recent', jsonEncode([for (final e in l.take(15)) {'id': e.id, 'n': e.name, 'r': e.radio}]));
+  }
+
+  static List<StbGroup> get groups => parseStbGroups(Store.p.getString('stb_groups') ?? '[]') ?? [];
+  static Future<void> saveGroups(List<StbGroup> g) => Store.p.setString('stb_groups', jsonEncode([for (final x in g) x.toJson()]));
+  static bool groupHas(String name, StbChannel c) => groups.where((g) => g.name == name).firstOrNull?.keys.contains(stbKey(c)) ?? false;
+  static List<String> groupsOf(StbChannel c) => [for (final g in groups) if (g.keys.contains(stbKey(c))) g.name];
+}
+
+const List<String> kDefaultGroups = ['أخبار', 'رياضة', 'أفلام', 'مسلسلات', 'أطفال', 'ديني'];
+
+Future<void> pickStbGroups(BuildContext context, StbChannel ch) async {
+  var gs = StbPrefs.groups;
+  await showModalBottomSheet(
+    context: context,
+    builder: (c) => StatefulBuilder(
+      builder: (c, ss) => SafeArea(
+        child: ListView(shrinkWrap: true, children: [
+          ListTile(title: Text('«${ch.name}» في مجموعات:')),
+          for (final g in gs)
+            CheckboxListTile(
+              value: g.keys.contains(stbKey(ch)),
+              title: Text(g.name),
+              onChanged: (v) async {
+                v == true ? g.keys.add(stbKey(ch)) : g.keys.remove(stbKey(ch));
+                await StbPrefs.saveGroups(gs);
+                ss(() {});
+              },
+            ),
+          ListTile(
+            leading: const Icon(Icons.add_rounded, color: kGold),
+            title: const Text('مجموعة جديدة'),
+            onTap: () async {
+              final n = await askText(context, 'اسم المجموعة', hint: 'أخبار، رياضة…');
+              if (n == null || n.trim().isEmpty) return;
+              gs = [...gs, StbGroup(n.trim(), [stbKey(ch)])];
+              await StbPrefs.saveGroups(gs);
+              ss(() {});
+            },
+          ),
+          if (gs.isEmpty)
+            ListTile(
+              leading: const Icon(Icons.auto_awesome_rounded),
+              title: Text('اعمل المجموعات المعتادة (${kDefaultGroups.join('، ')})'),
+              onTap: () async {
+                gs = [for (final n in kDefaultGroups) StbGroup(n, [])];
+                await StbPrefs.saveGroups(gs);
+                ss(() {});
+              },
+            ),
+        ]),
+      ),
+    ),
+  );
+}
+
+class StbGroupsPage extends StatefulWidget {
+  final List<StbChannel> channels;
+  const StbGroupsPage({super.key, required this.channels});
+  @override
+  State<StbGroupsPage> createState() => _StbGroupsPageState();
+}
+
+class _StbGroupsPageState extends State<StbGroupsPage> {
+  late List<StbGroup> gs = StbPrefs.groups;
+
+  Future<void> _save() async {
+    await StbPrefs.saveGroups(gs);
+    setState(() {});
+  }
+
+  Future<void> _export() async {
+    final dir = await getTemporaryDirectory();
+    final f = File('${dir.path}/a2r-channel-groups.json');
+    await f.writeAsString(const JsonEncoder.withIndent(' ').convert({'app': 'A2R Home', 'type': 'stb_groups', 'groups': [for (final g in gs) g.toJson()]}));
+    await SharePlus.instance.share(ShareParams(files: [XFile(f.path)], text: 'مجموعات قنوات A2R Home'));
+  }
+
+  Future<void> _import() async {
+    final p = await FilePicker.pickFile(type: FileType.any);
+    if (p == null) return;
+    final f = await pickedToFile(p);
+    if (f == null) return;
+    final inc = parseStbGroups(await f.readAsString());
+    if (inc == null) {
+      if (mounted) toast(context, 'الملف ده مش ملف مجموعات');
+      return;
+    }
+    gs = mergeStbGroups(gs, inc);
+    await _save();
+    if (mounted) toast(context, 'اتضاف ${inc.length} مجموعة');
+  }
+
+  String _name(String k) {
+    final radio = k.startsWith('1:');
+    final id = k.substring(2);
+    return widget.channels.where((c) => c.id == id && c.radio == radio).firstOrNull?.name ?? 'قناة $id';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('مجموعات القنوات'), actions: [
+        IconButton(tooltip: 'تصدير', icon: const Icon(Icons.ios_share_rounded), onPressed: gs.isEmpty ? null : _export),
+        IconButton(tooltip: 'استيراد', icon: const Icon(Icons.file_open_rounded), onPressed: _import),
+      ]),
+      floatingActionButton: FloatingActionButton(
+        child: const Icon(Icons.add_rounded),
+        onPressed: () async {
+          final n = await askText(context, 'اسم المجموعة');
+          if (n == null || n.trim().isEmpty) return;
+          gs.add(StbGroup(n.trim(), []));
+          await _save();
+        },
+      ),
+      body: Column(children: [
+        SwitchListTile(
+          value: StbPrefs.autoReconnect,
+          title: const Text('ارجع اتصل بالريسيفر لوحدك لما أرجع للتطبيق'),
+          onChanged: (v) => setState(() => StbPrefs.autoReconnect = v),
+        ),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 12),
+          child: Text('المجموعات دي على الموبايل بس (مش بتغيّر حاجة في الريسيفر). اسحب علشان ترتب، ودوس على المجموعة علشان ترتب قنواتها.', style: TextStyle(fontSize: 12, color: kMuted)),
+        ),
+        Expanded(
+          child: gs.isEmpty
+              ? const EmptyState(icon: Icons.folder_special_rounded, title: 'مفيش مجموعات — دوس + أو زرار المجموعات جنب أي قناة')
+              : ReorderableListView(
+                  onReorder: (a, b) async {
+                    if (b > a) b--;
+                    gs.insert(b, gs.removeAt(a));
+                    await _save();
+                  },
+                  children: [
+                    for (final g in gs)
+                      ListTile(
+                        key: ValueKey(g.name),
+                        leading: const Icon(Icons.drag_handle_rounded),
+                        title: Text(g.name),
+                        subtitle: Text('${g.keys.length} قناة'),
+                        onTap: () => _editGroup(g),
+                        trailing: PopupMenuButton<String>(
+                          onSelected: (v) async {
+                            if (v == 'rename') {
+                              final n = await askText(context, 'اسم جديد', initial: g.name);
+                              if (n != null && n.trim().isNotEmpty) g.name = n.trim();
+                            }
+                            if (v == 'del' && mounted && await confirm(context, 'تمسح مجموعة «${g.name}»؟')) gs.remove(g);
+                            await _save();
+                          },
+                          itemBuilder: (_) => const [
+                            PopupMenuItem(value: 'rename', child: Text('غيّر الاسم')),
+                            PopupMenuItem(value: 'del', child: Text('امسح')),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+        ),
+      ]),
+    );
+  }
+
+  Future<void> _editGroup(StbGroup g) async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (c) => StatefulBuilder(
+        builder: (c, ss) => SizedBox(
+          height: MediaQuery.of(c).size.height * 0.6,
+          child: g.keys.isEmpty
+              ? const EmptyState(icon: Icons.live_tv_rounded, title: 'المجموعة فاضية — ضيف قنوات من قايمة القنوات')
+              : ReorderableListView(
+                  onReorder: (a, b) async {
+                    if (b > a) b--;
+                    g.keys.insert(b, g.keys.removeAt(a));
+                    await _save();
+                    ss(() {});
+                  },
+                  children: [
+                    for (final k in g.keys)
+                      ListTile(
+                        key: ValueKey(k),
+                        leading: const Icon(Icons.drag_handle_rounded),
+                        title: Text(_name(k)),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.remove_circle_outline_rounded),
+                          onPressed: () async {
+                            g.keys.remove(k);
+                            await _save();
+                            ss(() {});
+                          },
+                        ),
+                      ),
+                  ],
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------- الكمبيوتر: حافظة، لينك، عرض تقديمي، معلومات، مؤقت إطفاء، تشغيل عن بعد ----------------
+extension PcClientV5 on PcClient {
+  Future<String> clipGet() async => '${(await _json('GET', '/clip'))['text'] ?? ''}';
+  Future<void> clipSet(String text) => _json('POST', '/clip', json: {'text': text});
+  Future<void> openUrl(String url) => _json('POST', '/open', json: {'url': url});
+  Future<Map<String, dynamic>> sysinfo() => _json('GET', '/sysinfo');
+  Future<void> shutdownIn(int minutes) => _json('POST', '/power', json: {'a': 'shutdown_in', 'minutes': minutes, 'confirm': true});
+}
+
+String fmtUptime(int secs) {
+  final d = secs ~/ 86400, h = (secs % 86400) ~/ 3600, m = (secs % 3600) ~/ 60;
+  return [if (d > 0) '$d يوم', if (h > 0) '$h ساعة', '$m دقيقة'].join(' ');
+}
+
+class PcWake {
+  static List<String> get macs => Store.p.getStringList('pc_macs') ?? [];
+  static Future<void> learn(PcClient pc) async {
+    try {
+      final i = await pc.sysinfo();
+      final m = [for (final x in (i['macs'] as List? ?? const [])) normMac('$x')].where((x) => x.length == 17).toList();
+      if (m.isNotEmpty) await Store.p.setStringList('pc_macs', m);
+    } catch (_) {}
+  }
+
+  static Future<void> wake(BuildContext context) async {
+    final n = await readPhoneNet();
+    final bc = <String>{'255.255.255.255', if ((n.broadcast ?? '').isNotEmpty) n.broadcast!, if (n.prefix.isNotEmpty) '${n.prefix}.255'};
+    try {
+      for (final m in macs) {
+        for (final b in bc) {
+          await sendWol(m, broadcast: b);
+        }
+      }
+      if (context.mounted) {
+        toast(context, 'اتبعت أمر التشغيل ✓ — لازم Wake-on-LAN يكون شغال في البيوس والكارت، وغالبًا بيشتغل بس لو الكمبيوتر متوصل بكابل');
+      }
+    } catch (e) {
+      if (context.mounted) toast(context, 'فشل: $e');
+    }
+  }
+}
+
+class PcExtras extends StatelessWidget {
+  final PcClient pc;
+  final void Function(Object) onErr;
+  const PcExtras({super.key, required this.pc, required this.onErr});
+
+  Future<void> _run(BuildContext context, Future<void> Function() f) async {
+    try {
+      await f();
+    } catch (e) {
+      onErr(e);
+    }
+  }
+
+  Future<void> _info(BuildContext context) async {
+    final i = await pc.sysinfo();
+    if (!context.mounted) return;
+    String pct(Object? v) => v == null ? '—' : '${(v as num).toStringAsFixed(0)}%';
+    String gb(Object? v) => v == null ? '—' : '${((v as num) / 1e9).toStringAsFixed(1)} جيجا';
+    final bat = i['battery'] is Map ? i['battery'] as Map : null;
+    await showDialog(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: Text('${i['name'] ?? 'الكمبيوتر'}'),
+        content: Text([
+          'المعالج: ${pct(i['cpu'])}',
+          'الرامات: ${pct(i['ram_pct'])} من ${gb(i['ram_total'])}',
+          'الهارد (${i['disk_path'] ?? 'C:'}): فاضي ${gb(i['disk_free'])} من ${gb(i['disk_total'])}',
+          if (bat != null) 'البطارية: ${bat['pct']}%${bat['plugged'] == true ? ' (على الشاحن)' : ''}',
+          if (i['uptime'] != null) 'شغال من: ${fmtUptime((i['uptime'] as num).toInt())}',
+          if (i['shutdown_at'] != null) 'هيطفي الساعة ${hhmm(((i['shutdown_at'] as num) * 1000).toInt())}',
+        ].join('\n'), style: const TextStyle(height: 1.8)),
+        actions: [TextButton(onPressed: () => Navigator.pop(d), child: const Text('تمام'))],
+      ),
+    );
+  }
+
+  Future<void> _timer(BuildContext context) async {
+    final m = await showModalBottomSheet<int>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: Wrap(children: [
+          const ListTile(title: Text('اطفي الكمبيوتر بعد…')),
+          for (final x in [15, 30, 60, 90, 120, 180]) ListTile(title: Text('$x دقيقة'), onTap: () => Navigator.pop(c, x)),
+          ListTile(title: const Text('إلغاء أي إطفاء متجدول', style: TextStyle(color: kBad)), onTap: () => Navigator.pop(c, 0)),
+        ]),
+      ),
+    );
+    if (m == null) return;
+    if (m == 0) {
+      await pc.power('cancel');
+      if (context.mounted) toast(context, 'اتلغى الإطفاء');
+      return;
+    }
+    await pc.shutdownIn(m);
+    if (context.mounted) toast(context, 'الكمبيوتر هيطفي بعد $m دقيقة (ويندوز هيظهر تنبيه) — «إلغاء الإطفاء» لو غيرت رأيك');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const SectionTitle('إضافات', icon: Icons.extension_rounded),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        OutlinedButton.icon(
+          icon: const Icon(Icons.content_paste_go_rounded),
+          label: const Text('ابعت الحافظة للكمبيوتر'),
+          onPressed: () => _run(context, () async {
+            final t = (await Clipboard.getData('text/plain'))?.text ?? '';
+            if (t.isEmpty) {
+              if (context.mounted) toast(context, 'الحافظة فاضية');
+              return;
+            }
+            await pc.clipSet(t);
+            if (context.mounted) toast(context, 'اتنسخ على الكمبيوتر ✓ (Ctrl+V هناك)');
+          }),
+        ),
+        OutlinedButton.icon(
+          icon: const Icon(Icons.content_paste_rounded),
+          label: const Text('هات حافظة الكمبيوتر'),
+          onPressed: () => _run(context, () async {
+            final t = await pc.clipGet();
+            await Clipboard.setData(ClipboardData(text: t));
+            if (context.mounted) toast(context, t.isEmpty ? 'حافظة الكمبيوتر فاضية' : 'اتنسخ على الموبايل ✓');
+          }),
+        ),
+        OutlinedButton.icon(
+          icon: const Icon(Icons.open_in_new_rounded),
+          label: const Text('افتح لينك على الكمبيوتر'),
+          onPressed: () => _run(context, () async {
+            final clip = (await Clipboard.getData('text/plain'))?.text ?? '';
+            if (!context.mounted) return;
+            final u = await askText(context, 'الرابط', initial: firstUrl(clip) ?? '', type: TextInputType.url);
+            if (u == null || u.trim().isEmpty) return;
+            final url = u.trim().startsWith('http') ? u.trim() : 'https://${u.trim()}';
+            await pc.openUrl(url);
+            if (context.mounted) toast(context, 'اتفتح ✓');
+          }),
+        ),
+        OutlinedButton.icon(
+          icon: const Icon(Icons.slideshow_rounded),
+          label: const Text('عرض تقديمي'),
+          onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PcPresentPage(pc: pc, onErr: onErr))),
+        ),
+        OutlinedButton.icon(icon: const Icon(Icons.memory_rounded), label: const Text('معلومات الكمبيوتر'), onPressed: () => _run(context, () => _info(context))),
+        OutlinedButton.icon(icon: const Icon(Icons.timer_rounded), label: const Text('مؤقت إطفاء'), onPressed: () => _run(context, () => _timer(context))),
+      ]),
+    ]);
+  }
+}
+
+class PcPresentPage extends StatelessWidget {
+  final PcClient pc;
+  final void Function(Object) onErr;
+  const PcPresentPage({super.key, required this.pc, required this.onErr});
+
+  void _k(String k, [List<String> mods = const []]) {
+    HapticFeedback.mediumImpact();
+    pc.input([
+      {'t': 'key', 'k': k, 'mods': mods}
+    ]).catchError(onErr);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    Widget big(String t, IconData i, VoidCallback f) => Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: FilledButton(
+              style: FilledButton.styleFrom(shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24))),
+              onPressed: f,
+              child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(i, size: 64), const SizedBox(height: 8), Text(t, style: const TextStyle(fontSize: 20))]),
+            ),
+          ),
+        );
+    return Scaffold(
+      appBar: AppBar(title: const Text('عرض تقديمي')),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.all(8),
+          child: Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
+            OutlinedButton(onPressed: () => _k('f5'), child: const Text('ابدأ من الأول (F5)')),
+            OutlinedButton(onPressed: () => _k('f5', ['shift']), child: const Text('من الشريحة دي')),
+            OutlinedButton(onPressed: () => _k('b'), child: const Text('شاشة سودا (B)')),
+            OutlinedButton(onPressed: () => _k('w'), child: const Text('شاشة بيضا (W)')),
+            OutlinedButton(onPressed: () => _k('esc'), child: const Text('إنهاء (Esc)')),
+          ]),
+        ),
+        Expanded(
+          child: Directionality(
+            textDirection: TextDirection.ltr,
+            child: Row(children: [
+              big('السابقة', Icons.arrow_back_rounded, () => _k('left')),
+              big('التالية', Icons.arrow_forward_rounded, () => _k('right')),
+            ]),
+          ),
+        ),
+        const Padding(padding: EdgeInsets.all(8), child: Text('بيشتغل مع PowerPoint وPDF وأغلب برامج العرض', style: TextStyle(color: kMuted, fontSize: 12))),
+      ]),
+    );
+  }
+}
+
+// ---------------- نسخة احتياطية للإعدادات ----------------
+/// المفاتيح اللي مش بتتنقل (توكن الكمبيوتر، القفل، الكاش المؤقت)
+bool backupSkipKey(String k) {
+  final l = k.toLowerCase();
+  return l == 'pc_saved' || l.startsWith('app_lock') || l.contains('password') || l.contains('token') || l == 'oui_auto_tried' || l == 'router_last_ok' || l == 'bg_last';
+}
+
+Map<String, dynamic> buildBackup(Map<String, Object?> prefs, DateTime now) => {
+      'app': 'A2R Home',
+      'type': 'settings',
+      'v': 1,
+      'at': now.toIso8601String(),
+      'prefs': {
+        for (final e in prefs.entries)
+          if (!backupSkipKey(e.key) && e.value != null)
+            e.key: {
+              't': e.value is bool ? 'b' : (e.value is int ? 'i' : (e.value is double ? 'd' : (e.value is List ? 'l' : 's'))),
+              'v': e.value,
+            }
+      },
+    };
+
+/// بيرجع عدد المفاتيح أو يرمي FormatException
+Future<int> restoreBackup(SharedPreferences p, String text) async {
+  final d = jsonDecode(text);
+  if (d is! Map || d['app'] != 'A2R Home' || d['prefs'] is! Map) throw const FormatException('الملف ده مش نسخة A2R Home');
+  var n = 0;
+  for (final e in (d['prefs'] as Map).entries) {
+    final k = '${e.key}';
+    if (backupSkipKey(k) || e.value is! Map) continue;
+    final t = e.value['t'], v = e.value['v'];
+    if (t == 'b' && v is bool) await p.setBool(k, v);
+    if (t == 'i' && v is num) await p.setInt(k, v.toInt());
+    if (t == 'd' && v is num) await p.setDouble(k, v.toDouble());
+    if (t == 's' && v is String) await p.setString(k, v);
+    if (t == 'l' && v is List) await p.setStringList(k, [for (final x in v) '$x']);
+    n++;
+  }
+  return n;
+}
+
+class BackupPage extends StatefulWidget {
+  const BackupPage({super.key});
+  @override
+  State<BackupPage> createState() => _BackupPageState();
+}
+
+class _BackupPageState extends State<BackupPage> {
+  bool lockOn = AppLock.enabled;
+
+  Future<Uint8List> _bytes() async {
+    final m = {for (final k in Store.p.getKeys()) k: Store.p.get(k)};
+    return Uint8List.fromList(utf8.encode(const JsonEncoder.withIndent(' ').convert(buildBackup(m, DateTime.now()))));
+  }
+
+  String get _fname {
+    final d = DateTime.now();
+    return 'A2R-Home-backup-${d.year}${d.month.toString().padLeft(2, '0')}${d.day.toString().padLeft(2, '0')}.json';
+  }
+
+  Future<void> _save() async {
+    try {
+      final u = await FilePicker.saveFile(fileName: _fname, bytes: await _bytes(), mimeType: 'application/json', dialogTitle: 'احفظ النسخة (اختار Download)');
+      if (mounted) toast(context, u == null ? 'اتلغى' : 'اتحفظت ✓');
+    } catch (e) {
+      if (mounted) toast(context, 'مقدرتش أحفظ: $e');
+    }
+  }
+
+  Future<void> _share() async {
+    final f = File('${(await getTemporaryDirectory()).path}/$_fname');
+    await f.writeAsBytes(await _bytes());
+    await SharePlus.instance.share(ShareParams(files: [XFile(f.path)], text: 'نسخة إعدادات A2R Home'));
+  }
+
+  Future<void> _restore() async {
+    final p = await FilePicker.pickFile(type: FileType.any);
+    if (p == null) return;
+    final f = await pickedToFile(p);
+    if (f == null || !mounted) return;
+    if (!await confirm(context, 'ترجّع الإعدادات من الملف ده؟ الإعدادات الحالية اللي بنفس الاسم هتتغير.')) return;
+    try {
+      final n = await restoreBackup(Store.p, await f.readAsString());
+      await Schedule.rearm();
+      await Quota.rearm();
+      await NetWatch.rearm();
+      if (mounted) toast(context, 'رجعت $n إعداد ✓ — اقفل التطبيق وافتحه تاني علشان كله يتحدّث');
+    } catch (e) {
+      if (mounted) toast(context, '$e'.replaceFirst('FormatException: ', ''));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('نسخة احتياطية + قفل')),
+      body: ListView(padding: const EdgeInsets.all(12), children: [
+        const Text('النسخة فيها: أسماء الأجهزة، مواعيد الحظر، الباقة، المفضلة والمجموعات، العلامات، السجلات، إعدادات الكاست. '
+            'مش فيها باسورد الراوتر (متخزن مشفّر على الموبايل بس) ولا ربط الكمبيوتر.',
+            style: TextStyle(color: kMuted, height: 1.6)),
+        const SizedBox(height: 10),
+        FilledButton.icon(onPressed: _save, icon: const Icon(Icons.save_alt_rounded), label: const Text('احفظ نسخة (Downloads)')),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(onPressed: _share, icon: const Icon(Icons.share_rounded), label: const Text('شارك النسخة (واتساب/درايف…)')),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(onPressed: _restore, icon: const Icon(Icons.restore_rounded), label: const Text('رجّع من نسخة')),
+        const Divider(height: 32),
+        SwitchListTile(
+          value: lockOn,
+          title: const Text('قفل التطبيق برقم سري'),
+          subtitle: const Text('بيطلبه لما تفتح التطبيق أو ترجعله بعد دقيقة. لو نسيته مفيش استرجاع غير مسح بيانات التطبيق.', style: TextStyle(fontSize: 12, color: kMuted)),
+          onChanged: (v) async {
+            if (v) {
+              final a = await askText(context, 'رقم سري (4-8 أرقام)', obscure: true, type: TextInputType.number);
+              if (a == null || !RegExp(r'^\d{4,8}$').hasMatch(a)) {
+                if (mounted && a != null) toast(context, 'لازم 4 لـ 8 أرقام');
+                return;
+              }
+              if (!mounted) return;
+              final b = await askText(context, 'اكتبه تاني', obscure: true, type: TextInputType.number);
+              if (b != a) {
+                if (mounted) toast(context, 'الرقمين مش زي بعض');
+                return;
+              }
+              await AppLock.setPin(a);
+            } else {
+              if (!await AppLock.askAndVerify(context)) return;
+              await AppLock.setPin(null);
+            }
+            setState(() => lockOn = AppLock.enabled);
+          },
+        ),
+      ]),
+    );
+  }
+}
+
+// ---------------- قفل التطبيق ----------------
+String pinHash(String salt, String pin) => sha256.convert(utf8.encode('a2r:$salt:$pin')).toString();
+
+class AppLock {
+  static bool get enabled => Store.p.getBool('app_lock_on') ?? false;
+  static const _k = 'app_lock_pin';
+
+  static Future<void> setPin(String? pin) async {
+    if (pin == null) {
+      await Store._sec.delete(key: _k);
+      await Store.p.setBool('app_lock_on', false);
+      return;
+    }
+    final salt = md5Hex('${DateTime.now().microsecondsSinceEpoch}${Random().nextInt(1 << 30)}').substring(0, 16);
+    await Store._sec.write(key: _k, value: '$salt:${pinHash(salt, pin)}');
+    await Store.p.setBool('app_lock_on', true);
+  }
+
+  static Future<bool> verify(String pin) async {
+    final s = await Store._sec.read(key: _k);
+    if (s == null || !s.contains(':')) return true; // مفيش رقم محفوظ → منقفلش التطبيق على صاحبه
+    final i = s.indexOf(':');
+    return pinHash(s.substring(0, i), pin) == s.substring(i + 1);
+  }
+
+  static Future<bool> askAndVerify(BuildContext context) async {
+    final p = await askText(context, 'الرقم السري', obscure: true, type: TextInputType.number);
+    if (p == null) return false;
+    final ok = await verify(p);
+    if (!ok && context.mounted) toast(context, 'غلط');
+    return ok;
+  }
+}
+
+class AppLockGate extends StatefulWidget {
+  final Widget child;
+  const AppLockGate({super.key, required this.child});
+  @override
+  State<AppLockGate> createState() => _AppLockGateState();
+}
+
+class _AppLockGateState extends State<AppLockGate> with WidgetsBindingObserver {
+  bool locked = AppLock.enabled;
+  DateTime? _away;
+  String entered = '';
+  int bad = 0;
+  DateTime? waitUntil;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState s) {
+    if (s == AppLifecycleState.paused) _away = DateTime.now();
+    if (s == AppLifecycleState.resumed && AppLock.enabled && _away != null && DateTime.now().difference(_away!).inSeconds >= 60) {
+      setState(() {
+        locked = true;
+        entered = '';
+      });
+    }
+  }
+
+  Future<void> _digit(String d) async {
+    if (waitUntil != null && DateTime.now().isBefore(waitUntil!)) return;
+    HapticFeedback.selectionClick();
+    setState(() => entered += d);
+    if (entered.length < 4) return;
+    if (await AppLock.verify(entered)) {
+      setState(() {
+        locked = false;
+        entered = '';
+        bad = 0;
+      });
+    } else if (entered.length >= 8) {
+      _fail();
+    }
+  }
+
+  void _fail() {
+    bad++;
+    HapticFeedback.heavyImpact();
+    setState(() {
+      entered = '';
+      if (bad >= 5) {
+        waitUntil = DateTime.now().add(const Duration(seconds: 30));
+        bad = 0;
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!locked) return widget.child;
+    // التطبيق نفسه بيفضل شغال تحت (علشان ميضيعش مكانك) والقفل فوقه
+    return Stack(children: [Offstage(child: widget.child), Positioned.fill(child: _lockScreen())]);
+  }
+
+  Widget _lockScreen() {
+    final wait = waitUntil != null && DateTime.now().isBefore(waitUntil!);
+    Widget key(String t, {VoidCallback? f}) => Padding(
+          padding: const EdgeInsets.all(8),
+          child: SizedBox(
+            width: 72,
+            height: 72,
+            child: OutlinedButton(style: OutlinedButton.styleFrom(shape: const CircleBorder()), onPressed: f ?? () => _digit(t), child: Text(t, style: const TextStyle(fontSize: 24))),
+          ),
+        );
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.lock_rounded, size: 48, color: kGold),
+            const SizedBox(height: 12),
+            Text(wait ? 'استنى 30 ثانية' : 'اكتب الرقم السري', style: const TextStyle(fontSize: 18)),
+            const SizedBox(height: 12),
+            Text('•' * entered.length, style: const TextStyle(fontSize: 32, letterSpacing: 8, color: kGold)),
+            const SizedBox(height: 12),
+            Directionality(
+              textDirection: TextDirection.ltr,
+              child: Column(children: [
+                for (final row in const [
+                  ['1', '2', '3'],
+                  ['4', '5', '6'],
+                  ['7', '8', '9'],
+                ])
+                  Row(mainAxisSize: MainAxisSize.min, children: [for (final d in row) key(d)]),
+                Row(mainAxisSize: MainAxisSize.min, children: [
+                  key('⌫', f: () => setState(() => entered = entered.isEmpty ? '' : entered.substring(0, entered.length - 1))),
+                  key('0'),
+                  key('✓', f: entered.length >= 4 ? _fail : null),
+                ]),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+
+// ======== toto_v5.dart ========
+// الأكسس بوينت TOTOLINK N300RT (فيرموير Realtek "boa" القديم)
+// المبدأ: التطبيق مش بيخمّن أسماء فورمات — بيقرا صفحات الجهاز نفسه ويبعت نفس الفورم اللي الصفحة فيها
+// بنفس القيم الحالية ويغيّر الحقل المطلوب بس. أي حاجة خطيرة ممنوعة في الكود (قايمة حظر).
+
+class HtmlOption {
+  final String value, text;
+  final bool selected;
+  HtmlOption(this.value, this.text, this.selected);
+}
+
+class HtmlField {
+  final String name, type, value;
+  final bool checked;
+  final int? maxLength;
+  final List<HtmlOption> options;
+  HtmlField(this.name, this.type, this.value, {this.checked = false, this.maxLength, this.options = const []});
+  bool get isButton => type == 'submit' || type == 'button' || type == 'reset' || type == 'image';
+  String get selectedValue {
+    final s = options.where((o) => o.selected).firstOrNull ?? options.firstOrNull;
+    return s?.value ?? '';
+  }
+
+  String get selectedText => (options.where((o) => o.selected).firstOrNull ?? options.firstOrNull)?.text ?? '';
+}
+
+class HtmlForm {
+  final String page, action, method, name;
+  final List<HtmlField> fields;
+  final String body; // HTML جوه الفورم
+  HtmlForm(this.page, this.action, this.method, this.name, this.fields, this.body);
+  HtmlField? field(bool Function(HtmlField f) t) => fields.where(t).firstOrNull;
+  Iterable<HtmlField> get dataFields => fields.where((f) => !f.isButton && f.name.isNotEmpty);
+  Iterable<HtmlField> get buttons => fields.where((f) => f.isButton && f.name.isNotEmpty);
+  String describe() {
+    final b = StringBuffer('FORM page=$page action=$action method=$method name=$name\n');
+    for (final f in fields) {
+      final secret = totoIsSecretName(f.name) || f.type == 'password';
+      b.write('  ${f.type} ${f.name}=${secret ? '***' : f.value}');
+      if (f.type == 'checkbox' || f.type == 'radio') b.write(f.checked ? ' [x]' : ' [ ]');
+      if (f.maxLength != null) b.write(' max=${f.maxLength}');
+      if (f.options.isNotEmpty) b.write(' {${f.options.map((o) => '${o.selected ? '*' : ''}${o.value}:${o.text}').join(', ')}}');
+      b.writeln();
+    }
+    return b.toString();
+  }
+}
+
+String htmlDecode(String s) => s
+    .replaceAll('&nbsp;', ' ')
+    .replaceAll('&amp;', '&')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAllMapped(RegExp(r'&#(\d+);'), (m) => String.fromCharCode(int.parse(m[1]!)));
+
+String stripTags(String s) => htmlDecode(s.replaceAll(RegExp(r'<script[\s\S]*?</script>', caseSensitive: false), ' ').replaceAll(RegExp(r'<[^>]*>'), ' '))
+    .replaceAll(RegExp(r'\s+'), ' ')
+    .trim();
+
+/// خصائص التاج: name="x" name='x' name=x و checked لوحدها
+Map<String, String> attrsOf(String tag) {
+  final out = <String, String>{};
+  final inner = tag.replaceFirst(RegExp(r'^<\s*[A-Za-z]+'), '').replaceFirst(RegExp(r'/?>$'), '');
+  for (final m in RegExp(r'''([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?''').allMatches(inner)) {
+    out[m[1]!.toLowerCase()] = htmlDecode(m[2] ?? m[3] ?? m[4] ?? '');
+  }
+  return out;
+}
+
+List<HtmlForm> parseForms(String html, String page) {
+  final out = <HtmlForm>[];
+  final noComments = html.replaceAll(RegExp(r'<!--[\s\S]*?-->'), '');
+  for (final fm in RegExp(r'<form\b([^>]*)>([\s\S]*?)(?:</form>|(?=<form\b)|$)', caseSensitive: false).allMatches(noComments)) {
+    final fa = attrsOf('<form${fm[1]}>');
+    final body = fm[2]!;
+    final fields = <HtmlField>[];
+    for (final m in RegExp(r'<(input|select|textarea)\b([^>]*)>([\s\S]*?</select>|[\s\S]*?</textarea>)?', caseSensitive: false).allMatches(body)) {
+      final tag = m[1]!.toLowerCase();
+      final a = attrsOf('<$tag${m[2]}>');
+      final name = a['name'] ?? '';
+      final ml = int.tryParse(a['maxlength'] ?? '');
+      if (tag == 'input') {
+        fields.add(HtmlField(name, (a['type'] ?? 'text').toLowerCase(), a['value'] ?? '', checked: a.containsKey('checked'), maxLength: ml));
+      } else if (tag == 'select') {
+        final opts = <HtmlOption>[];
+        for (final o in RegExp(r'<option\b([^>]*)>([^<]*)', caseSensitive: false).allMatches(m[3] ?? '')) {
+          final oa = attrsOf('<option${o[1]}>');
+          final text = htmlDecode(o[2]!).trim();
+          opts.add(HtmlOption(oa['value'] ?? text, text, oa.containsKey('selected')));
+        }
+        fields.add(HtmlField(name, 'select', '', options: opts));
+      } else {
+        final t = (m[3] ?? '').replaceFirst(RegExp(r'</textarea>$', caseSensitive: false), '');
+        fields.add(HtmlField(name, 'textarea', htmlDecode(t), maxLength: ml));
+      }
+    }
+    out.add(HtmlForm(page, fa['action'] ?? '', (fa['method'] ?? 'get').toLowerCase(), fa['name'] ?? fa['id'] ?? '', fields, body));
+  }
+  return out;
+}
+
+// ---- الأمان: قايمة الحظر ----
+const List<String> kTotoBlockWords = [
+  'upload', 'reset', 'default', 'factory', 'syscmd', 'wps', 'wsc', 'upgrade', 'firmware', 'flash', 'config', 'saveconf', 'reload',
+  'opmode', 'operation', 'wan', 'repeater', 'vxd', 'wisp', 'tcpip', 'lan_ip', 'lanip', 'dhcp', 'passwordsetup', 'password', 'admin',
+  'ntp', 'ping', 'diag', 'tracert', 'syslog', 'telnet', 'ssh', 'remote', 'ddns', 'dmz', 'route', 'iptv', 'vpn', 'schedule', 'cmd', 'shell',
+];
+
+/// الحقول اللي ممكن نغيّرها (لو نفس الكلمة في قايمة الحظر بنستثنيها لحقل واحد بالاسم ده بس)
+bool totoIsSecretName(String n) => RegExp(r'pass|psk|pwd|key|secret', caseSensitive: false).hasMatch(n);
+
+/// سبب منع الفورم (null = مسموح). بيبص على الـ action واسم الفورم وكل الحقول (مش الزراير اللي مش هنبعتها)
+String? totoBlockReason(HtmlForm f, {Set<String> allowNames = const {}}) {
+  String? hit(String s) {
+    final l = s.toLowerCase();
+    for (final w in kTotoBlockWords) {
+      if (l.contains(w)) return w;
+    }
+    return null;
+  }
+
+  final a = hit(f.action) ?? hit(f.name);
+  if (a != null) return 'الفورم ($a) ممنوع';
+  for (final x in f.dataFields) {
+    if (allowNames.contains(x.name)) continue;
+    // "submit-url" عادي في Realtek
+    if (x.name.toLowerCase() == 'submit-url') continue;
+    final h = hit(x.name);
+    if (h != null) return 'فيه حقل ممنوع (${x.name})';
+  }
+  if (f.fields.any((x) => x.type == 'file')) return 'فورم رفع ملفات ممنوع';
+  if (!f.action.contains('boafrm/') && !f.action.toLowerCase().startsWith('/goform/') && !f.action.toLowerCase().startsWith('goform/')) {
+    return 'الفورم مش بيروح لـ boafrm (${f.action.isEmpty ? 'فاضي' : f.action})';
+  }
+  return null;
+}
+
+/// حقول قيمتها بتتملا بالجافاسكريبت لما الصفحة تفتح (يبقى القيمة اللي في الـ HTML مش الحقيقية)
+Set<String> jsFilledFields(String html, Iterable<String> names) {
+  final scripts = RegExp(r'<script[^>]*>([\s\S]*?)</script>', caseSensitive: false).allMatches(html).map((m) => m[1]!).join('\n');
+  final out = <String>{};
+  for (final n in names) {
+    if (n.isEmpty) continue;
+    final e = RegExp.escape(n);
+    if (RegExp('(\\.|\\[["\'])$e(["\']\\])?\\s*\\.\\s*(value|checked|selectedIndex|defaultChecked)\\s*=(?!=)').hasMatch(scripts) ||
+        RegExp('getElementById\\(\\s*["\']$e["\']\\s*\\)\\s*\\.\\s*(value|checked|selectedIndex)\\s*=(?!=)').hasMatch(scripts)) {
+      out.add(n);
+    }
+  }
+  return out;
+}
+
+/// البيانات اللي هتتبعت: نفس القيم الحالية + التغيير + زرار الإرسال
+Map<String, String> formPayload(HtmlForm f, Map<String, String> changes, {String? submit}) {
+  final out = <String, String>{};
+  for (final x in f.dataFields) {
+    if (x.type == 'checkbox' || x.type == 'radio') {
+      if (x.checked) out[x.name] = x.value.isEmpty ? 'on' : x.value;
+    } else if (x.type == 'select') {
+      out[x.name] = x.selectedValue;
+    } else {
+      out[x.name] = x.value;
+    }
+  }
+  out.addAll(changes);
+  if (submit != null) {
+    final b = f.buttons.where((x) => x.name == submit).firstOrNull;
+    if (b != null) out[b.name] = b.value;
+  }
+  return out;
+}
+
+String totoMask(String s) => s.replaceAllMapped(
+    RegExp(r'(^|[&?\s])([A-Za-z0-9_\-]*(?:pass|psk|pwd|key|secret)[A-Za-z0-9_\-]*)=([^&\s]*)', caseSensitive: false), (m) => '${m[1]}${m[2]}=***');
+
+/// روابط الصفحات من HTML/JS (href/src/location/نصوص فيها .htm)
+List<String> discoverPages(String html) {
+  final out = <String>{};
+  for (final m in RegExp(r'''["'=\s(]/?([A-Za-z0-9_\-/]+\.(?:htm|html|asp))(?:[?#][^"'\s)]*)?''', caseSensitive: false).allMatches(html)) {
+    final p = '/${m[1]!.replaceFirst(RegExp(r'^/+'), '')}';
+    if (totoPageSafe(p)) out.add(p);
+  }
+  return out.toList();
+}
+
+/// الصفحات اللي ينفع نفتحها GET (قراية بس)
+bool totoPageSafe(String p) {
+  final l = p.toLowerCase();
+  if (!RegExp(r'^/[a-z0-9_\-/]+\.(htm|html|asp)$').hasMatch(l)) return false;
+  for (final w in ['boafrm', 'goform', 'cgi', 'syscmd', 'upgrade', 'upload', 'config', 'logout', 'reboot_now']) {
+    if (l.contains(w)) return false;
+  }
+  return true;
+}
+
+class HtmlRow {
+  final List<String> cells;
+  final String html;
+  HtmlRow(this.cells, this.html);
+}
+
+List<HtmlRow> tableRows(String html) => [
+      for (final r in RegExp(r'<tr\b[^>]*>([\s\S]*?)(?=<tr\b|</table>|$)', caseSensitive: false).allMatches(html))
+        HtmlRow([for (final c in RegExp(r'<t[dh]\b[^>]*>([\s\S]*?)(?=<t[dh]\b|</tr>|$)', caseSensitive: false).allMatches(r[1]!)) stripTags(c[1]!)], r[0]!)
+    ];
+
+final RegExp kMacRe = RegExp(r'\b([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b|\b[0-9A-Fa-f]{12}\b');
+final RegExp kIpRe = RegExp(r'\b(?:\d{1,3}\.){3}\d{1,3}\b');
+
+class TotoClient {
+  final String mac;
+  String ip = '', name = '', extra = '', page = '';
+  TotoClient(this.mac);
+}
+
+/// صفوف فيها MAC → عملاء (من جدول الواي فاي أو DHCP)
+List<TotoClient> clientsFromRows(List<HtmlRow> rows, String page) {
+  final out = <TotoClient>[];
+  for (final r in rows) {
+    if (r.html.toLowerCase().contains('<table')) continue; // صف بيلف جدول جوه جدول
+    final macCell = r.cells.indexWhere((c) => kMacRe.hasMatch(c) && c.length <= 20);
+    if (macCell < 0) continue;
+    final c = TotoClient(normMac(kMacRe.firstMatch(r.cells[macCell])![0]!));
+    final rest = <String>[];
+    for (var i = 0; i < r.cells.length; i++) {
+      if (i == macCell) continue;
+      final v = r.cells[i];
+      if (c.ip.isEmpty && kIpRe.hasMatch(v)) {
+        c.ip = kIpRe.firstMatch(v)![0]!;
+      } else if (v.isNotEmpty && v.length <= 40) {
+        rest.add(v);
+      }
+    }
+    final nm = rest.where((v) => RegExp(r'[A-Za-z]').hasMatch(v) && !RegExp(r'^(yes|no|on|off|\d+(\.\d+)?\s*\w{0,4})$', caseSensitive: false).hasMatch(v)).firstOrNull;
+    c.name = nm ?? '';
+    c.extra = rest.where((v) => v != nm).join(' • ');
+    c.page = page;
+    out.add(c);
+  }
+  return out;
+}
+
+/// جداول الحالة: "عنوان | قيمة"
+List<MapEntry<String, String>> statusPairs(String html) {
+  final out = <MapEntry<String, String>>[];
+  for (final r in tableRows(html)) {
+    if (r.cells.length == 2 && r.cells[0].isNotEmpty && r.cells[0].length < 40 && r.cells[1].isNotEmpty && r.cells[1].length < 80) {
+      out.add(MapEntry(r.cells[0].replaceFirst(RegExp(r'\s*:\s*$'), ''), r.cells[1]));
+    }
+  }
+  return out;
+}
+
+/// لو الصفحة صفحة دخول: نوعها
+class TotoLogin {
+  final String kind; // basic / form / none / captcha
+  final HtmlForm? form;
+  final String note;
+  TotoLogin(this.kind, {this.form, this.note = ''});
+}
+
+TotoLogin detectLogin(int status, String? wwwAuth, String body, String page) {
+  if (status == 401 && (wwwAuth ?? '').toLowerCase().contains('basic')) return TotoLogin('basic');
+  for (final f in parseForms(body, page)) {
+    if (f.fields.any((x) => x.type == 'password')) {
+      if (f.dataFields.any((x) => RegExp(r'captcha|verif|code|check_?num', caseSensitive: false).hasMatch(x.name) && x.type != 'hidden')) {
+        return TotoLogin('captcha', form: f, note: 'صفحة الدخول فيها كود تحقق — استخدم صفحة الجهاز');
+      }
+      final js = RegExp(r'hex_md5|md5\(|base64|btoa\(|encrypt', caseSensitive: false).hasMatch(body);
+      return TotoLogin('form', form: f, note: js ? 'صفحة الدخول ممكن تشفّر الباسورد بالجافاسكريبت قبل ما تبعته' : '');
+    }
+  }
+  return TotoLogin('none');
+}
+
+/// يبني الدخول من فورم الجهاز نفسه
+Map<String, String> loginPayload(HtmlForm f, String user, String pass) {
+  final ch = <String, String>{};
+  for (final x in f.dataFields) {
+    if (x.type == 'password') {
+      ch[x.name] = pass;
+    } else if ((x.type == 'text' || x.type == 'email') && RegExp(r'user|name|login|account', caseSensitive: false).hasMatch(x.name)) {
+      ch[x.name] = user;
+    }
+  }
+  final sub = f.buttons.where((b) => b.type == 'submit').firstOrNull?.name;
+  return formPayload(f, ch, submit: sub);
+}
+
+/// اختيار عنوان فاضي للأكسس في شبكة البيت: برا مدى الـ DHCP ومش مستخدم
+List<String> suggestApIps(String prefix, {int? dhcpStart, int? dhcpEnd, required Set<String> used}) {
+  final out = <String>[];
+  bool inDhcp(int n) => dhcpStart != null && dhcpEnd != null && n >= dhcpStart && n <= dhcpEnd;
+  for (var n = 250; n >= 200 && out.length < 6; n--) {
+    final ip = '$prefix.$n';
+    if (!inDhcp(n) && !used.contains(ip)) out.add(ip);
+  }
+  if (out.isEmpty && dhcpStart != null && dhcpStart > 3) {
+    for (var n = dhcpStart - 1; n >= 2 && out.length < 6; n--) {
+      final ip = '$prefix.$n';
+      if (!used.contains(ip)) out.add(ip);
+    }
+  }
+  return out;
+}
+
+int? lastOctet(String? ip) {
+  final p = (ip ?? '').split('.');
+  return p.length == 4 ? int.tryParse(p[3]) : null;
+}
+
+String prefixOf(String ip) {
+  final p = ip.split('.');
+  return p.length == 4 ? '${p[0]}.${p[1]}.${p[2]}' : '';
+}
+
+// ---- تخزين ----
+class TotoStore {
+  static String get ip => Store.p.getString('toto_ip') ?? '192.168.2.2';
+  static set ip(String v) => Store.p.setString('toto_ip', v);
+  static String get user => Store.p.getString('toto_user') ?? 'admin';
+  static set user(String v) => Store.p.setString('toto_user', v);
+  static Future<String?> pass() => Store._sec.read(key: 'toto_pw');
+  static Future<void> savePass(String? v) => v == null ? Store._sec.delete(key: 'toto_pw') : Store._sec.write(key: 'toto_pw', value: v);
+  /// الأجهزة اللي جدول الأكسس قال إنها متوصلة بيه (MAC)
+  static Set<String> get macs => (Store.p.getStringList('toto_macs') ?? []).toSet();
+  static set macs(Set<String> v) => Store.p.setStringList('toto_macs', v.toList());
+}
+
+// ---- الاتصال بالجهاز ----
+class TotoDevice {
+  final String host;
+  String kind = 'none';
+  String? _basic;
+  final Map<String, String> cookies = {};
+  final HttpClient _http = HttpClient()..connectionTimeout = const Duration(seconds: 4);
+  final Map<String, String> pages = {}; // path → html
+  TotoDevice(this.host) {
+    _http.badCertificateCallback = (c, h, p) => h == host;
+  }
+
+  void close() => _http.close(force: true);
+
+  Future<({int status, Map<String, String> headers, String body})> _req(String method, String path, {Map<String, String>? form, String? referer}) async {
+    final uri = Uri.parse('http://$host${path.startsWith('/') ? '' : '/'}$path');
+    final rq = await _http.openUrl(method, uri).timeout(const Duration(seconds: 6));
+    rq.followRedirects = false;
+    if (_basic != null) rq.headers.set('Authorization', 'Basic $_basic');
+    if (cookies.isNotEmpty) rq.headers.set('Cookie', cookies.entries.map((e) => '${e.key}=${e.value}').join('; '));
+    rq.headers.set('Referer', referer ?? 'http://$host/');
+    String? bodyStr;
+    if (form != null) {
+      bodyStr = form.entries.map((e) => '${Uri.encodeQueryComponent(e.key)}=${Uri.encodeQueryComponent(e.value)}').join('&');
+      rq.headers.contentType = ContentType('application', 'x-www-form-urlencoded');
+      rq.contentLength = utf8.encode(bodyStr).length;
+      rq.write(bodyStr);
+    }
+    final rs = await rq.close().timeout(const Duration(seconds: 8));
+    final bytes = await rs.fold<List<int>>([], (a, b) => a..addAll(b)).timeout(const Duration(seconds: 10));
+    final body = utf8.decode(bytes, allowMalformed: true);
+    final h = <String, String>{};
+    rs.headers.forEach((k, v) => h[k] = v.join(', '));
+    for (final c in rs.cookies) {
+      cookies[c.name] = c.value;
+    }
+    AppLog.add('TOTO', '$method $path${bodyStr == null ? '' : ' body=${totoMask(bodyStr)}'} → ${rs.statusCode} '
+        'server=${h['server'] ?? '-'} loc=${h['location'] ?? '-'} auth=${h['www-authenticate'] ?? '-'} len=${bytes.length}');
+    return (status: rs.statusCode, headers: h, body: body);
+  }
+
+  /// GET لصفحة آمنة بس
+  Future<({int status, Map<String, String> headers, String body})> get(String path) async {
+    if (!totoPageSafe(path) && path != '/') throw StateError('الصفحة دي مش مسموح أفتحها: $path');
+    var r = await _req('GET', path);
+    for (var i = 0; i < 2 && (r.status == 301 || r.status == 302 || r.status == 303) && (r.headers['location'] ?? '').isNotEmpty; i++) {
+      final l = Uri.parse(r.headers['location']!);
+      if (l.host.isNotEmpty && l.host != host) break;
+      if (!totoPageSafe(l.path) && l.path != '/') break;
+      r = await _req('GET', l.path);
+    }
+    return r;
+  }
+
+  /// هل ده TOTOLINK / Realtek boa؟
+  Future<String?> identify() async {
+    final r = await get('/');
+    final b = r.body.toLowerCase();
+    final s = (r.headers['server'] ?? '').toLowerCase();
+    final hit = b.contains('totolink') || s.contains('boa') || b.contains('boafrm') || b.contains('home.htm') || (r.headers['www-authenticate'] ?? '').toLowerCase().contains('totolink');
+    AppLog.add('TOTO', 'identify $host server=${r.headers['server']} title=${RegExp(r'<title>([^<]*)', caseSensitive: false).firstMatch(r.body)?.group(1)} hit=$hit');
+    return hit ? (r.headers['server'] ?? 'web') : null;
+  }
+
+  /// محاولة دخول واحدة. بيرجع رسالة خطأ أو null لو تمام
+  Future<String?> login(String user, String pass) async {
+    var r = await get('/home.htm');
+    var page = '/home.htm';
+    // تحويل بالجافاسكريبت لصفحة الدخول
+    final jsLoc = RegExp(r'''location(?:\.href)?\s*=\s*["']/?([A-Za-z0-9_\-/]+\.(?:htm|html|asp))''').firstMatch(r.body)?.group(1);
+    if (r.status == 200 && jsLoc != null && !r.body.toLowerCase().contains('type="password"') && totoPageSafe('/$jsLoc') && r.body.length < 3000) {
+      page = '/$jsLoc';
+      r = await get(page);
+    }
+    var lg = detectLogin(r.status, r.headers['www-authenticate'], r.body, page);
+    if (lg.kind == 'none' && r.status == 200) {
+      kind = 'none';
+      pages[page] = r.body;
+      return null; // مفتوح من غير دخول (أو الجلسة لسه شغالة)
+    }
+    if (lg.kind == 'captcha') return lg.note;
+    if (lg.kind == 'basic') {
+      _basic = base64.encode(utf8.encode('$user:$pass'));
+      final r2 = await get('/home.htm');
+      if (r2.status == 401) {
+        _basic = null;
+        return 'اسم المستخدم أو الباسورد غلط';
+      }
+      kind = 'basic';
+      pages['/home.htm'] = r2.body;
+      return null;
+    }
+    if (lg.kind == 'form' && lg.form != null) {
+      final f = lg.form!;
+      if (lg.note.isNotEmpty) AppLog.add('TOTO', 'تنبيه: ${lg.note}');
+      AppLog.add('TOTO', 'login form:\n${f.describe()}');
+      final action = f.action.isEmpty ? page : (f.action.startsWith('/') ? f.action : '/${f.action}');
+      if (!action.toLowerCase().contains('login') && !action.toLowerCase().contains('boafrm')) return 'فورم الدخول غريب ($action) — مش هبعت الباسورد له';
+      final p = await _req('POST', action, form: loginPayload(f, user, pass), referer: 'http://$host$page');
+      if (p.status >= 400) return 'الجهاز رفض الدخول (${p.status})';
+      final r2 = await get('/home.htm');
+      final again = detectLogin(r2.status, r2.headers['www-authenticate'], r2.body, '/home.htm');
+      if (again.kind != 'none') return 'الدخول مانفعش — الباسورد غلط${lg.note.isNotEmpty ? ' أو ${lg.note}' : ''}';
+      kind = 'form';
+      pages['/home.htm'] = r2.body;
+      return null;
+    }
+    return 'مش لاقي صفحة دخول مفهومة (${r.status})';
+  }
+
+  static const List<String> kExtraPages = ['/status.htm', '/wlstatbl.htm', '/dhcptbl.htm', '/wlactrl.htm', '/wlbasic.htm', '/wlwpa.htm', '/reboot.htm', '/menu.htm'];
+
+  /// يقرا صفحات الجهاز (من القايمة + أسماء Realtek المعروفة) — GET بس
+  Future<void> crawl({int maxPages = 40}) async {
+    final queue = <String>[...pages.keys, '/home.htm', ...kExtraPages];
+    final seen = <String>{};
+    while (queue.isNotEmpty && seen.length < maxPages) {
+      final p = queue.removeAt(0);
+      if (!seen.add(p)) continue;
+      try {
+        final r = pages.containsKey(p) && p != '/home.htm' ? null : await get(p);
+        if (r != null) {
+          if (r.status != 200) continue;
+          if (detectLogin(r.status, null, r.body, p).kind != 'none') continue;
+          pages[p] = r.body;
+        }
+        for (final n in discoverPages(pages[p] ?? '')) {
+          if (!seen.contains(n)) queue.add(n);
+        }
+      } catch (e) {
+        AppLog.add('TOTO', 'GET $p ✗ $e');
+      }
+    }
+  }
+
+  List<HtmlForm> get forms => [for (final e in pages.entries) ...parseForms(e.value, e.key)];
+
+  /// بيبعت فورم الجهاز (بعد كل فحوص الأمان)
+  Future<int> submit(HtmlForm f, Map<String, String> payload) async {
+    final reason = totoBlockReason(f, allowNames: payload.keys.where((k) => !f.dataFields.any((x) => x.name == k)).toSet());
+    if (reason != null) throw StateError('ممنوع: $reason');
+    final action = f.action.startsWith('/') ? f.action : '/${f.action}';
+    final r = f.method == 'post' ? await _req('POST', action, form: payload, referer: 'http://$host${f.page}') : throw StateError('الفورم مش POST');
+    return r.status;
+  }
+}
+
+/// فحص قبل أي تغيير: ممنوع + قيم بتتملا بالجافاسكريبت
+String? totoPreflight(HtmlForm f, String pageHtml, Set<String> changing) {
+  final b = totoBlockReason(f);
+  if (b != null) return b;
+  final js = jsFilledFields(pageHtml, f.dataFields.map((x) => x.name).where((n) => !changing.contains(n)));
+  if (js.isNotEmpty) return 'الصفحة بتملا قيم (${js.take(4).join('، ')}) بالجافاسكريبت — لو بعتّ هيتبعت قيم غلط';
+  if (f.method != 'post') return 'الفورم مش POST';
+  return null;
+}
+
+/// يلاقي فورم الريستارت (مش جدول الريستارت)
+HtmlForm? findRebootForm(List<HtmlForm> forms) => forms.where((f) {
+      final a = '${f.action} ${f.name}'.toLowerCase();
+      return a.contains('reboot') && !a.contains('sche') && !f.dataFields.any((x) => x.type == 'text' || x.type == 'select');
+    }).firstOrNull;
+
+/// اسم الشبكة: فورم فيه ssid ونوعه AP (مش Client/WDS)
+({HtmlForm form, HtmlField ssid})? findSsidForm(List<HtmlForm> forms) {
+  for (final f in forms) {
+    final s = f.field((x) => RegExp(r'^ssid\d*$', caseSensitive: false).hasMatch(x.name) && x.type == 'text');
+    if (s == null) continue;
+    final mode = f.field((x) => RegExp(r'^mode\d*$', caseSensitive: false).hasMatch(x.name) && x.type == 'select');
+    if (mode == null) continue;
+    final t = mode.selectedText.toLowerCase();
+    if (!t.contains('ap') || t.contains('client') || t.contains('wds')) continue;
+    return (form: f, ssid: s);
+  }
+  return null;
+}
+
+({HtmlForm form, HtmlField key})? findWifiKeyForm(List<HtmlForm> forms) {
+  for (final f in forms) {
+    final k = f.field((x) => RegExp(r'^(psk_?value|wpa_?psk|pskValue)\d*$', caseSensitive: false).hasMatch(x.name) && (x.type == 'password' || x.type == 'text'));
+    if (k != null) return (form: f, key: k);
+  }
+  return null;
+}
+
+/// فورم إضافة MAC للحظر: فيه حقل mac + اختيار (معطّل/مسموح/ممنوع)
+({HtmlForm form, HtmlField mac, HtmlField? mode, HtmlOption? deny, HtmlField? comment, String? addBtn})? findMacAddForm(List<HtmlForm> forms) {
+  for (final f in forms) {
+    final mac = f.field((x) => RegExp(r'^mac(addr)?\d*$', caseSensitive: false).hasMatch(x.name) && x.type == 'text');
+    if (mac == null) continue;
+    final mode = f.field((x) => x.type == 'select' && x.options.any((o) => o.text.toLowerCase().contains('deny')));
+    final deny = mode?.options.where((o) => o.text.toLowerCase().contains('deny')).firstOrNull;
+    final comment = f.field((x) => RegExp(r'comment|desc', caseSensitive: false).hasMatch(x.name) && x.type == 'text');
+    final add = f.buttons.where((b) => RegExp(r'add', caseSensitive: false).hasMatch(b.name)).firstOrNull?.name;
+    return (form: f, mac: mac, mode: mode, deny: deny, comment: comment, addBtn: add);
+  }
+  return null;
+}
+
+/// فورم مسح MAC: صف فيه الـ MAC + checkbox + زرار "Delete Selected" (مش Delete All)
+({HtmlForm form, String checkbox, String delBtn})? findMacDelete(List<HtmlForm> forms, String mac) {
+  final hex = mac.replaceAll(':', '').toUpperCase();
+  for (final f in forms) {
+    final del = f.buttons.where((b) => RegExp(r'del', caseSensitive: false).hasMatch(b.name) && !RegExp(r'all', caseSensitive: false).hasMatch('${b.name} ${b.value}')).firstOrNull;
+    if (del == null) continue;
+    for (final r in tableRows(f.body)) {
+      if (!r.cells.any((c) => c.replaceAll(RegExp(r'[^0-9A-Fa-f]'), '').toUpperCase() == hex)) continue;
+      final cb = RegExp(r'<input\b[^>]*>', caseSensitive: false).allMatches(r.html).map((m) => attrsOf(m[0]!)).where((a) => (a['type'] ?? '').toLowerCase() == 'checkbox').firstOrNull;
+      if (cb != null && (cb['name'] ?? '').isNotEmpty) return (form: f, checkbox: cb['name']!, delBtn: del.name);
+    }
+  }
+  return null;
+}
+
+String macForField(String mac, HtmlField f) => (f.maxLength != null && f.maxLength! <= 12) ? mac.replaceAll(':', '').toUpperCase() : normMac(mac);
+
+/// يدوّر على صفحة TOTOLINK في شبكة الموبايل
+Future<List<String>> scanForToto(String prefix, {List<String> extra = const []}) async {
+  final cands = <String>{...extra, '$prefix.1', '$prefix.2', '$prefix.254'};
+  final open = <String>[];
+  final ips = [for (var i = 1; i < 255; i++) '$prefix.$i'];
+  for (var i = 0; i < ips.length; i += 32) {
+    await Future.wait(ips.skip(i).take(32).map((ip) async {
+      try {
+        final s = await Socket.connect(ip, 80, timeout: const Duration(milliseconds: 350));
+        s.destroy();
+        open.add(ip);
+      } catch (_) {}
+    }));
+  }
+  cands.addAll(open);
+  final found = <String>[];
+  await Future.wait(cands.map((ip) async {
+    final d = TotoDevice(ip);
+    try {
+      if (await d.identify() != null) found.add(ip);
+    } catch (_) {
+    } finally {
+      d.close();
+    }
+  }));
+  AppLog.add('TOTO', 'scan $prefix.x → web=${open.length} totolink=$found');
+  return found;
+}
+
+Future<bool> port80Open(String ip) async {
+  try {
+    final s = await Socket.connect(ip, 80, timeout: const Duration(milliseconds: 1500));
+    s.destroy();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ---- الشاشة ----
+class TotoPage extends StatefulWidget {
+  final ZteRouter? router;
+  final List<LanHost> hosts;
+  final String Function(LanHost) labelOf;
+  const TotoPage({super.key, required this.router, required this.hosts, required this.labelOf});
+  @override
+  State<TotoPage> createState() => _TotoPageState();
+}
+
+class _TotoPageState extends State<TotoPage> {
+  final ipC = TextEditingController(text: TotoStore.ip);
+  TotoDevice? dev;
+  bool busy = false;
+  String status = '';
+  bool? reachable;
+  PhoneNet? net;
+  List<String> suggest = [];
+  String dhcpInfo = '';
+  List<TotoClient> clients = [];
+  List<MapEntry<String, String>> info = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _check();
+  }
+
+  @override
+  void dispose() {
+    dev?.close();
+    super.dispose();
+  }
+
+  Future<void> _run(String msg, Future<void> Function() f) async {
+    if (busy) return;
+    setState(() {
+      busy = true;
+      status = msg;
+    });
+    try {
+      await f();
+    } catch (e) {
+      AppLog.add('TOTO', '✗ $e');
+      if (mounted) setState(() => status = '$e'.replaceFirst('Bad state: ', ''));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> _check() => _run('بشوف الأكسس…', () async {
+        net = await readPhoneNet();
+        final ip = ipC.text.trim();
+        reachable = await port80Open(ip);
+        status = reachable! ? 'الأكسس رد على $ip' : 'الأكسس مش بيرد على $ip';
+        if (!reachable! && net?.prefix.isNotEmpty == true && prefixOf(ip) != net!.prefix) await _suggest();
+      });
+
+  Future<void> _suggest() async {
+    final prefix = net?.prefix ?? '';
+    if (prefix.isEmpty) return;
+    int? s, e;
+    if (widget.router != null) {
+      try {
+        final j = await widget.router!.get(['lan_ipaddr', 'lan_netmask', 'dhcpEnabled', 'dhcpStart', 'dhcpEnd']);
+        AppLog.add('TOTO', 'ZTE DHCP raw: $j');
+        if (prefixOf('${j['dhcpStart']}') == prefix) s = lastOctet('${j['dhcpStart']}');
+        if (prefixOf('${j['dhcpEnd']}') == prefix) e = lastOctet('${j['dhcpEnd']}');
+      } catch (err) {
+        AppLog.add('TOTO', 'ZTE DHCP read ✗ $err');
+      }
+    }
+    dhcpInfo = s != null && e != null ? 'الراوتر بيوزّع من $prefix.$s لـ $prefix.$e' : 'مقدرتش أقرا مدى الـ DHCP من الراوتر — اتأكد إن العنوان برا المدى من صفحة الراوتر';
+    final used = {for (final h in widget.hosts) h.ip, net?.ip ?? '', net?.gateway ?? ''};
+    final c = suggestApIps(prefix, dhcpStart: s, dhcpEnd: e, used: used);
+    final free = <String>[];
+    for (final ip in c) {
+      if (free.length >= 2) break;
+      final alive = await probeHost(ip, ports: const [80, 443, 22, 53]) != null || await pingOnce(ip) != null;
+      if (!alive) free.add(ip);
+    }
+    suggest = free;
+  }
+
+  Future<void> _scan() => _run('بدوّر على الأكسس في الشبكة…', () async {
+        net ??= await readPhoneNet();
+        final extra = [for (final h in widget.hosts) if (RegExp(r'toto|zioncom', caseSensitive: false).hasMatch(h.vendor + h.name)) h.ip];
+        final f = await scanForToto(net!.prefix, extra: extra);
+        if (f.isEmpty) {
+          status = 'ملقتش صفحة TOTOLINK على ${net!.prefix}.x';
+        } else {
+          ipC.text = f.first;
+          TotoStore.ip = f.first;
+          reachable = true;
+          status = 'لقيته على ${f.join('، ')}';
+        }
+      });
+
+  Future<void> _login() async {
+    final ip = ipC.text.trim();
+    if (!isIpv4(ip)) {
+      toast(context, 'العنوان مش مظبوط');
+      return;
+    }
+    TotoStore.ip = ip;
+    var pw = await TotoStore.pass();
+    if (!mounted) return;
+    if (pw == null) {
+      final u = await askText(context, 'اسم المستخدم', initial: TotoStore.user);
+      if (u == null || !mounted) return;
+      TotoStore.user = u.trim().isEmpty ? 'admin' : u.trim();
+      pw = await askText(context, 'باسورد صفحة الأكسس', obscure: true);
+      if (pw == null) return;
+    }
+    final pass = pw;
+    await _run('بدخل (محاولة واحدة)…', () async {
+      dev?.close();
+      final d = TotoDevice(ip);
+      final err = await d.login(TotoStore.user, pass);
+      if (err != null) {
+        d.close();
+        await TotoStore.savePass(null);
+        status = err;
+        return;
+      }
+      await TotoStore.savePass(pass);
+      dev = d;
+      status = 'دخلت ✓ — بقرا الصفحات…';
+      if (mounted) setState(() {});
+      await _read();
+    });
+  }
+
+  Future<void> _read() async {
+    final d = dev!;
+    d.pages.removeWhere((k, v) => k != '/home.htm');
+    await d.crawl();
+    final cl = <String, TotoClient>{};
+    final inf = <MapEntry<String, String>>[];
+    for (final e in d.pages.entries) {
+      final l = e.key.toLowerCase();
+      if (l.contains('status') || l.contains('home')) inf.addAll(statusPairs(e.value));
+      final isAcl = l.contains('ac') && l.contains('ctrl') || l.contains('filter');
+      if (isAcl) continue;
+      if (RegExp(r'sta|client|dhcp|tbl', caseSensitive: false).hasMatch(l)) {
+        for (final c in clientsFromRows(tableRows(e.value), e.key)) {
+          final ex = cl[c.mac];
+          if (ex == null) {
+            cl[c.mac] = c;
+          } else {
+            if (ex.ip.isEmpty) ex.ip = c.ip;
+            if (ex.name.isEmpty) ex.name = c.name;
+          }
+        }
+      }
+    }
+    final seen = <String>{};
+    info = [for (final e in inf) if (seen.add(e.key)) e];
+    clients = cl.values.toList();
+    TotoStore.macs = {for (final c in clients) c.mac};
+    status = 'اتقرا ${d.pages.length} صفحة • ${clients.length} جهاز على الأكسس • ${d.forms.length} فورم';
+    AppLog.add('TOTO', status);
+  }
+
+  void _dumpForms() {
+    final d = dev;
+    if (d == null) return;
+    AppLog.add('TOTO', '===== صفحات الأكسس (${d.pages.length}) =====');
+    for (final e in d.pages.entries) {
+      AppLog.add('TOTO', 'PAGE ${e.key} len=${e.value.length} links=${discoverPages(e.value).join(' ')}');
+    }
+    for (final f in d.forms) {
+      final why = totoBlockReason(f);
+      AppLog.add('TOTO', '${f.describe()}  → ${why == null ? 'مسموح' : 'ممنوع: $why'}');
+    }
+    toast(context, 'اتكتبت في السجل ✓ — افتح السجل وشاركه');
+  }
+
+  Future<bool> _apply(String title, HtmlForm f, Map<String, String> changes, {String? submit, required String summary}) async {
+    final pageHtml = dev!.pages[f.page] ?? '';
+    final why = totoPreflight(f, pageHtml, changes.keys.toSet());
+    if (why != null) {
+      AppLog.add('TOTO', '$title: مش هبعت — $why\n${f.describe()}');
+      if (mounted) {
+        await showDialog(
+          context: context,
+          builder: (d) => AlertDialog(
+            title: Text(title),
+            content: Text('مش هقدر أعملها من التطبيق بأمان: $why.\nاعملها من صفحة الجهاز نفسها، وابعتلي السجل علشان أظبطها.'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(d), child: const Text('تمام')),
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(d);
+                  _openWeb(f.page);
+                },
+                child: const Text('افتح الصفحة'),
+              ),
+            ],
+          ),
+        );
+      }
+      return false;
+    }
+    if (!mounted || !await confirm(context, '«تجريبي» $summary\nهيتبعت نفس فورم الجهاز (${f.action}) بكل قيمه الحالية والتغيير ده بس.')) return false;
+    final code = await dev!.submit(f, formPayload(f, changes, submit: submit));
+    AppLog.add('TOTO', '$title → HTTP $code');
+    return code < 400;
+  }
+
+  void _openWeb([String page = '/home.htm']) =>
+      Navigator.push(context, MaterialPageRoute(builder: (_) => BrowserPage(initialUrl: 'http://${ipC.text.trim()}$page')));
+
+  Future<void> _reboot() => _run('ريستارت…', () async {
+        final f = findRebootForm(dev!.forms);
+        if (f == null) {
+          status = 'ملقتش فورم الريستارت في صفحات الجهاز';
+          return;
+        }
+        final btn = f.buttons.where((b) => b.type == 'submit').firstOrNull?.name;
+        if (await _apply('ريستارت', f, {}, submit: btn, summary: 'ريستارت للأكسس؟ النت هيقطع على الأجهزة المتوصلة بيه دقيقة أو اتنين.')) {
+          status = 'اتبعت الريستارت — استنى دقيقتين وبعدين «اقرا تاني»';
+        }
+      });
+
+  Future<void> _ssid() async {
+    final r = findSsidForm(dev!.forms);
+    if (r == null) {
+      setState(() => status = 'ملقتش فورم اسم الشبكة في وضع AP (لو الأكسس مكرر/Client التطبيق مش هيلمسه)');
+      return;
+    }
+    final n = await askText(context, 'اسم الواي فاي الجديد (إنجليزي، لحد 32 حرف)', initial: r.ssid.value);
+    if (n == null) return;
+    final v = n.trim();
+    if (v.isEmpty || v.length > 32 || !RegExp(r'^[\x20-\x7E]+$').hasMatch(v)) {
+      if (mounted) toast(context, 'الاسم لازم حروف إنجليزي/أرقام ولحد 32');
+      return;
+    }
+    await _run('بغيّر الاسم…', () async {
+      final btn = r.form.buttons.where((b) => b.type == 'submit' && RegExp(r'save|apply', caseSensitive: false).hasMatch('${b.name} ${b.value}')).firstOrNull?.name;
+      if (!await _apply('اسم الواي فاي', r.form, {r.ssid.name: v}, submit: btn, summary: 'تغيير اسم شبكة الأكسس لـ «$v»؟ الأجهزة المتوصلة بيه هتفصل ولازم تتوصل بالاسم الجديد.')) return;
+      await Future.delayed(const Duration(seconds: 3));
+      await _read();
+      final after = findSsidForm(dev!.forms)?.ssid.value;
+      status = after == v ? 'اتغيّر الاسم ✓ (اتأكدت من الصفحة)' : 'اتبعت، بس الصفحة لسه بتقول «${after ?? '؟'}» — ممكن يحتاج ريستارت أو الجهاز رفض';
+    });
+  }
+
+  Future<void> _key() async {
+    final r = findWifiKeyForm(dev!.forms);
+    if (r == null) {
+      setState(() => status = 'ملقتش فورم باسورد الواي فاي');
+      return;
+    }
+    final k = await askText(context, 'باسورد الواي فاي الجديد (8-63 حرف إنجليزي)', obscure: true);
+    if (k == null) return;
+    if (k.length < 8 || k.length > 63 || !RegExp(r'^[\x20-\x7E]+$').hasMatch(k)) {
+      if (mounted) toast(context, 'لازم من 8 لـ 63 حرف إنجليزي/أرقام');
+      return;
+    }
+    await _run('بغيّر الباسورد…', () async {
+      final btn = r.form.buttons.where((b) => b.type == 'submit' && RegExp(r'save|apply', caseSensitive: false).hasMatch('${b.name} ${b.value}')).firstOrNull?.name;
+      if (!await _apply('باسورد الواي فاي', r.form, {r.key.name: k}, submit: btn, summary: 'تغيير باسورد واي فاي الأكسس؟ كل الأجهزة المتوصلة بيه هتفصل ولازم تكتب الجديد.')) return;
+      await Future.delayed(const Duration(seconds: 3));
+      await _read();
+      final after = findWifiKeyForm(dev!.forms)?.key.value ?? '';
+      status = after == k ? 'اتغيّر ✓ (اتأكدت من الصفحة)' : 'اتبعت — الصفحة مش بتعرض الباسورد فمقدرش أتأكد؛ جرّب تتصل بالجديد';
+    });
+  }
+
+  Future<void> _block(TotoClient c) => _run('بحظر ${c.mac}…', () async {
+        final r = findMacAddForm(dev!.forms);
+        if (r == null) {
+          status = 'ملقتش فورم التحكم بالـ MAC';
+          return;
+        }
+        final ch = <String, String>{r.mac.name: macForField(c.mac, r.mac)};
+        if (r.comment != null) ch[r.comment!.name] = 'A2R';
+        var note = '';
+        if (r.mode != null) {
+          final cur = r.mode!.selectedText.toLowerCase();
+          if (cur.contains('allow')) {
+            status = 'الأكسس شغال بنظام «المسموح بس» — الإضافة هتسمح للجهاز مش تحظره. مش هعمل حاجة.';
+            return;
+          }
+          if (r.deny == null) {
+            status = 'مش لاقي اختيار «Deny» في الفورم';
+            return;
+          }
+          if (!cur.contains('deny')) note = '\nالتحكم بالـ MAC مقفول دلوقتي — هيتشغل بنظام «امنع اللي في القايمة» (القايمة فيها الجهاز ده بس).';
+          ch[r.mode!.name] = r.deny!.value;
+        }
+        if (await _apply('حظر', r.form, ch, submit: r.addBtn, summary: 'حظر ${c.name.isEmpty ? c.mac : c.name} من واي فاي الأكسس؟ (هيقدر يتوصل بالراوتر الأساسي عادي)$note')) {
+          await Future.delayed(const Duration(seconds: 2));
+          await _read();
+          status = findMacDelete(dev!.forms, c.mac) != null ? 'اتحظر ✓ (ظهر في قايمة الجهاز)' : 'اتبعت — بس مش لاقيه في قايمة الحظر بعد القراية';
+        }
+      });
+
+  Future<void> _unblock(TotoClient c) => _run('بفك الحظر…', () async {
+        final r = findMacDelete(dev!.forms, c.mac);
+        if (r == null) {
+          status = 'الجهاز ده مش في قايمة الحظر بتاعة الأكسس';
+          return;
+        }
+        if (await _apply('فك الحظر', r.form, {r.checkbox: 'ON'}, submit: r.delBtn, summary: 'فك حظر ${c.mac}؟')) {
+          await Future.delayed(const Duration(seconds: 2));
+          await _read();
+          status = findMacDelete(dev!.forms, c.mac) == null ? 'اتفك الحظر ✓' : 'اتبعت — بس لسه موجود في القايمة';
+        }
+      });
+
+  List<TotoClient> get _blockedList {
+    final d = dev;
+    if (d == null) return [];
+    final out = <TotoClient>[];
+    for (final e in d.pages.entries) {
+      final l = e.key.toLowerCase();
+      if (!(l.contains('ac') && l.contains('ctrl') || l.contains('filter'))) continue;
+      out.addAll(clientsFromRows(tableRows(e.value), e.key));
+    }
+    return out;
+  }
+
+  Widget _wrongSubnetCard() {
+    final ip = ipC.text.trim();
+    final p = net?.prefix ?? '192.168.7';
+    return Card(
+      color: const Color(0xFF2A2210),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('الأكسس بوينت على عنوان $ip والموبايل على شبكة $p — علشان التطبيق يوصله دايمًا: غيّر عنوانه لعنوان من شبكة البيت',
+              style: const TextStyle(fontWeight: FontWeight.w700, height: 1.6)),
+          const SizedBox(height: 8),
+          Text(
+            [
+              'الخطوات (من صفحة الأكسس نفسها، بإيدك — التطبيق مش بيغيّر عنوان الأكسس):',
+              '⚠ الأول افتح «Operation Mode»: الخطوات دي بس لو الوضع Repeater أو Bridge/AP. لو WISP أو Gateway متغيّرش عنوانه (النت هيقطع على الأجهزة اللي عليه) — كمّل ادخله بالعنوان اليدوي زي ما بتعمل.',
+              '1) وصّل الموبايل بالأكسس بعنوان يدوي زي ما بتعمل، وافتح $ip',
+              '2) Network ← LAN',
+              '3) IP Address: ${suggest.isNotEmpty ? suggest.first : '$p.250'}${suggest.length > 1 ? ' (أو ${suggest[1]})' : ''}',
+              '4) Subnet Mask: 255.255.255.0',
+              '5) Default Gateway: $p.1',
+              '6) DHCP Server: Disabled (الراوتر هو اللي يوزّع)',
+              '7) Save / Apply واستنى يعمل ريستارت',
+              '8) رجّع الموبايل على DHCP العادي، واكتب العنوان الجديد هنا أو دوس «دوّر في الشبكة»',
+            ].join('\n'),
+            style: const TextStyle(height: 1.7, fontSize: 13),
+          ),
+          if (dhcpInfo.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 6), child: Text(dhcpInfo, style: const TextStyle(fontSize: 12, color: kMuted))),
+          if (suggest.isNotEmpty)
+            Text('العناوين المقترحة اتجربت بـ ping ومحدش راد عليها دلوقتي', style: const TextStyle(fontSize: 12, color: kMuted)),
+        ]),
+      ),
+    );
+  }
+
+  Widget _clientTile(TotoClient c, {bool blocked = false}) {
+    final z = widget.hosts.where((h) => h.mac == c.mac).firstOrNull;
+    final name = z != null ? widget.labelOf(z) : (c.name.isNotEmpty ? c.name : '(اسم مش معروف)');
+    return ListTile(
+      leading: Icon(blocked ? Icons.block_rounded : Icons.devices_other_rounded, color: blocked ? kBad : kGold),
+      title: Text(name),
+      subtitle: Text([c.mac, if ((z?.ip ?? c.ip).isNotEmpty) z?.ip ?? c.ip, if (z != null) 'في قايمة الراوتر', if (c.extra.isNotEmpty) c.extra].join(' • '), style: const TextStyle(fontSize: 12)),
+      trailing: PopupMenuButton<String>(
+        onSelected: (v) => v == 'b' ? _block(c) : _unblock(c),
+        itemBuilder: (_) => [
+          if (!blocked) const PopupMenuItem(value: 'b', child: Text('احظره من الأكسس (تجريبي)')),
+          const PopupMenuItem(value: 'u', child: Text('فك الحظر (تجريبي)')),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ip = ipC.text.trim();
+    final wrongNet = reachable == false && (net?.prefix ?? '').isNotEmpty && prefixOf(ip) != net!.prefix;
+    final blocked = _blockedList;
+    return Scaffold(
+      appBar: AppBar(title: const Text('الأكسس بوينت (TOTOLINK)'), actions: [
+        IconButton(tooltip: 'افتح صفحة الجهاز', icon: const Icon(Icons.public_rounded), onPressed: () => _openWeb()),
+      ]),
+      body: ListView(padding: const EdgeInsets.all(12), children: [
+        Row(children: [
+          Expanded(
+            child: TextField(
+              controller: ipC,
+              keyboardType: TextInputType.number,
+              textDirection: TextDirection.ltr,
+              decoration: const InputDecoration(labelText: 'عنوان الأكسس'),
+              onSubmitted: (v) {
+                TotoStore.ip = v.trim();
+                _check();
+              },
+            ),
+          ),
+          const SizedBox(width: 8),
+          OutlinedButton(onPressed: busy ? null : _check, child: const Text('جرّب')),
+        ]),
+        const SizedBox(height: 8),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          FilledButton.icon(onPressed: busy || reachable != true ? null : _login, icon: const Icon(Icons.login_rounded), label: Text(dev == null ? 'ادخل' : 'ادخل تاني')),
+          OutlinedButton.icon(onPressed: busy ? null : _scan, icon: const Icon(Icons.radar_rounded), label: const Text('دوّر في الشبكة')),
+          if (dev != null) OutlinedButton.icon(onPressed: busy ? null : () => _run('بقرا…', _read), icon: const Icon(Icons.refresh_rounded), label: const Text('اقرا تاني')),
+          if (dev != null) OutlinedButton.icon(onPressed: _dumpForms, icon: const Icon(Icons.bug_report_rounded), label: const Text('شارك صفحات الجهاز')),
+          TextButton(
+            onPressed: () async {
+              await TotoStore.savePass(null);
+              if (mounted) toast(context, 'اتمسح الباسورد المحفوظ');
+            },
+            child: const Text('انسى الباسورد'),
+          ),
+        ]),
+        if (busy) const Padding(padding: EdgeInsets.symmetric(vertical: 8), child: LinearProgressIndicator()),
+        if (status.isNotEmpty) Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: Text(status, style: const TextStyle(height: 1.5))),
+        if (wrongNet) _wrongSubnetCard(),
+        if (dev != null) ...[
+          if (info.isNotEmpty) ...[
+            const SectionTitle('حالة الجهاز', icon: Icons.info_outline_rounded),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  for (final e in info.take(30))
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Text('${e.key}: ${e.value}', textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 13)),
+                    ),
+                ]),
+              ),
+            ),
+          ],
+          const SectionTitle('الأجهزة المتوصلة بالأكسس', icon: Icons.wifi_rounded),
+          if (clients.isEmpty) const Text('ملقتش جدول أجهزة في صفحات الجهاز (شارك صفحات الجهاز وابعتلي السجل)', style: TextStyle(color: kMuted)),
+          for (final c in clients) Card(child: _clientTile(c)),
+          if (blocked.isNotEmpty) ...[
+            const SectionTitle('محظورين من الأكسس', icon: Icons.block_rounded),
+            for (final c in blocked) Card(child: _clientTile(c, blocked: true)),
+          ],
+          const SectionTitle('تحكم (تجريبي)', icon: Icons.tune_rounded),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            OutlinedButton.icon(onPressed: busy ? null : _ssid, icon: const Icon(Icons.wifi_rounded), label: const Text('اسم الواي فاي')),
+            OutlinedButton.icon(onPressed: busy ? null : _key, icon: const Icon(Icons.key_rounded), label: const Text('باسورد الواي فاي')),
+            OutlinedButton.icon(onPressed: busy ? null : _reboot, icon: const Icon(Icons.restart_alt_rounded), label: const Text('ريستارت')),
+          ]),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text('التطبيق مش بيلمس: تحديث السوفت وير، حفظ/استرجاع/ضبط المصنع، وضع التشغيل، الاتصال بالراوتر (المكرر)، عنوان الأكسس، الـ DHCP، باسورد الدخول، WPS.',
+                style: TextStyle(fontSize: 12, color: kMuted, height: 1.5)),
+          ),
+        ],
+      ]),
+    );
   }
 }
