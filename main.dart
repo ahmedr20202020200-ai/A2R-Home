@@ -41,7 +41,7 @@ const Color kBg = Color(0xFF0E1015);
 const Color kSurface = Color(0xFF181B22);
 const Color kSurface2 = Color(0xFF20242D);
 const Color kLine = Color(0x1FFFFFFF);
-const Color kMuted = Color(0xFF9AA1AD);
+const Color kMuted = Color(0xFFBFC5D0);
 const Color kOk = Color(0xFF4CD08A);
 const Color kBad = Color(0xFFFF6B6B);
 
@@ -84,7 +84,7 @@ class A2RHome extends StatelessWidget {
         ),
         listTileTheme: const ListTileThemeData(iconColor: kGold, contentPadding: EdgeInsets.symmetric(horizontal: 14)),
         filledButtonTheme: FilledButtonThemeData(style: FilledButton.styleFrom(shape: round, padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12))),
-        outlinedButtonTheme: OutlinedButtonThemeData(style: OutlinedButton.styleFrom(shape: round, side: const BorderSide(color: kLine))),
+        outlinedButtonTheme: OutlinedButtonThemeData(style: OutlinedButton.styleFrom(shape: round, foregroundColor: const Color(0xFFF2D28C), side: BorderSide(color: kGold.withValues(alpha: 0.55), width: 1))),
         textButtonTheme: TextButtonThemeData(style: TextButton.styleFrom(shape: round)),
         chipTheme: ChipThemeData(
           backgroundColor: kSurface2,
@@ -130,6 +130,87 @@ class A2RHome extends StatelessWidget {
         progressIndicatorTheme: const ProgressIndicatorThemeData(color: kGold),
       ),
       home: const Shell(),
+    );
+  }
+}
+
+
+/// زرار مربع بأيقونة وتحتها اسمه (شبكة 4 في الصف)
+class _ActTile extends StatelessWidget {
+  final IconData icon;
+  final Widget label;
+  final VoidCallback? onTap;
+  const _ActTile({required this.icon, required this.label, this.onTap});
+  @override
+  Widget build(BuildContext context) {
+    final w = (MediaQuery.of(context).size.width - 24 - 24 - 24) / 4;
+    return SizedBox(
+      width: w,
+      child: Material(
+        color: kSurface2,
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Icon(icon, size: 24, color: kGold),
+              const SizedBox(height: 6),
+              DefaultTextStyle.merge(style: const TextStyle(fontSize: 12, height: 1.25), textAlign: TextAlign.center, maxLines: 2, overflow: TextOverflow.ellipsis, child: label),
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// حالة الاتصال الحالية (بتتحدث من كل تبويب) — بيعرضها الشريط اللي فوق
+class Live {
+  static bool router = false;
+  static bool pc = false;
+}
+
+class StatusStrip extends StatefulWidget {
+  const StatusStrip({super.key});
+  @override
+  State<StatusStrip> createState() => _StatusStripState();
+}
+
+class _StatusStripState extends State<StatusStrip> {
+  Timer? _t;
+  @override
+  void initState() {
+    super.initState();
+    _t = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _t?.cancel();
+    super.dispose();
+  }
+
+  Widget _dot(String name, bool on) => Row(mainAxisSize: MainAxisSize.min, children: [
+        Container(width: 10, height: 10, decoration: BoxDecoration(color: on ? kOk : kBad, shape: BoxShape.circle)),
+        const SizedBox(width: 6),
+        Text('$name ${on ? 'متصل' : 'مش متصل'}', style: const TextStyle(fontSize: 13)),
+      ]);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+      decoration: BoxDecoration(color: kSurface, borderRadius: BorderRadius.circular(14), border: Border.all(color: kLine)),
+      child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+        _dot('الراوتر', Live.router),
+        _dot('الريسيفر', GmClient.active?.connected ?? false),
+        _dot('الكمبيوتر', Live.pc),
+      ]),
     );
   }
 }
@@ -315,7 +396,10 @@ class _ShellState extends State<Shell> {
           const SizedBox(width: 4),
         ],
       ),
-      body: IndexedStack(index: tab, children: const [NetworkPage(), CastPage(), ReceiverPage(), PcPage()]),
+      body: Column(children: [
+        const StatusStrip(),
+        Expanded(child: IndexedStack(index: tab, children: const [NetworkPage(), CastPage(), ReceiverPage(), PcPage()])),
+      ]),
       bottomNavigationBar: NavigationBar(
         selectedIndex: tab,
         onDestinationSelected: (i) {
@@ -591,6 +675,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           blockedMacs = (await router!.blockList()).macs;
         } catch (_) {}
         unawaited(DeviceWatch.update({for (final s in list) s.mac.isNotEmpty ? s.mac : s.ip}));
+        unawaited(NewDevAlert.check(list));
         for (final s in list) {
           final key = s.ip.isEmpty ? s.mac : s.ip;
           final h = hosts.putIfAbsent(key, () => LanHost(key, source: 'router'));
@@ -763,37 +848,38 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
-        child: Wrap(spacing: 18, runSpacing: 6, children: [
-          _kv('الواي فاي', n?.ssid ?? '—'),
-          _kv('IP الموبايل', n?.ip ?? '—'),
-          _kv('البوابة', n?.gateway ?? '—'),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Wrap(spacing: 18, runSpacing: 6, children: [
+          _kv('الواي فاي', n?.ssid ?? 'مش متصل بواي فاي'),
+          _kv('IP الموبايل', n?.ip ?? 'مش متصل'),
+          _kv('البوابة', n?.gateway ?? 'مش متصل'),
           _kv('النسخة', appVersion),
-          ActionChip(avatar: const Icon(Icons.speed, size: 18), label: const Text('سرعة النت'), onPressed: _speed),
-          ActionChip(avatar: const Icon(Icons.network_ping, size: 18), label: const Text('Ping'), onPressed: () => _pingAsk()),
-          ActionChip(avatar: const Icon(Icons.power_settings_new, size: 18), label: const Text('تشغيل جهاز (WOL)'), onPressed: () => _wol(null)),
-          ActionChip(avatar: const Icon(Icons.qr_code_2_rounded, size: 18), label: const Text('QR الواي فاي'), onPressed: _qr),
-          ActionChip(avatar: const Icon(Icons.monitor_heart_rounded, size: 18), label: const Text('مراقبة الأجهزة'), onPressed: () async {
+          ]),
+          const SizedBox(height: 12),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+          _ActTile(icon: Icons.speed, label: const Text('سرعة النت'), onTap: _speed),
+          _ActTile(icon: Icons.network_ping, label: const Text('Ping'), onTap: () => _pingAsk()),
+          _ActTile(icon: Icons.power_settings_new, label: const Text('تشغيل جهاز (WOL)'), onTap: () => _wol(null)),
+          _ActTile(icon: Icons.qr_code_2_rounded, label: const Text('QR الواي فاي'), onTap: _qr),
+          _ActTile(icon: Icons.monitor_heart_rounded, label: const Text('مراقبة الأجهزة'), onTap: () async {
             await Navigator.push(context, MaterialPageRoute(builder: (_) => DeviceWatchPage(hosts: hosts.values.toList(), labelOf: label)));
             if (mounted) setState(() {});
           }),
-          ActionChip(avatar: const Icon(Icons.show_chart_rounded, size: 18), label: const Text('سجل الإشارة والسرعة'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SignalHistoryPage()))),
-          ActionChip(avatar: const Icon(Icons.settings_backup_restore_rounded, size: 18), label: const Text('نسخة احتياطية + قفل'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BackupPage()))),
-          ActionChip(avatar: const Icon(Icons.schedule_rounded, size: 18), label: const Text('مواعيد الحظر'), onPressed: () async {
+          _ActTile(icon: Icons.show_chart_rounded, label: const Text('سجل الإشارة والسرعة'), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SignalHistoryPage()))),
+          _ActTile(icon: Icons.settings_backup_restore_rounded, label: const Text('نسخة احتياطية + قفل'), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BackupPage()))),
+          _ActTile(icon: Icons.schedule_rounded, label: const Text('مواعيد الحظر'), onTap: () async {
             await Navigator.push(context, MaterialPageRoute(builder: (_) => SchedulePage(router: router, devices: [
                   for (final h in hosts.values)
                     if (h.mac.isNotEmpty) (mac: h.mac, name: label(h))
                 ])));
             if (mounted) setState(() {});
           }),
-          ActionChip(avatar: const Icon(Icons.data_usage_rounded, size: 18), label: const Text('باقة النت'), onPressed: () {
+          _ActTile(icon: Icons.data_usage_rounded, label: const Text('باقة النت'), onTap: () {
             final total = (int.tryParse('${st['monthly_tx_bytes'] ?? ''}') ?? 0) + (int.tryParse('${st['monthly_rx_bytes'] ?? ''}') ?? 0);
             Navigator.push(context, MaterialPageRoute(builder: (_) => QuotaPage(routerTotal: router == null ? null : total)));
           }),
-          ActionChip(avatar: const Icon(Icons.history_rounded, size: 18), label: const Text('سجل الأجهزة'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryPage()))),
-          ActionChip(
-            avatar: const Icon(Icons.business, size: 18),
-            label: Text(Oui.table.isEmpty ? 'نزّل أسماء الشركات' : 'شركات: ${Oui.table.length}'),
-            onPressed: () async {
+          _ActTile(icon: Icons.history_rounded, label: const Text('سجل الأجهزة'), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryPage()))),
+          _ActTile(icon: Icons.business, label: Text(Oui.table.isEmpty ? 'نزّل أسماء الشركات' : 'شركات: ${Oui.table.length}'), onTap: () async {
               toast(context, 'بنزّل القايمة (حوالي 6 ميجا)…');
               try {
                 final n = await Oui.download();
@@ -808,17 +894,19 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
             },
           ),
         ]),
+        ]),
       ),
     );
   }
 
   Widget _kv(String k, String v) => Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-        Text(k, style: const TextStyle(fontSize: 11, color: Colors.white54)),
+        Text(k, style: const TextStyle(fontSize: 11, color: kMuted)),
         Text(v, textDirection: TextDirection.ltr, style: const TextStyle(fontWeight: FontWeight.w600)),
       ]);
 
   Widget _routerCard() {
     final r = router;
+    Live.router = r != null;
     if (r == null) {
       return Card(
         child: ListTile(
@@ -1235,7 +1323,7 @@ class _SmsPageState extends State<SmsPage> {
                               Text(m.number, textDirection: TextDirection.ltr, style: TextStyle(fontWeight: m.unread ? FontWeight.bold : FontWeight.normal)),
                               const Spacer(),
                               Text(m.date == null ? '' : '${m.date!.day}/${m.date!.month} ${m.date!.hour}:${m.date!.minute.toString().padLeft(2, '0')}',
-                                  style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                                  style: const TextStyle(fontSize: 11, color: kMuted)),
                             ]),
                             subtitle: SelectableText(m.text),
                             trailing: IconButton(
@@ -1770,9 +1858,23 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
       return;
     }
     String? sub;
-    if (r.length == 1 && mimeOf(r.first.name).startsWith('video') && mounted && await confirm(context, 'تضيف ملف ترجمة (srt)؟')) {
-      final s = await FilePicker.pickFile(type: FileType.any);
-      final p = s == null ? null : await pickedToFile(s);
+    if (r.length == 1 && mimeOf(r.first.name).startsWith('video') && mounted) {
+      final how = await showDialog<int>(
+        context: context,
+        builder: (d) => SimpleDialog(title: const Text('ترجمة للفيديو؟'), children: [
+          SimpleDialogOption(onPressed: () => Navigator.pop(d, 1), child: const Text('اختار ملف srt من الموبايل')),
+          SimpleDialogOption(onPressed: () => Navigator.pop(d, 2), child: const Text('دوّر في OpenSubtitles')),
+          SimpleDialogOption(onPressed: () => Navigator.pop(d, 0), child: const Text('من غير ترجمة')),
+        ]),
+      );
+      File? p;
+      if (how == 1) {
+        final s = await FilePicker.pickFile(type: FileType.any);
+        p = s == null ? null : await pickedToFile(s);
+      } else if (how == 2 && mounted) {
+        final nm = r.first.name.replaceAll(RegExp(r'\.[A-Za-z0-9]{2,4}$'), '').replaceAll(RegExp(r'[._]+'), ' ');
+        p = await Navigator.push<File>(context, MaterialPageRoute(builder: (_) => SubSearchPage(initialQuery: nm)));
+      }
       if (p != null) sub = await MediaServer.I.share(p, ip);
     }
     if (mounted) toast(context, 'بجهّز الملفات…');
@@ -1994,7 +2096,7 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
         padding: const EdgeInsets.all(10),
         child: Column(children: [
           Text(cs.queue[cs.playing].title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
-          Text('${cs.way == CastWay.gm ? 'G-MScreen' : 'DLNA'} • ${castStateAr(cs.state)}', style: const TextStyle(fontSize: 11, color: Colors.white54)),
+          Text('${cs.way == CastWay.gm ? 'G-MScreen' : 'DLNA'} • ${castStateAr(cs.state)}', style: const TextStyle(fontSize: 11, color: kMuted)),
           if (cs.resumedFrom != null)
             TextButton.icon(onPressed: () => _run(cs.fromStart), icon: const Icon(Icons.restart_alt_rounded, size: 18), label: Text('كمّلت من ${fmtHms(Duration(seconds: cs.resumedFrom!))} — من الأول')),
           Row(children: [
@@ -8245,6 +8347,205 @@ class _SlideshowPageState extends State<SlideshowPage> {
 
 const int kPcHttpPort = 47800, kPcUdpPort = 47801;
 
+// ---------------- OpenSubtitles (بحث وتنزيل ترجمات جوه التطبيق) ----------------
+/// المفتاح واليوزر والباسورد بتكتبهم انت في التطبيق ومتخزنين في تخزين آمن على موبايلك بس. مفيش حاجة منهم في الكود.
+class OsClient {
+  static const _sec = FlutterSecureStorage();
+  static const _ua = 'A2R Home v1.0';
+  String? _token;
+  String _base = 'https://api.opensubtitles.com/api/v1';
+
+  static Future<String> apiKey() async => (await _sec.read(key: 'os_key')) ?? '';
+  static Future<String> user() async => (await _sec.read(key: 'os_user')) ?? '';
+  static Future<void> save(String key, String user, String pass) async {
+    Future<void> w(String k, String v) => v.trim().isEmpty ? _sec.delete(key: k) : _sec.write(key: k, value: v.trim());
+    await w('os_key', key);
+    await w('os_user', user);
+    await w('os_pass', pass);
+  }
+
+  Future<Map<String, String>> _h({bool auth = false}) async => {
+        'Api-Key': await apiKey(),
+        'User-Agent': _ua,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        if (auth && _token != null) 'Authorization': 'Bearer $_token',
+      };
+
+  /// تسجيل الدخول اختياري: من غيره التنزيل محدود (حوالي 5 في اليوم على نفس الشبكة)
+  Future<void> _login() async {
+    if (_token != null) return;
+    final u = await _sec.read(key: 'os_user'), p = await _sec.read(key: 'os_pass');
+    if (u == null || u.isEmpty || p == null || p.isEmpty) return;
+    final r = await http.post(Uri.parse('$_base/login'), headers: await _h(), body: jsonEncode({'username': u, 'password': p})).timeout(const Duration(seconds: 15));
+    if (r.statusCode != 200) throw StateError('تسجيل الدخول في OpenSubtitles فشل (${r.statusCode}) — راجع اليوزر والباسورد');
+    final m = jsonDecode(r.body) as Map;
+    _token = '${m['token']}';
+    final b = '${m['base_url'] ?? ''}';
+    if (b.isNotEmpty) _base = 'https://$b/api/v1';
+  }
+
+  Future<List<OsSub>> search(String q, List<String> langs) async {
+    if ((await apiKey()).isEmpty) throw StateError('اكتب مفتاح OpenSubtitles الأول');
+    final uri = Uri.parse('$_base/subtitles').replace(queryParameters: {'query': q, 'languages': langs.join(','), 'order_by': 'download_count', 'order_direction': 'desc'});
+    final r = await http.get(uri, headers: await _h()).timeout(const Duration(seconds: 20));
+    if (r.statusCode == 401 || r.statusCode == 403) throw StateError('المفتاح مرفوض — راجع مفتاح OpenSubtitles');
+    if (r.statusCode != 200) throw StateError('OpenSubtitles رد بـ ${r.statusCode}');
+    final out = <OsSub>[];
+    for (final e in (jsonDecode(r.body)['data'] as List? ?? const [])) {
+      final a = (e as Map)['attributes'] as Map? ?? {};
+      final files = a['files'] as List? ?? const [];
+      if (files.isEmpty) continue;
+      final f = files.first as Map;
+      out.add(OsSub(
+          fileId: (f['file_id'] as num).toInt(),
+          name: '${a['release'] ?? f['file_name'] ?? ''}',
+          lang: '${a['language'] ?? ''}',
+          downloads: (a['download_count'] as num?)?.toInt() ?? 0));
+    }
+    return out;
+  }
+
+  /// بينزّل الترجمة ويحفظها srt في فولدر مؤقت
+  Future<File> download(OsSub s) async {
+    await _login();
+    final r = await http
+        .post(Uri.parse('$_base/download'), headers: await _h(auth: true), body: jsonEncode({'file_id': s.fileId, 'sub_format': 'srt'}))
+        .timeout(const Duration(seconds: 20));
+    final m = r.body.isEmpty ? {} : jsonDecode(r.body) as Map;
+    if (r.statusCode == 406) throw StateError('خلص حد التنزيل النهارده — سجّل يوزر وباسورد OpenSubtitles في الإعدادات أو جرب بكرة');
+    if (r.statusCode != 200 || m['link'] == null) throw StateError('التنزيل فشل (${r.statusCode}) ${m['message'] ?? ''}');
+    final f = await http.get(Uri.parse('${m['link']}'), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 30));
+    if (f.statusCode != 200 || f.bodyBytes.isEmpty) throw StateError('ملف الترجمة مجاش');
+    final dir = Directory('${(await getTemporaryDirectory()).path}/subs');
+    await dir.create(recursive: true);
+    final file = File('${dir.path}/os_${s.fileId}.srt');
+    await file.writeAsBytes(f.bodyBytes);
+    return file;
+  }
+}
+
+class OsSub {
+  final int fileId;
+  final String name, lang;
+  final int downloads;
+  const OsSub({required this.fileId, required this.name, required this.lang, required this.downloads});
+}
+
+Future<void> osSettingsDialog(BuildContext context) async {
+  final k = TextEditingController(text: await OsClient.apiKey());
+  final u = TextEditingController(text: await OsClient.user());
+  final p = TextEditingController();
+  if (!context.mounted) return;
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (d) => AlertDialog(
+      title: const Text('إعدادات OpenSubtitles'),
+      content: SingleChildScrollView(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('المفتاح (API key) مجاني: سجّل حساب على opensubtitles.com ← Consumers ← New. اليوزر والباسورد اختياريين وبيزودوا حد التنزيل اليومي. كله بيتخزن على موبايلك بس.', style: TextStyle(fontSize: 12, color: kMuted, height: 1.5)),
+          const SizedBox(height: 10),
+          TextField(controller: k, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'مفتاح API')),
+          const SizedBox(height: 8),
+          TextField(controller: u, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'اليوزر (اختياري)')),
+          const SizedBox(height: 8),
+          TextField(controller: p, obscureText: true, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'الباسورد (اختياري، سيبه فاضي لو مش عايز تغيّره)')),
+        ]),
+      ),
+      actions: [TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('إلغاء')), FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('حفظ'))],
+    ),
+  );
+  if (ok != true) return;
+  final oldPass = p.text.isEmpty ? (await const FlutterSecureStorage().read(key: 'os_pass')) ?? '' : p.text;
+  await OsClient.save(k.text, u.text, u.text.trim().isEmpty ? '' : oldPass);
+}
+
+/// شاشة البحث: بترجع ملف srt اللي اتنزل (أو null)
+class SubSearchPage extends StatefulWidget {
+  final String initialQuery;
+  const SubSearchPage({super.key, this.initialQuery = ''});
+  @override
+  State<SubSearchPage> createState() => _SubSearchPageState();
+}
+
+class _SubSearchPageState extends State<SubSearchPage> {
+  late final TextEditingController qc = TextEditingController(text: widget.initialQuery);
+  final os = OsClient();
+  List<OsSub> res = [];
+  bool busy = false;
+  String msg = '';
+  int lang = 0; // 0 عربي، 1 إنجليزي، 2 الاتنين
+
+  Future<void> _search() async {
+    if (qc.text.trim().isEmpty) return;
+    setState(() {
+      busy = true;
+      msg = '';
+    });
+    try {
+      res = await os.search(qc.text.trim(), const [['ar'], ['en'], ['ar', 'en']][lang]);
+      if (res.isEmpty) msg = 'مفيش نتايج — جرب اسم الفيلم بالإنجليزي';
+    } catch (e) {
+      msg = '$e'.replaceFirst('Bad state: ', '');
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  Future<void> _pick(OsSub s) async {
+    setState(() {
+      busy = true;
+      msg = '';
+    });
+    try {
+      final f = await os.download(s);
+      if (mounted) Navigator.pop(context, f);
+      return;
+    } catch (e) {
+      msg = '$e'.replaceFirst('Bad state: ', '');
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('ترجمة من OpenSubtitles'), actions: [IconButton(icon: const Icon(Icons.key_rounded), tooltip: 'الإعدادات', onPressed: () => osSettingsDialog(context))]),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: TextField(
+            controller: qc,
+            textInputAction: TextInputAction.search,
+            onSubmitted: (_) => _search(),
+            decoration: InputDecoration(hintText: 'اسم الفيلم أو المسلسل', suffixIcon: IconButton(icon: const Icon(Icons.search), onPressed: busy ? null : _search)),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: SegmentedButton<int>(
+            segments: const [ButtonSegment(value: 0, label: Text('عربي')), ButtonSegment(value: 1, label: Text('إنجليزي')), ButtonSegment(value: 2, label: Text('الاتنين'))],
+            selected: {lang},
+            onSelectionChanged: (v) => setState(() => lang = v.first),
+          ),
+        ),
+        if (busy) const Padding(padding: EdgeInsets.only(top: 8), child: LinearProgressIndicator()),
+        if (msg.isNotEmpty) Padding(padding: const EdgeInsets.all(12), child: Text(msg, style: const TextStyle(color: kBad))),
+        Expanded(
+          child: ListView.builder(
+            itemCount: res.length,
+            itemBuilder: (c, i) => ListTile(
+              title: Text(res[i].name, maxLines: 2, overflow: TextOverflow.ellipsis, textDirection: TextDirection.ltr, textAlign: TextAlign.start),
+              subtitle: Text('${res[i].lang} • ${res[i].downloads} تنزيل', style: const TextStyle(fontSize: 12, color: kMuted)),
+              trailing: const Icon(Icons.download_rounded, color: kGold),
+              onTap: busy ? null : () => _pick(res[i]),
+            ),
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
 class PcInfo {
   final String host, name;
   final int port;
@@ -8319,6 +8620,12 @@ class PcClient {
   Future<Map<String, dynamic>> info() => _json('GET', '/info');
   Future<void> input(List<Map<String, dynamic>> cmds) => _json('POST', '/input', json: cmds);
   Future<void> power(String a) => _json('POST', '/power', json: {'a': a, 'confirm': true});
+  Future<List<Map<String, dynamic>>> procs() async {
+    final m = await _json('GET', '/procs');
+    return [for (final e in (m['procs'] as List? ?? const [])) Map<String, dynamic>.from(e as Map)];
+  }
+
+  Future<void> killProc(int pid) => _json('POST', '/kill', json: {'pid': pid, 'confirm': true});
   Future<Map<String, dynamic>> files([String? path]) => _json('GET', '/files', q: path == null ? null : {'path': path});
 
   Future<Uint8List?> frame({int width = 1280, int quality = 60}) async {
@@ -8416,6 +8723,10 @@ String pcErrAr(String e) {
   if (e.startsWith('locked')) return 'محاولات غلط كتير — استنى دقيقة (الكود هيتغير)';
   if (e == 'not_lan') return 'لازم تكون على نفس الشبكة';
   if (e == 'outside_home') return 'الفولدر ده برة ملفات المستخدم';
+  if (e == 'no_route') return 'نسخة A2R-PC.exe قديمة — نزّل الأحدث من Releases';
+  if (e == 'protected') return 'دي عملية نظام ومحمية';
+  if (e == 'no_such_pid') return 'العملية دي اتقفلت قبل كده';
+  if (e == 'kill_failed') return 'ويندوز رفض يقفلها';
   return e;
 }
 
@@ -8548,6 +8859,7 @@ class _PcPageState extends State<PcPage> with AutomaticKeepAliveClientMixin {
   @override
   Widget build(BuildContext context) {
     super.build(context);
+    Live.pc = pc != null;
     if (pc == null) return _pairView();
     return Column(children: [
       Card(
@@ -10908,6 +11220,38 @@ List<(String, bool)> watchChanges(Map<String, dynamic> watched, Set<String> pres
   return out;
 }
 
+/// تنبيه لما جهاز جديد (عمره ما ظهر قبل كده) يدخل الشبكة
+class NewDevAlert {
+  static bool get enabled => Store.p.getBool('newdev_on') ?? false;
+  static Set<String> get known => (Store.p.getStringList('newdev_known') ?? []).toSet();
+
+  static Future<void> setEnabled(bool v) async {
+    await Store.p.setBool('newdev_on', v);
+    if (!v) await Store.p.remove('newdev_known');
+    await NetWatch.rearm();
+  }
+
+  /// أول مرة بيحفظ اللي موجود من غير إشعار. بعد كده أي MAC جديد = إشعار. بيرجّع الجدد (للاختبار)
+  static Future<List<RouterStation>> check(List<RouterStation> list) async {
+    if (!enabled) return const [];
+    final seen = known;
+    final first = !(Store.p.containsKey('newdev_known'));
+    final fresh = <RouterStation>[];
+    for (final s in list) {
+      final k = s.mac.isNotEmpty ? s.mac.toUpperCase() : s.ip;
+      if (k.isEmpty) continue;
+      if (seen.add(k) && !first) fresh.add(s);
+    }
+    await Store.p.setStringList('newdev_known', seen.toList());
+    for (final s in fresh) {
+      final n = s.hostname.isNotEmpty ? s.hostname : (Oui.vendorOf(s.mac).isNotEmpty ? Oui.vendorOf(s.mac) : 'جهاز مجهول');
+      Native.notify('جهاز جديد دخل الشبكة', '$n • ${s.ip} • ${s.mac}');
+      AppLog.add('NEWDEV', '$n ${s.ip} ${s.mac}');
+    }
+    return fresh;
+  }
+}
+
 class NetWatch {
   static bool get enabled => Store.p.getBool('netwatch_on') ?? false;
   static Future<void> setEnabled(bool v) async {
@@ -10916,7 +11260,7 @@ class NetWatch {
   }
 
   static Future<String> rearm() async {
-    if (!enabled && DeviceWatch.all.isEmpty) {
+    if (!enabled && DeviceWatch.all.isEmpty && !NewDevAlert.enabled) {
       await Native4.cancelAlarm(1003);
       return 'off';
     }
@@ -10930,9 +11274,10 @@ class NetWatch {
     try {
       final st = await r.status();
       await NetLog.sample(st, source: 'bg');
-      if (DeviceWatch.all.isNotEmpty) {
+      if (DeviceWatch.all.isNotEmpty || NewDevAlert.enabled) {
         final list = await r.stations();
         await DeviceWatch.update({for (final s in list) s.mac.isNotEmpty ? s.mac : s.ip});
+        await NewDevAlert.check(list);
       }
       return 'RSRP ${st['lte_rsrp']} ${st['ppp_status']}';
     } finally {
@@ -10988,6 +11333,16 @@ class _DeviceWatchPageState extends State<DeviceWatchPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('مراقبة الأجهزة')),
       body: ListView(padding: const EdgeInsets.all(12), children: [
+        SwitchListTile(
+          value: NewDevAlert.enabled,
+          title: const Text('نبّهني لو جهاز جديد دخل الشبكة'),
+          subtitle: const Text('أي جهاز عمره ما ظهر في الراوتر قبل كده. أول مرة بيحفظ الأجهزة الحالية من غير إشعار. محتاج دخول الراوتر.', style: TextStyle(fontSize: 12, color: kMuted)),
+          onChanged: (v) async {
+            await NewDevAlert.setEnabled(v);
+            if (v) await Native.askNotifyPermission();
+            if (mounted) setState(() {});
+          },
+        ),
         const Text('إشعار لما جهاز يدخل أو يخرج من الشبكة (حسب قايمة الراوتر — بيتأخر دقايق لحد ما الراوتر يحس إن الجهاز خرج). في الخلفية بيتشيّك كل ربع ساعة تقريبًا.',
             style: TextStyle(color: kMuted, fontSize: 12, height: 1.5)),
         if (w.isEmpty) const EmptyState(icon: Icons.visibility_rounded, title: 'مفيش أجهزة متراقبة — اختار من تحت أو من قايمة الجهاز'),
@@ -11683,10 +12038,89 @@ class PcExtras extends StatelessWidget {
           label: const Text('عرض تقديمي'),
           onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PcPresentPage(pc: pc, onErr: onErr))),
         ),
+        OutlinedButton.icon(icon: const Icon(Icons.list_alt_rounded), label: const Text('العمليات'), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => PcProcsPage(pc: pc)))),
         OutlinedButton.icon(icon: const Icon(Icons.memory_rounded), label: const Text('معلومات الكمبيوتر'), onPressed: () => _run(context, () => _info(context))),
         OutlinedButton.icon(icon: const Icon(Icons.timer_rounded), label: const Text('مؤقت إطفاء'), onPressed: () => _run(context, () => _timer(context))),
       ]),
     ]);
+  }
+}
+
+class PcProcsPage extends StatefulWidget {
+  final PcClient pc;
+  const PcProcsPage({super.key, required this.pc});
+  @override
+  State<PcProcsPage> createState() => _PcProcsPageState();
+}
+
+class _PcProcsPageState extends State<PcProcsPage> {
+  List<Map<String, dynamic>> list = [];
+  bool busy = true;
+  String err = '';
+  String q = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      busy = true;
+      err = '';
+    });
+    try {
+      list = await widget.pc.procs();
+    } catch (e) {
+      err = '$e'.replaceFirst('Bad state: ', '');
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  Future<void> _kill(Map<String, dynamic> p) async {
+    if (!await confirm(context, 'تقفل ${p['name']} (رقم ${p['pid']})؟\nأي شغل مش محفوظ فيه هيضيع.')) return;
+    try {
+      await widget.pc.killProc((p['pid'] as num).toInt());
+      if (mounted) toast(context, 'اتقفلت ✓');
+      await _load();
+    } catch (e) {
+      if (mounted) toast(context, '$e'.replaceFirst('Bad state: ', ''));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final shown = [
+      for (final p in list)
+        if (q.isEmpty || '${p['name']}'.toLowerCase().contains(q.toLowerCase())) p
+    ];
+    return Scaffold(
+      appBar: AppBar(title: const Text('العمليات على الكمبيوتر'), actions: [IconButton(icon: const Icon(Icons.refresh_rounded), onPressed: busy ? null : _load)]),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: TextField(decoration: const InputDecoration(hintText: 'دوّر باسم البرنامج', prefixIcon: Icon(Icons.search)), onChanged: (v) => setState(() => q = v)),
+        ),
+        if (busy) const LinearProgressIndicator(),
+        if (err.isNotEmpty) Padding(padding: const EdgeInsets.all(12), child: Text(err, style: const TextStyle(color: kBad))),
+        Expanded(
+          child: ListView.builder(
+            itemCount: shown.length,
+            itemBuilder: (c, i) {
+              final p = shown[i];
+              final prot = p['protected'] == true;
+              return ListTile(
+                leading: Icon(prot ? Icons.lock_outline_rounded : Icons.apps_rounded, color: prot ? kMuted : kGold),
+                title: Text('${p['name']}', textDirection: TextDirection.ltr, textAlign: TextAlign.start),
+                subtitle: Text('${p['mem_mb']} ميجا • رقم ${p['pid']}', style: const TextStyle(fontSize: 12, color: kMuted)),
+                trailing: prot ? null : IconButton(icon: const Icon(Icons.close_rounded, color: kBad), tooltip: 'اقفل', onPressed: () => _kill(p)),
+              );
+            },
+          ),
+        ),
+      ]),
+    );
   }
 }
 
