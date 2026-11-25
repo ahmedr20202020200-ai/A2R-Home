@@ -21,6 +21,7 @@ import 'package:qr/qr.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:xml/xml.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yte;
@@ -3094,10 +3095,34 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   Future<void> key(int k) async {
     try {
       if (gm == null) throw StateError('مش متصل بالريسيفر');
+      if (k == K.recall) return await _recall();
       await gm!.key(k);
     } catch (e) {
       if (mounted) toast(context, '$e');
     }
+  }
+
+  /// Recall: بنبعت زرار الريسيفر نفسه (29 زي G-MScreen)، ولو القناة متغيرتش في ثانية ونص
+  /// بنرجع إحنا للقناة اللي قبلها من سجل التطبيق (أمر تغيير القناة 1000 اللي شغال عندك)
+  Future<void> _recall() async {
+    final before = await gm!.playingId() ?? playingId;
+    await gm!.key(K.recall);
+    await Future.delayed(const Duration(milliseconds: 1500));
+    final after = await gm?.playingId();
+    if (after != null && after != before) {
+      AppLog.add('STB', 'RECALL: الريسيفر غيّر القناة لوحده ($before → $after)');
+      await _refreshPlaying();
+      return;
+    }
+    final prev = recallTarget(StbPrefs.recent, before);
+    if (prev == null) {
+      AppLog.add('STB', 'RECALL: القناة متغيرتش ومفيش قناة قبلها في سجل التطبيق');
+      if (mounted) toast(context, 'مفيش قناة قبلها لسه — غيّر قناة الأول من التطبيق أو الريموت');
+      return;
+    }
+    AppLog.add('STB', 'RECALL: الريسيفر مرجّعش — هرجع للقناة اللي قبلها من سجل التطبيق (${prev.radio ? 1 : 0}:${prev.id} ${prev.name})');
+    final ch = channels.where((c) => c.id == prev.id && c.radio == prev.radio).firstOrNull ?? StbChannel(prev.id, prev.name, prev.radio, 0, const {});
+    await _zapTo(ch);
   }
 
   Future<void> manual() async {
@@ -3505,6 +3530,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                 label: const Text('شغّلها على التلفزيون'),
               ),
               OutlinedButton.icon(onPressed: () => watch(ch), icon: const Icon(Icons.phone_android_rounded), label: const Text('على الموبايل')),
+              OutlinedButton.icon(onPressed: () => watchExternal(ch), icon: const Icon(Icons.open_in_new_rounded), label: const Text('مشغل خارجي')),
               OutlinedButton.icon(
                 onPressed: () {
                   Navigator.pop(c);
@@ -3680,14 +3706,29 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     }
   }
 
+  /// اتفرج على الموبايل: جوه التطبيق (مشغل خارجي بقى اختيار احتياطي من ⋮ جوه المشغل)
   Future<void> watch(StbChannel ch) async {
+    if (gm == null) {
+      toast(context, 'مش متصل بالريسيفر');
+      return;
+    }
+    final list = channels.where((c) => c.radio == ch.radio).toList();
+    var i = list.indexWhere((c) => c.id == ch.id);
+    if (i < 0) {
+      list.insert(0, ch);
+      i = 0;
+    }
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => StbPlayerPage(gm: gm!, list: list, index: i)));
+  }
+
+  /// المشغل الخارجي القديم (VLC وغيره)
+  Future<void> watchExternal(StbChannel ch) async {
     try {
       final u = await gm!.streamUrl(ch);
       if (u == null) {
-        if (mounted) toast(context, 'الريسيفر مرجّعش رابط بث (ممكن مش بيدعم SAT>IP) — شوف السجل');
+        if (mounted) toast(context, 'الريسيفر مرجّعش رابط بث — شوف السجل');
         return;
       }
-      AppLog.add('STB', 'stream url $u');
       final ok = await Native.openVideo(u);
       if (!ok && mounted) {
         await Clipboard.setData(ClipboardData(text: u));
@@ -3940,6 +3981,11 @@ class RemoteControl extends StatelessWidget {
                 _k('P−', K.pageUp, size: 44),
                 _k('P+', K.pageDown, size: 44),
                 _k('', K.sleep, icon: Icons.bedtime_outlined, size: 44),
+              ]),
+              _row([
+                _k('TIMER', K.timer, size: 44),
+                _k('', K.prev, icon: Icons.skip_previous_rounded, size: 44),
+                _k('', K.next, icon: Icons.skip_next_rounded, size: 44),
               ]),
               _row([
                 _k('Res', K.resolution, size: 44),
@@ -7348,11 +7394,36 @@ class K {
   static const up = 1, down = 2, left = 3, right = 4, ok = 5, menu = 6, exit = 7;
   static const red = 8, green = 9, yellow = 10, blue = 11;
   static int digit(int n) => 12 + n;
-  static const tvRadio = 22, mute = 23, resolution = 24, sleep = 26, recall = 29, sat = 30,
+  // المصدر: G-MScreen 1.0.22176 (GsRemoteControlFragment — الجدول العادي لكل الأجهزة غير platform 30،
+  // والريسيفر بتاعك platform 101) + أوامر الصوت فيه (util/y) + ha-viark (متجرب على جهاز حقيقي).
+  static const tvRadio = 22, mute = 23, resolution = 24, timer = 26, recall = 29, sat = 30,
       subtitle = 31, epg = 32, fav = 33, teletext = 34, volUp = 35, volDown = 36,
-      pageUp = 37, pageDown = 38, find = 39, power = 42, usb = 43, f1 = 44, f2 = 45,
+      pageUp = 37, pageDown = 38, find = 39, sleep = 41, power = 42, usb = 43, f1 = 44, f2 = 45,
       audio = 54, pauseLive = 55, info = 57, record = 58, rew = 59, ff = 60, play = 61,
-      stop = 62, pause = 63, prev = 64, next = 65, chUp = 69, chDown = 70;
+      stop = 62, pause = 63, prev = 64, next = 65, chUp = 69, chDown = 70, home = 82;
+
+  /// اسم كل زرار (للسجل)
+  static String name(int k) {
+    if (k >= 12 && k <= 21) return 'رقم ${k - 12}';
+    return const {
+          1: 'UP', 2: 'DOWN', 3: 'LEFT', 4: 'RIGHT', 5: 'OK', 6: 'MENU', 7: 'EXIT', 8: 'RED', 9: 'GREEN', 10: 'YELLOW', 11: 'BLUE',
+          22: 'TV/R', 23: 'MUTE', 24: 'RES', 26: 'TIMER', 29: 'RECALL', 30: 'SAT', 31: 'SUBTITLE', 32: 'EPG', 33: 'FAV', 34: 'TXT',
+          35: 'VOL+', 36: 'VOL-', 37: 'PAGE UP', 38: 'PAGE DOWN', 39: 'FIND', 41: 'SLEEP', 42: 'POWER', 43: 'USB', 44: 'F1', 45: 'F2',
+          54: 'AUDIO', 55: 'PAUSE LIVE', 57: 'INFO', 58: 'REC', 59: 'REW', 60: 'FF', 61: 'PLAY', 62: 'STOP', 63: 'PAUSE',
+          64: 'PREV', 65: 'NEXT', 69: 'CH+', 70: 'CH-', 82: 'HOME',
+        }[k] ??
+        '?';
+  }
+
+  /// مصدر كل كود: gm = زرار في ريموت G-MScreen نفسه، gmVoice = في أوامر الصوت بتاعته بس، viark = متجرب على جهاز حقيقي من نفس العيلة
+  static const Map<int, String> source = {
+    1: 'gm', 2: 'gm', 3: 'gm', 4: 'gm', 5: 'gm', 6: 'gm', 7: 'gm', 8: 'gm', 9: 'gm', 10: 'gm', 11: 'gm',
+    12: 'gm', 13: 'gm', 14: 'gm', 15: 'gm', 16: 'gm', 17: 'gm', 18: 'gm', 19: 'gm', 20: 'gm', 21: 'gm',
+    22: 'gm', 23: 'gm', 24: 'viark', 26: 'viark', 29: 'gm', 30: 'gmVoice', 31: 'gm', 32: 'gm', 33: 'gmVoice', 34: 'gm',
+    35: 'gm', 36: 'gm', 37: 'gm', 38: 'gm', 39: 'gmVoice', 41: 'gmVoice', 42: 'gm', 43: 'gm', 44: 'viark', 45: 'viark',
+    54: 'gmVoice', 55: 'gmVoice', 57: 'gmVoice', 58: 'gm', 59: 'gm', 60: 'gm', 61: 'gm', 62: 'gm', 63: 'gm', 64: 'gm', 65: 'gm',
+    69: 'viark', 70: 'viark', 82: 'gm',
+  };
 }
 
 class GmClient extends ChangeNotifier {
@@ -7522,11 +7593,14 @@ class GmClient extends ChangeNotifier {
     }
   }
 
-  Future<void> key(int code) => send(1040, {
+  Future<void> key(int code) {
+    AppLog.add('STB', 'KEY ${K.name(code)} = $code (${K.source[code] ?? 'مش معروف'})');
+    return send(1040, {
         'array': [
           {'KeyValue': '$code'}
         ]
       }, reply: false);
+  }
 
   Future<void> zap(StbChannel c) => send(1000, {
         'array': [
@@ -7536,21 +7610,17 @@ class GmClient extends ChangeNotifier {
 
   Future<void> power() => send(1041, {}, reply: false);
 
-  /// رابط البث للموبايل (مش بيغير القناة على التلفزيون)
+  /// رابط البث للموبايل (مش بيغير القناة على التلفزيون) — طلب 1009 زي G-MScreen (LivePlayActivity.J0/h0)
   Future<String?> streamUrl(StbChannel c) async {
     final r = await send(1009, {
       'array': [
         {'TvState': c.radio ? '1' : '0', 'ProgramId': c.id}
       ]
     });
-    if (r is String) return RegExp(r'(rtsp|http)s?://\S+').firstMatch(r)?.group(0);
-    final m = first(r);
-    for (final v in m.values) {
-      final s = '$v';
-      if (s.startsWith('rtsp://') || s.startsWith('http')) return s;
-    }
-    final any = RegExp(r'(rtsp|http)s?://[^"\s<]+').firstMatch(jsonEncode(r));
-    return any?.group(0);
+    AppLog.add('STB', '1009 reply ${jsonEncode(r).length > 600 ? jsonEncode(r).substring(0, 600) : jsonEncode(r)}');
+    final res = gmStreamFromReply(r, host);
+    if (res.err != null) throw StateError(res.err!);
+    return res.url;
   }
 
   Future<void> stopStream() => send(1012, {}, reply: false);
@@ -13726,6 +13796,46 @@ class StbGroup {
 
 String stbKey(StbChannel c) => '${c.radio ? 1 : 0}:${c.id}';
 
+/// رد طلب 1009 → رابط البث. زي G-MScreen: {success:1, url:...} أو {success:≠1, errormsg:...}،
+/// ولو الرابط فيه IP غير الريسيفر (0.0.0.0 أو عنوان داخلي) بنحط IP الريسيفر مكانه
+({String? url, String? err}) gmStreamFromReply(dynamic r, String host) {
+  Map m = const {};
+  if (r is List && r.isNotEmpty && r.first is Map) m = r.first as Map;
+  if (r is Map) m = r;
+  String? url;
+  if (m['url'] != null && '${m['url']}'.trim().isNotEmpty) url = '${m['url']}'.trim();
+  final succ = int.tryParse('${m['success'] ?? ''}');
+  if (url == null) {
+    for (final v in m.values) {
+      final t = '$v';
+      if (t.startsWith('rtsp://') || t.startsWith('http')) {
+        url = t;
+        break;
+      }
+    }
+  }
+  url ??= RegExp(r'(rtsp|https?)://[^"\s<]+').firstMatch(r is String ? r : jsonEncode(r))?.group(0);
+  if (succ != null && succ != 1 && url == null) {
+    final em = '${m['errormsg'] ?? ''}'.trim();
+    return (url: null, err: em.isEmpty ? 'الريسيفر رفض يدي رابط البث (كود $succ)' : 'الريسيفر قال: $em');
+  }
+  if (url == null) return (url: null, err: null);
+  return (url: fixStbStreamUrl(url, host), err: null);
+}
+
+String fixStbStreamUrl(String url, String host) {
+  if (url.startsWith('file://') || host.isEmpty || url.contains(host)) return url;
+  return url.replaceFirst(RegExp(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'), host);
+}
+
+/// القناة اللي هنرجعلها في Recall: أول قناة في سجل التطبيق غير اللي شغالة دلوقتي
+({String id, String name, bool radio})? recallTarget(List<({String id, String name, bool radio})> recent, String? current) {
+  for (final e in recent) {
+    if (e.id != current) return e;
+  }
+  return null;
+}
+
 /// بيقرا ملف المجموعات (تصدير A2R Home أو قايمة بسيطة) — بيرجع null لو الملف مش مفهوم
 List<StbGroup>? parseStbGroups(String text) {
   try {
@@ -15592,6 +15702,349 @@ class _TotoPageState extends State<TotoPage> {
           ),
         ],
       ]),
+    );
+  }
+}
+
+// ---------------- مشغل القنوات جوه التطبيق ----------------
+/// رسالة خطأ المشغل بالعربي
+String stbPlayerError(String raw) {
+  final r = raw.toLowerCase();
+  if (r.contains('timeout') || r.contains('مهلة')) return 'الريسيفر مبعتش صورة في الوقت — جرّب تاني أو قرّب من الراوتر';
+  if (r.contains('decoder') || r.contains('codec') || r.contains('format_unsupported') || r.contains('unrecognizedinputformat')) {
+    return 'الموبايل مش بيعرف يشغّل نوع الصورة/الصوت بتاع القناة دي — جرّب «مشغل خارجي» من ⋮ (VLC بيشغّلها)';
+  }
+  if (r.contains('connection') || r.contains('refused') || r.contains('unable to connect') || r.contains('http')) {
+    return 'مقدرتش أوصل لبث الريسيفر — اتأكد إنك على نفس الواي فاي';
+  }
+  return 'القناة مشتغلتش — جرّب تاني أو «مشغل خارجي» من ⋮';
+}
+
+class StbPlayerPage extends StatefulWidget {
+  final GmClient gm;
+  final List<StbChannel> list;
+  final int index;
+  const StbPlayerPage({super.key, required this.gm, required this.list, required this.index});
+  @override
+  State<StbPlayerPage> createState() => _StbPlayerPageState();
+}
+
+class _StbPlayerPageState extends State<StbPlayerPage> {
+  VideoPlayerController? vc;
+  late int idx = widget.index;
+  String? err, url;
+  bool loading = true, overlay = true, full = false, noPicture = false;
+  double vol = 1;
+  int retries = 0, _gen = 0;
+  Timer? _hide;
+
+  StbChannel get ch => widget.list[idx];
+
+  @override
+  void initState() {
+    super.initState();
+    _open();
+  }
+
+  @override
+  void dispose() {
+    _hide?.cancel();
+    final c = vc;
+    vc = null;
+    c?.removeListener(_onTick);
+    c?.dispose();
+    widget.gm.stopStream().catchError((_) {});
+    if (full) _setFull(false);
+    super.dispose();
+  }
+
+  void _poke() {
+    _hide?.cancel();
+    if (!overlay) setState(() => overlay = true);
+    _hide = Timer(const Duration(seconds: 4), () {
+      if (mounted && vc?.value.isPlaying == true) setState(() => overlay = false);
+    });
+  }
+
+  Future<void> _open({bool retry = false}) async {
+    final gen = ++_gen;
+    if (!retry) retries = 0;
+    setState(() {
+      loading = true;
+      err = null;
+      noPicture = false;
+    });
+    final old = vc;
+    vc = null;
+    old?.removeListener(_onTick);
+    await old?.dispose();
+    try {
+      final u = await widget.gm.streamUrl(ch);
+      if (gen != _gen || !mounted) return;
+      if (u == null) throw StateError('الريسيفر مرجّعش رابط بث للقناة دي');
+      url = u;
+      AppLog.add('PLAYER', 'فتح ${ch.name} → ${u.split('?').first}');
+      final c = VideoPlayerController.networkUrl(
+        Uri.parse(u),
+        formatHint: u.contains('.m3u8') ? VideoFormat.hls : VideoFormat.other,
+        httpHeaders: const {'User-Agent': 'A2R Home'},
+      );
+      await c.initialize().timeout(const Duration(seconds: 20), onTimeout: () => throw TimeoutException('مهلة'));
+      if (gen != _gen || !mounted) {
+        await c.dispose();
+        return;
+      }
+      await c.setVolume(vol);
+      await c.play();
+      c.addListener(_onTick);
+      setState(() {
+        vc = c;
+        loading = false;
+        noPicture = c.value.size.width == 0;
+      });
+      if (noPicture) AppLog.add('PLAYER', 'صوت من غير صورة (size=0) — غالبًا الموبايل مفيهوش decoder للصورة');
+      _poke();
+    } catch (e) {
+      if (gen != _gen || !mounted) return;
+      AppLog.add('PLAYER', 'خطأ ${ch.name}: $e');
+      final m = e is StateError ? e.message : stbPlayerError('$e');
+      setState(() {
+        loading = false;
+        err = m;
+      });
+    }
+  }
+
+  void _onTick() {
+    final c = vc;
+    if (c == null || !mounted) return;
+    if (c.value.hasError) {
+      final d = c.value.errorDescription ?? '';
+      AppLog.add('PLAYER', 'وقف: $d');
+      c.removeListener(_onTick);
+      if (retries < 3) {
+        retries++;
+        setState(() => err = 'البث وقف — بعيد الاتصال ($retries/3)...');
+        Future.delayed(const Duration(seconds: 2), () {
+          if (mounted) _open(retry: true);
+        });
+      } else {
+        setState(() => err = stbPlayerError(d));
+      }
+      return;
+    }
+    setState(() {});
+  }
+
+  void _step(int d) {
+    if (widget.list.length < 2) return;
+    HapticFeedback.selectionClick();
+    idx = (idx + d) % widget.list.length;
+    if (idx < 0) idx += widget.list.length;
+    _open();
+  }
+
+  Future<void> _setFull(bool on) async {
+    full = on;
+    if (on) {
+      await SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    } else {
+      await SystemChrome.setPreferredOrientations(const []);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _external() async {
+    final u = url;
+    if (u == null) return;
+    final ok = await Native.openVideo(u);
+    if (!ok && mounted) {
+      await Clipboard.setData(ClipboardData(text: u));
+      if (mounted) toast(context, 'مفيش مشغل خارجي — الرابط اتنسخ');
+    }
+  }
+
+  void _pickList() {
+    var q = '';
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (c) => StatefulBuilder(
+        builder: (c, set) {
+          final shown = [
+            for (var i = 0; i < widget.list.length; i++)
+              if (q.isEmpty || widget.list[i].name.toLowerCase().contains(q.toLowerCase()) || '${widget.list[i].index + 1}' == q) i
+          ];
+          return SizedBox(
+            height: MediaQuery.of(c).size.height * 0.7,
+            child: Column(children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: TextField(
+                  decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'دوّر على قناة'),
+                  onChanged: (v) => set(() => q = v.trim()),
+                ),
+              ),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: shown.length,
+                  itemBuilder: (_, j) {
+                    final i = shown[j];
+                    return ListTile(
+                      selected: i == idx,
+                      selectedColor: kGold,
+                      leading: Text('${widget.list[i].index + 1}', style: const TextStyle(color: kMuted)),
+                      title: Text(widget.list[i].name),
+                      onTap: () {
+                        Navigator.pop(c);
+                        idx = i;
+                        _open();
+                      },
+                    );
+                  },
+                ),
+              ),
+            ]),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _btn(IconData i, String tip, VoidCallback on, {double size = 30}) =>
+      IconButton(icon: Icon(i, size: size, color: Colors.white), tooltip: tip, onPressed: () {
+        on();
+        _poke();
+      });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = vc;
+    final playing = c?.value.isPlaying == true;
+    return PopScope(
+      canPop: !full,
+      onPopInvokedWithResult: (did, _) {
+        if (!did && full) _setFull(false);
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          top: !full,
+          bottom: !full,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => overlay ? setState(() => overlay = false) : _poke(),
+            onHorizontalDragEnd: (d) {
+              final v = d.primaryVelocity ?? 0;
+              if (v.abs() > 400) _step(v < 0 ? 1 : -1);
+            },
+            child: Stack(children: [
+              Center(
+                child: c != null && c.value.isInitialized && !noPicture
+                    ? AspectRatio(aspectRatio: c.value.aspectRatio == 0 ? 16 / 9 : c.value.aspectRatio, child: VideoPlayer(c))
+                    : (noPicture
+                        ? const Padding(
+                            padding: EdgeInsets.all(24),
+                            child: Text('الصوت شغال بس الموبايل مش بيعرف يعرض صورة القناة دي — جرّب «مشغل خارجي» من ⋮',
+                                textAlign: TextAlign.center, style: TextStyle(color: kMuted)),
+                          )
+                        : null),
+              ),
+              if (loading) const Center(child: CircularProgressIndicator(color: kGold)),
+              if (err != null && !loading)
+                Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(mainAxisSize: MainAxisSize.min, children: [
+                      const Icon(Icons.error_outline_rounded, color: kBad, size: 40),
+                      const SizedBox(height: 8),
+                      Text(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white)),
+                      const SizedBox(height: 12),
+                      Wrap(spacing: 8, children: [
+                        FilledButton.icon(onPressed: () => _open(), icon: const Icon(Icons.refresh_rounded), label: const Text('جرّب تاني')),
+                        if (url != null) OutlinedButton.icon(onPressed: _external, icon: const Icon(Icons.open_in_new_rounded), label: const Text('مشغل خارجي')),
+                      ]),
+                    ]),
+                  ),
+                ),
+              if (overlay) ...[
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: Container(
+                    color: Colors.black54,
+                    child: Row(children: [
+                      _btn(Icons.arrow_back_rounded, 'رجوع', () => full ? _setFull(false) : Navigator.pop(context), size: 26),
+                      Expanded(
+                        child: Text('${ch.index + 1}  ${ch.name}',
+                            maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
+                      ),
+                      PopupMenuButton<String>(
+                        icon: const Icon(Icons.more_vert_rounded, color: Colors.white),
+                        onSelected: (v) async {
+                          if (v == 'ext') await _external();
+                          if (v == 'tv') {
+                            await widget.gm.zap(ch).catchError((_) {});
+                            if (context.mounted) toast(context, 'اتشغلت على التلفزيون');
+                          }
+                          if (v == 'copy' && url != null) {
+                            await Clipboard.setData(ClipboardData(text: url!));
+                            if (context.mounted) toast(context, 'الرابط اتنسخ');
+                          }
+                        },
+                        itemBuilder: (_) => const [
+                          PopupMenuItem(value: 'ext', child: Text('مشغل خارجي (VLC...)')),
+                          PopupMenuItem(value: 'tv', child: Text('شغّلها على التلفزيون كمان')),
+                          PopupMenuItem(value: 'copy', child: Text('انسخ رابط البث')),
+                        ],
+                      ),
+                    ]),
+                  ),
+                ),
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  child: Container(
+                    color: Colors.black54,
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Directionality(
+                      textDirection: TextDirection.ltr,
+                      child: Row(children: [
+                        _btn(Icons.skip_previous_rounded, 'القناة اللي قبلها', () => _step(-1)),
+                        _btn(playing ? Icons.pause_rounded : Icons.play_arrow_rounded, playing ? 'وقف' : 'شغّل', () {
+                          if (c == null) return;
+                          playing ? c.pause() : c.play();
+                        }, size: 36),
+                        _btn(Icons.skip_next_rounded, 'القناة اللي بعدها', () => _step(1)),
+                        Icon(vol == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded, color: Colors.white, size: 20),
+                        Expanded(
+                          child: Slider(
+                            value: vol,
+                            activeColor: kGold,
+                            onChanged: (v) {
+                              setState(() => vol = v);
+                              c?.setVolume(v);
+                              _poke();
+                            },
+                          ),
+                        ),
+                        _btn(Icons.list_rounded, 'القنوات', _pickList, size: 26),
+                        _btn(full ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded, 'ملء الشاشة', () => _setFull(!full), size: 28),
+                      ]),
+                    ),
+                  ),
+                ),
+              ],
+            ]),
+          ),
+        ),
+      ),
     );
   }
 }
