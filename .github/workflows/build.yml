@@ -89,6 +89,10 @@ jobs:
           import android.os.Looper
           import android.provider.OpenableColumns
           import android.speech.RecognizerIntent
+          import android.app.PictureInPictureParams
+          import android.content.res.Configuration
+          import android.util.Rational
+          import android.view.WindowManager
           import org.json.JSONArray
           import org.json.JSONObject
           import java.io.File
@@ -176,6 +180,27 @@ jobs:
                                   }
                               }
                           }
+                          // v6: صورة جوه صورة للمشغل
+                          "pip" -> {
+                              if (Build.VERSION.SDK_INT >= 26) {
+                                  val w = (call.argument<Int>("w") ?: 16).coerceIn(1, 10000)
+                                  val h = (call.argument<Int>("h") ?: 9).coerceIn(1, 10000)
+                                  var r = Rational(w, h)
+                                  if (r.toFloat() > 2.39f) r = Rational(239, 100)
+                                  if (r.toFloat() < 0.42f) r = Rational(42, 100)
+                                  result.success(enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(r).build()))
+                              } else {
+                                  result.success(false)
+                              }
+                          }
+                          // v6: إضاءة الشاشة للمشغل (-1 = العادية)
+                          "brightness" -> {
+                              val v = (call.argument<Double>("v") ?: -1.0).toFloat()
+                              val lp = window.attributes
+                              lp.screenBrightness = if (v < 0f) WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE else v.coerceIn(0.01f, 1f)
+                              window.attributes = lp
+                              result.success(true)
+                          }
                           "initialAction" -> {
                                   val a = pendingAction
                                   pendingAction = null
@@ -251,6 +276,11 @@ jobs:
                       val list = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
                       r?.success(if (resultCode == RESULT_OK && list != null) ArrayList(list) else null)
                   }
+              }
+
+              override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+                  super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+                  live?.invokeMethod("pipChanged", isInPictureInPictureMode)
               }
 
               override fun onDestroy() {
@@ -1002,6 +1032,9 @@ jobs:
           share = ''.join(
               '            <intent-filter><action android:name="android.intent.action.%s"/><category android:name="android.intent.category.DEFAULT"/><data android:mimeType="%s"/></intent-filter>\n' % (a, m)
               for a, m in [('SEND', 'video/*'), ('SEND', 'image/*'), ('SEND', 'text/plain'), ('SEND_MULTIPLE', 'video/*'), ('SEND_MULTIPLE', 'image/*')])
+          # v6: صورة جوه صورة لمشغل القنوات
+          s, npip = re.subn(r'(<activity\b[^>]*?android:name="\.MainActivity")', r'\1\n            android:supportsPictureInPicture="true"', s, count=1)
+          assert npip == 1, 'MainActivity activity tag not found for PiP'
           i = s.find('</activity>')
           assert i > 0 and '.MainActivity' in s[:i]
           s = s[:i] + share + '        ' + s[i:]
