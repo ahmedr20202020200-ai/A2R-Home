@@ -66,6 +66,7 @@ jobs:
             path_provider: 2.1.5
             qr: 3.0.2
             youtube_explode_dart: 3.1.0
+            video_player: 2.14.0
           dependency_overrides:
             # نسخ من غير JNI (نفس تطبيقاتك التانية)
             path_provider_android: 2.2.23
@@ -305,7 +306,33 @@ jobs:
               /** أيقونة الإشعار: أبيض على شفاف (ic_stat_a2r) — ولو خطوة الأيقونة فشلت نرجع لأيقونة التطبيق */
               fun smallIcon(ctx: Context): Int {
                   val id = ctx.resources.getIdentifier("ic_stat_a2r", "drawable", ctx.packageName)
+                  if (id == 0) android.util.Log.w("A2R", "ic_stat_a2r missing -> fallback to app icon")
                   return if (id != 0) id else ctx.applicationInfo.icon
+              }
+
+              /** أيقونة التطبيق الحقيقية بالألوان (بتظهر جوه الإشعار نفسه) — الأيقونة الصغيرة فوق لازم تبقى لون واحد (قاعدة أندرويد) */
+              private var bigIconCache: Bitmap? = null
+              fun largeIcon(ctx: Context): Bitmap? {
+                  bigIconCache?.let { return it }
+                  return try {
+                      val d = ctx.packageManager.getApplicationIcon(ctx.packageName)
+                      val px = (64 * ctx.resources.displayMetrics.density).toInt().coerceIn(64, 256)
+                      val bmp = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888)
+                      val c = android.graphics.Canvas(bmp)
+                      d.setBounds(0, 0, px, px)
+                      d.draw(c)
+                      bigIconCache = bmp
+                      bmp
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              /** نفس الشكل لكل إشعارات التطبيق */
+              fun brand(ctx: Context, b: Notification.Builder): Notification.Builder {
+                  b.setSmallIcon(smallIcon(ctx)).setColor(0xFFE8B23E.toInt())
+                  largeIcon(ctx)?.let { b.setLargeIcon(it) }
+                  return b
               }
 
               fun handle(ctx: Context, call: MethodCall, result: MethodChannel.Result) {
@@ -435,8 +462,7 @@ jobs:
                       nm.createNotificationChannel(NotificationChannel("net", "الشبكة", NotificationManager.IMPORTANCE_DEFAULT))
                   }
                   val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, "net") else Notification.Builder(ctx)
-                  b.setSmallIcon(smallIcon(ctx))
-                      .setColor(0xFFE8B23E.toInt())
+                  brand(ctx, b)
                       .setContentTitle(title)
                       .setContentText(body)
                       .setStyle(Notification.BigTextStyle().bigText(body))
@@ -489,8 +515,7 @@ jobs:
                       nm.createNotificationChannel(NotificationChannel("remote", "ريموت الريسيفر", NotificationManager.IMPORTANCE_LOW))
                   }
                   val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, "remote") else Notification.Builder(ctx)
-                  b.setSmallIcon(smallIcon(ctx))
-                      .setColor(0xFFE8B23E.toInt())
+                  brand(ctx, b)
                       .setContentTitle(title)
                       .setContentText("ريموت سريع")
                       .setOngoing(true)
@@ -698,7 +723,7 @@ jobs:
                   }
                   nb.setContentTitle("A2R Home: مشاركة الشاشة شغالة")
                   nb.setContentText("اقفلها من التطبيق")
-                  nb.setSmallIcon(android.R.drawable.ic_menu_share)
+                  A2RNative.brand(this, nb)
                   nb.setOngoing(true)
                   try {
                       if (Build.VERSION.SDK_INT >= 29) {
@@ -1018,7 +1043,7 @@ jobs:
         run: |
           python3 -m venv /tmp/iv
           /tmp/iv/bin/pip install --quiet pillow
-          /tmp/iv/bin/python - <<'PYICON'
+          /tmp/iv/bin/python - <<'PYICON' || echo "::warning title=أيقونة التطبيق::سكربت الأيقونة وقع — شوف السطور اللي فوق"
           from PIL import Image, ImageDraw, ImageFilter, ImageFont
           import math, os, glob, subprocess
           # أيقونة A2R Home — اختيار أحمد رقم 2: A2R دهبي + خط + موجات بث، على خلفية غامقة
@@ -1161,6 +1186,15 @@ jobs:
               for f in fs:
                   if 'ic_launcher' in f or 'ic_stat' in f: print(os.path.join(r, f))
           PYICON
+          # لو أيقونة الإشعار متعملتش: نقولها بصوت عالي (تحذير أحمر في صفحة البناء) بدل ما تعدّي ساكتة
+          RES=android/app/src/main/res
+          n=$(ls $RES/drawable-*/ic_stat_a2r.png 2>/dev/null | wc -l)
+          if [ "$n" -lt 5 ]; then
+            echo "::error title=أيقونة الإشعار::ic_stat_a2r.png اتعمل في $n من 5 مقاسات — الإشعارات هتطلع بأيقونة غلط"
+            echo "### ⚠️ أيقونة الإشعار (ic_stat_a2r) متعملتش ($n/5) — الإشعارات هتطلع بأيقونة غلط" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "### ✅ أيقونة التطبيق + أيقونة الإشعار اتعملوا ($n/5 مقاسات)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Disable release lint (lint crash in webview plugin)
         run: |
