@@ -167,6 +167,117 @@ class _ActTile extends StatelessWidget {
   }
 }
 
+// ---------- v6: ترتيب الشاشات — أدوات أساسية ظاهرة والباقي في «المزيد» ----------
+class ToolItem {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final String group;
+  const ToolItem(this.icon, this.label, this.onTap, {this.group = ''});
+}
+
+/// شبكة أزرار: أول [main] أزرار ظاهرين + زرار «المزيد» بيفتح كل الأدوات متقسمة مجموعات
+class ToolGrid extends StatelessWidget {
+  final List<ToolItem> items;
+  final int main;
+  final String title;
+  const ToolGrid({super.key, required this.items, this.main = 3, this.title = 'كل الأدوات'});
+
+  static Future<void> openAll(BuildContext context, List<ToolItem> items, String title) async {
+    final groups = <String, List<ToolItem>>{};
+    for (final t in items) {
+      groups.putIfAbsent(t.group, () => []).add(t);
+    }
+    final picked = await showModalBottomSheet<ToolItem>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: kSurface,
+      builder: (s) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(s).size.height * 0.8),
+          child: ListView(shrinkWrap: true, padding: const EdgeInsets.fromLTRB(12, 0, 12, 16), children: [
+            Padding(padding: const EdgeInsets.fromLTRB(4, 0, 4, 4), child: Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800))),
+            for (final g in groups.entries) ...[
+              if (g.key.isNotEmpty) SectionTitle(g.key),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                for (final t in g.value) _ActTile(icon: t.icon, label: Text(t.label), onTap: () => Navigator.pop(s, t)),
+              ]),
+            ],
+          ]),
+        ),
+      ),
+    );
+    picked?.onTap();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final shown = items.length <= main + 1 ? items : items.take(main).toList();
+    return Wrap(spacing: 8, runSpacing: 8, children: [
+      for (final t in shown) _ActTile(icon: t.icon, label: Text(t.label), onTap: t.onTap),
+      if (shown.length < items.length)
+        _ActTile(icon: Icons.apps_rounded, label: Text('المزيد (${items.length - shown.length})'), onTap: () => openAll(context, items, title)),
+    ]);
+  }
+}
+
+/// كارت بيتقفل ويتفتح وبيفتكر حالته (Store: fold_<id>)
+class FoldCard extends StatefulWidget {
+  final String id;
+  final String title;
+  final IconData icon;
+  final String? subtitle;
+  final Widget child;
+  final bool initiallyOpen;
+  const FoldCard({super.key, required this.id, required this.title, required this.icon, required this.child, this.subtitle, this.initiallyOpen = false});
+  @override
+  State<FoldCard> createState() => _FoldCardState();
+}
+
+class _FoldCardState extends State<FoldCard> {
+  late bool open;
+  @override
+  void initState() {
+    super.initState();
+    bool? v;
+    try {
+      v = Store.p.getBool('fold_${widget.id}');
+    } catch (_) {}
+    open = v ?? widget.initiallyOpen;
+  }
+
+  @override
+  Widget build(BuildContext context) => Card(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(16),
+            onTap: () {
+              setState(() => open = !open);
+              try {
+                Store.p.setBool('fold_${widget.id}', open);
+              } catch (_) {}
+            },
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+              child: Row(children: [
+                Icon(widget.icon, color: kGold, size: 20),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text(widget.title, style: const TextStyle(fontWeight: FontWeight.w700)),
+                    if (widget.subtitle != null) Text(widget.subtitle!, style: const TextStyle(fontSize: 12, color: kMuted)),
+                  ]),
+                ),
+                AnimatedRotation(turns: open ? 0.5 : 0, duration: const Duration(milliseconds: 180), child: const Icon(Icons.expand_more_rounded, color: kMuted)),
+              ]),
+            ),
+          ),
+          if (open) Padding(padding: const EdgeInsets.fromLTRB(12, 0, 12, 12), child: widget.child),
+        ]),
+      );
+}
+
 /// حالة الاتصال الحالية (بتتحدث من كل تبويب) — بيعرضها الشريط اللي فوق
 class Live {
   static bool router = false;
@@ -208,9 +319,9 @@ class _StatusStripState extends State<StatusStrip> {
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
       decoration: BoxDecoration(color: kSurface, borderRadius: BorderRadius.circular(14), border: Border.all(color: kLine)),
       child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        _dot('الراوتر', Live.router),
-        _dot('الريسيفر', GmClient.active?.connected ?? false),
-        _dot('الكمبيوتر', Live.pc),
+        Flexible(child: FittedBox(fit: BoxFit.scaleDown, child: _dot('الراوتر', Live.router))),
+        Flexible(child: FittedBox(fit: BoxFit.scaleDown, child: _dot('الريسيفر', GmClient.active?.connected ?? false))),
+        Flexible(child: FittedBox(fit: BoxFit.scaleDown, child: _dot('الكمبيوتر', Live.pc))),
       ]),
     );
   }
@@ -384,10 +495,12 @@ class _ShellState extends State<Shell> {
             child: Icon(icons[tab], color: const Color(0xFF1A1405), size: 22),
           ),
           const SizedBox(width: 10),
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(titles[tab]),
-            Text('A2R Home • $appVersion', style: const TextStyle(fontSize: 11, color: kMuted, fontWeight: FontWeight.w400)),
-          ]),
+          Flexible(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(titles[tab], maxLines: 1, overflow: TextOverflow.ellipsis),
+              Text('A2R Home • $appVersion', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11, color: kMuted, fontWeight: FontWeight.w400)),
+            ]),
+          ),
         ]),
         actions: [
           IconButton(
@@ -850,41 +963,53 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
 
   Widget _infoCard() {
     final n = net;
+    final tools = <ToolItem>[
+      ToolItem(Icons.speed, 'سرعة النت', _speed, group: 'أدوات الشبكة'),
+      ToolItem(Icons.monitor_heart_rounded, 'مراقبة الأجهزة', () async {
+        await Navigator.push(context, MaterialPageRoute(builder: (_) => DeviceWatchPage(hosts: hosts.values.toList(), labelOf: label)));
+        if (mounted) setState(() {});
+      }, group: 'الحظر والمراقبة'),
+      ToolItem(Icons.schedule_rounded, 'مواعيد الحظر', () async {
+        await Navigator.push(context, MaterialPageRoute(builder: (_) => SchedulePage(router: router, devices: [
+              for (final h in hosts.values)
+                if (h.mac.isNotEmpty) (mac: h.mac, name: label(h))
+            ])));
+        if (mounted) setState(() {});
+      }, group: 'الحظر والمراقبة'),
+      ToolItem(Icons.network_ping, 'Ping', () => _pingAsk(), group: 'أدوات الشبكة'),
+      ToolItem(Icons.power_settings_new, 'تشغيل جهاز (WOL)', () => _wol(null), group: 'أدوات الشبكة'),
+      ToolItem(Icons.qr_code_2_rounded, 'QR الواي فاي', _qr, group: 'أدوات الشبكة'),
+      ToolItem(Icons.data_usage_rounded, 'باقة النت', () {
+        final total = (int.tryParse('${st['monthly_tx_bytes'] ?? ''}') ?? 0) + (int.tryParse('${st['monthly_rx_bytes'] ?? ''}') ?? 0);
+        Navigator.push(context, MaterialPageRoute(builder: (_) => QuotaPage(routerTotal: router == null ? null : total)));
+      }, group: 'الحظر والمراقبة'),
+      ToolItem(Icons.history_rounded, 'سجل الأجهزة', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryPage())), group: 'الحظر والمراقبة'),
+      ToolItem(Icons.show_chart_rounded, 'سجل الإشارة والسرعة', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SignalHistoryPage())), group: 'سجلات وإعدادات'),
+      ToolItem(Icons.settings_backup_restore_rounded, 'نسخة احتياطية + قفل', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BackupPage())), group: 'سجلات وإعدادات'),
+      ToolItem(Icons.business, Oui.table.isEmpty ? 'نزّل أسماء الشركات' : 'شركات: ${Oui.table.length}', _ouiDownload, group: 'سجلات وإعدادات'),
+    ];
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            const Icon(Icons.wifi_rounded, color: kGold, size: 20),
+            const SizedBox(width: 8),
+            Expanded(child: Text(n?.ssid ?? 'مش متصل بواي فاي', style: const TextStyle(fontWeight: FontWeight.w700), overflow: TextOverflow.ellipsis)),
+          ]),
+          const SizedBox(height: 6),
           Wrap(spacing: 18, runSpacing: 6, children: [
-          _kv('الواي فاي', n?.ssid ?? 'مش متصل بواي فاي'),
-          _kv('IP الموبايل', n?.ip ?? 'مش متصل'),
-          _kv('البوابة', n?.gateway ?? 'مش متصل'),
-          _kv('النسخة', appVersion),
+            _kv('IP الموبايل', n?.ip ?? 'مش متصل'),
+            _kv('البوابة', n?.gateway ?? 'مش متصل'),
           ]),
           const SizedBox(height: 12),
-          Wrap(spacing: 8, runSpacing: 8, children: [
-          _ActTile(icon: Icons.speed, label: const Text('سرعة النت'), onTap: _speed),
-          _ActTile(icon: Icons.network_ping, label: const Text('Ping'), onTap: () => _pingAsk()),
-          _ActTile(icon: Icons.power_settings_new, label: const Text('تشغيل جهاز (WOL)'), onTap: () => _wol(null)),
-          _ActTile(icon: Icons.qr_code_2_rounded, label: const Text('QR الواي فاي'), onTap: _qr),
-          _ActTile(icon: Icons.monitor_heart_rounded, label: const Text('مراقبة الأجهزة'), onTap: () async {
-            await Navigator.push(context, MaterialPageRoute(builder: (_) => DeviceWatchPage(hosts: hosts.values.toList(), labelOf: label)));
-            if (mounted) setState(() {});
-          }),
-          _ActTile(icon: Icons.show_chart_rounded, label: const Text('سجل الإشارة والسرعة'), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SignalHistoryPage()))),
-          _ActTile(icon: Icons.settings_backup_restore_rounded, label: const Text('نسخة احتياطية + قفل'), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BackupPage()))),
-          _ActTile(icon: Icons.schedule_rounded, label: const Text('مواعيد الحظر'), onTap: () async {
-            await Navigator.push(context, MaterialPageRoute(builder: (_) => SchedulePage(router: router, devices: [
-                  for (final h in hosts.values)
-                    if (h.mac.isNotEmpty) (mac: h.mac, name: label(h))
-                ])));
-            if (mounted) setState(() {});
-          }),
-          _ActTile(icon: Icons.data_usage_rounded, label: const Text('باقة النت'), onTap: () {
-            final total = (int.tryParse('${st['monthly_tx_bytes'] ?? ''}') ?? 0) + (int.tryParse('${st['monthly_rx_bytes'] ?? ''}') ?? 0);
-            Navigator.push(context, MaterialPageRoute(builder: (_) => QuotaPage(routerTotal: router == null ? null : total)));
-          }),
-          _ActTile(icon: Icons.history_rounded, label: const Text('سجل الأجهزة'), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryPage()))),
-          _ActTile(icon: Icons.business, label: Text(Oui.table.isEmpty ? 'نزّل أسماء الشركات' : 'شركات: ${Oui.table.length}'), onTap: () async {
+          ToolGrid(items: tools, main: 3, title: 'أدوات الشبكة'),
+        ]),
+      ),
+    );
+  }
+
+  Future<void> _ouiDownload() async {
               final prog = ValueNotifier<String>('بجهّز التحميل…');
               showDialog<void>(
                 context: context,
@@ -931,12 +1056,6 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
                   ),
                 );
               }
-            },
-          ),
-        ]),
-        ]),
-      ),
-    );
   }
 
   Widget _kv(String k, String v) => Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
@@ -996,27 +1115,40 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           const SizedBox(height: 6),
           Wrap(spacing: 18, runSpacing: 6, children: [
             _kv('الشبكة', '${g('network_provider')} ${g('network_type')}'),
-            _kv('الإشارة', '${g('signalbar')}/5'),
-            _kv('RSRP', g('lte_rsrp')),
-            _kv('RSRQ', gAny(['lte_rsrq', 'Z4g_rsrq', 'lte_ca_pcell_rsrq'])),
-            _kv('SINR', gAny(['lte_snr', 'Z4g_SINR', 'lte_sinr', 'Z5g_SINR'])),
-            _kv('Band', gAny(['lte_band', 'lte_ca_pcell_band', 'wan_active_band', 'lte_main_band'])),
-            _kv('IP الخارجي', g('wan_ipaddr')),
+            _kv('الإشارة', '${g('signalbar')}/5 • ${g('lte_rsrp')}'),
             _kv('دلوقتي ↓/↑', '${downK.toStringAsFixed(0)}/${upK.toStringAsFixed(0)} kbps'),
             _kv('استهلاك الشهر', fmtBytes(tx + rx)),
             if (g('sms_unread_num').isNotEmpty && g('sms_unread_num') != '0') _kv('رسايل جديدة', g('sms_unread_num')),
           ]),
           if (g('lte_rsrp').isNotEmpty) _signalHint(int.tryParse(g('lte_rsrp')) ?? 0),
-          // fix19: أزرار واضحة للـ DNS والحظر
-          if (router != null) ...[
-            const SizedBox(height: 6),
-            if (acl != null) Text('فلتر الـ MAC (واي فاي الراوتر): ${acl!.kindAr}${acl!.black.isEmpty ? '' : ' • في القايمة السودا ${acl!.black.length}'}', style: const TextStyle(fontSize: 12, color: kMuted)),
-            Wrap(spacing: 8, runSpacing: 4, children: [
-              OutlinedButton.icon(onPressed: () => _routerAction('dns'), icon: const Icon(Icons.dns_rounded, size: 18), label: const Text('DNS الراوتر')),
-              OutlinedButton.icon(onPressed: _openToto, icon: const Icon(Icons.wifi_tethering_rounded, size: 18), label: const Text('DNS/حظر الأكسس')),
-              OutlinedButton.icon(onPressed: () => _routerAction('acl'), icon: const Icon(Icons.bug_report_rounded, size: 18), label: const Text('ابعتلي حالة الحظر')),
-            ]),
-          ],
+          // v6: التفاصيل + أزرار fix19 (DNS والحظر) جوه «تفاصيل» علشان الكارت ميبقاش زحمة
+          Theme(
+            data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+            child: ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              childrenPadding: const EdgeInsets.only(bottom: 4),
+              expandedCrossAxisAlignment: CrossAxisAlignment.start,
+              initiallyExpanded: Store.p.getBool('fold_router_more') ?? false,
+              onExpansionChanged: (v) => Store.p.setBool('fold_router_more', v),
+              title: const Text('تفاصيل الإشارة + DNS والحظر', style: TextStyle(fontSize: 13, color: kGold, fontWeight: FontWeight.w600)),
+              children: [
+                Wrap(spacing: 18, runSpacing: 6, children: [
+                  _kv('RSRP', g('lte_rsrp')),
+                  _kv('RSRQ', gAny(['lte_rsrq', 'Z4g_rsrq', 'lte_ca_pcell_rsrq'])),
+                  _kv('SINR', gAny(['lte_snr', 'Z4g_SINR', 'lte_sinr', 'Z5g_SINR'])),
+                  _kv('Band', gAny(['lte_band', 'lte_ca_pcell_band', 'wan_active_band', 'lte_main_band'])),
+                  _kv('IP الخارجي', g('wan_ipaddr')),
+                ]),
+                const SizedBox(height: 8),
+                if (acl != null) Text('فلتر الـ MAC (واي فاي الراوتر): ${acl!.kindAr}${acl!.black.isEmpty ? '' : ' • في القايمة السودا ${acl!.black.length}'}', style: const TextStyle(fontSize: 12, color: kMuted)),
+                Wrap(spacing: 8, runSpacing: 4, children: [
+                  OutlinedButton.icon(onPressed: () => _routerAction('dns'), icon: const Icon(Icons.dns_rounded, size: 18), label: const Text('DNS الراوتر')),
+                  OutlinedButton.icon(onPressed: _openToto, icon: const Icon(Icons.wifi_tethering_rounded, size: 18), label: const Text('DNS/حظر الأكسس')),
+                  OutlinedButton.icon(onPressed: () => _routerAction('acl'), icon: const Icon(Icons.bug_report_rounded, size: 18), label: const Text('ابعتلي حالة الحظر')),
+                ]),
+              ],
+            ),
+          ),
         ]),
       ),
     );
@@ -2106,16 +2238,16 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
                   ),
                 ),
               ]),
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                    cs.way == CastWay.gm
+                        ? 'G-MScreen: الرابط بيروح للريسيفر على اتصال الريموت (أمر 1063). لو مشتغلش ارجع لـ DLNA.'
+                        : 'DLNA زي Web Video Caster • Chromecast مش مدعوم.',
+                    style: const TextStyle(fontSize: 11, color: Colors.white60)),
+              ),
             ]),
           ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: Text(
-              cs.way == CastWay.gm
-                  ? 'طريقة G-MScreen بتبعت الرابط للريسيفر على نفس اتصال الريموت (أمر 1063). لو مشتغلتش ارجع لـ DLNA.'
-                  : 'DLNA زي Web Video Caster. الريسيفر بيظهر أول واحد لو متوصّل قبل كده. Chromecast مش مدعوم.',
-              style: const TextStyle(fontSize: 12, color: Colors.white60)),
         ),
         if (cs.note.isNotEmpty)
           Padding(
@@ -2127,48 +2259,20 @@ class _CastPageState extends State<CastPage> with AutomaticKeepAliveClientMixin 
             ]),
           ),
         Padding(
-          padding: const EdgeInsets.all(10),
-          child: Wrap(spacing: 8, runSpacing: 8, children: [
-            FilledButton.icon(
-              icon: const Icon(Icons.public),
-              label: const Text('المتصفح'),
-              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BrowserPage())),
-            ),
-            FilledButton.tonalIcon(icon: const Icon(Icons.video_library), label: const Text('من الموبايل'), onPressed: pickLocal),
-            FilledButton.tonalIcon(
-              icon: const Icon(Icons.live_tv),
-              label: const Text('قنوات IPTV'),
-              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const IptvPage())),
-            ),
-            FilledButton.tonalIcon(icon: const Icon(Icons.link), label: const Text('رابط'), onPressed: addLink),
-            FilledButton.tonalIcon(
-              icon: const Icon(Icons.slideshow_rounded),
-              label: const Text('عرض صور'),
-              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SlideshowPage())),
-            ),
-            FilledButton.tonalIcon(
-              icon: const Icon(Icons.download_rounded),
-              label: const Text('التنزيلات'),
-              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const DownloadsPage())),
-            ),
-            FilledButton.tonalIcon(
-              icon: const Icon(Icons.queue_music_rounded),
-              label: const Text('قوايم محفوظة'),
-              onPressed: () async {
-                await Navigator.push(context, MaterialPageRoute(builder: (_) => const PlaylistsPage()));
-                if (mounted) setState(() {});
-              },
-            ),
-            FilledButton.tonalIcon(
-              icon: const Icon(Icons.history_rounded),
-              label: const Text('اللي اتعرض قبل كده'),
-              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const CastHistoryPage())),
-            ),
-            FilledButton.tonalIcon(
-              icon: const Icon(Icons.school_rounded),
-              label: const Text('تعلّم من Web Video Caster'),
-              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LearnPage())),
-            ),
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+          child: ToolGrid(title: 'اعرض على الشاشة', main: 3, items: [
+            ToolItem(Icons.public, 'المتصفح', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BrowserPage())), group: 'اعرض من'),
+            ToolItem(Icons.video_library, 'من الموبايل', pickLocal, group: 'اعرض من'),
+            ToolItem(Icons.link, 'رابط', addLink, group: 'اعرض من'),
+            ToolItem(Icons.live_tv, 'قنوات IPTV', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const IptvPage())), group: 'اعرض من'),
+            ToolItem(Icons.slideshow_rounded, 'عرض صور', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SlideshowPage())), group: 'اعرض من'),
+            ToolItem(Icons.download_rounded, 'التنزيلات', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const DownloadsPage())), group: 'محفوظ'),
+            ToolItem(Icons.queue_music_rounded, 'قوايم محفوظة', () async {
+              await Navigator.push(context, MaterialPageRoute(builder: (_) => const PlaylistsPage()));
+              if (mounted) setState(() {});
+            }, group: 'محفوظ'),
+            ToolItem(Icons.history_rounded, 'اللي اتعرض قبل كده', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const CastHistoryPage())), group: 'محفوظ'),
+            ToolItem(Icons.school_rounded, 'تعلّم من Web Video Caster', () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LearnPage())), group: 'مساعدة'),
           ]),
         ),
         if (cs.playing >= 0 && cs.playing < cs.queue.length) _remote(),
@@ -3557,6 +3661,21 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
           ),
         ]),
       ),
+      if (q.isEmpty && connected && _lastPlay() != null)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+          child: Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: ActionChip(
+              avatar: const Icon(Icons.play_circle_fill_rounded, size: 18, color: kGold),
+              label: Text('كمّل على الموبايل: ${_lastPlay()!.name}', style: const TextStyle(fontSize: 12)),
+              onPressed: () {
+                final r = _lastPlay()!;
+                watch(channels.where((c) => c.id == r.id && c.radio == r.radio).firstOrNull ?? StbChannel(r.id, r.name, r.radio, 0, const {}));
+              },
+            ),
+          ),
+        ),
       if (q.isEmpty && StbPrefs.recent.isNotEmpty && connected)
         SizedBox(
           height: 44,
@@ -3571,6 +3690,11 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                 ),
               ),
           ]),
+        ),
+      if (channels.isNotEmpty)
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 0, 16, 4),
+          child: Text('دوسة = على التلفزيون • ▶ = على الموبايل • ضغطة طويلة = خيارات ومجموعات', style: TextStyle(fontSize: 11, color: kMuted)),
         ),
       Expanded(
         child: channels.isEmpty
@@ -3620,15 +3744,6 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                             ),
                             IconButton(
                               visualDensity: VisualDensity.compact,
-                              icon: Icon(StbPrefs.groupsOf(ch).isEmpty ? Icons.folder_open_rounded : Icons.folder_special_rounded, color: kMuted),
-                              tooltip: 'مجموعات',
-                              onPressed: () async {
-                                await pickStbGroups(context, ch);
-                                if (mounted) setState(() {});
-                              },
-                            ),
-                            IconButton(
-                              visualDensity: VisualDensity.compact,
                               icon: const Icon(Icons.play_circle_outline_rounded, color: kMuted),
                               tooltip: 'اتفرج على الموبايل',
                               onPressed: () => watch(ch),
@@ -3669,6 +3784,15 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               ),
               OutlinedButton.icon(onPressed: () => watch(ch), icon: const Icon(Icons.phone_android_rounded), label: const Text('على الموبايل')),
               OutlinedButton.icon(onPressed: () => watchExternal(ch), icon: const Icon(Icons.open_in_new_rounded), label: const Text('مشغل خارجي')),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  Navigator.pop(c);
+                  await pickStbGroups(context, ch);
+                  if (mounted) setState(() {});
+                },
+                icon: Icon(StbPrefs.groupsOf(ch).isEmpty ? Icons.folder_open_rounded : Icons.folder_special_rounded),
+                label: const Text('المجموعات'),
+              ),
               OutlinedButton.icon(
                 onPressed: () {
                   Navigator.pop(c);
@@ -3845,6 +3969,16 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   }
 
   /// اتفرج على الموبايل: جوه التطبيق (مشغل خارجي بقى اختيار احتياطي من ⋮ جوه المشغل)
+  /// آخر قناة اتفرجت عليها في مشغل الموبايل (v6)
+  ({String id, String name, bool radio})? _lastPlay() {
+    try {
+      final m = jsonDecode(Store.p.getString('stb_last_play') ?? '') as Map;
+      return (id: '${m['id']}', name: '${m['n']}', radio: m['r'] == true);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> watch(StbChannel ch) async {
     if (gm == null) {
       toast(context, 'مش متصل بالريسيفر');
@@ -4202,14 +4336,15 @@ class Gauge extends StatelessWidget {
   final String label;
   final double? value;
   final Color color;
-  const Gauge({super.key, required this.label, required this.value, required this.color});
+  final double size;
+  const Gauge({super.key, required this.label, required this.value, required this.color, this.size = 138});
   @override
   Widget build(BuildContext context) {
     final v = (value ?? 0).clamp(0, 100) / 100;
     return Column(children: [
       SizedBox(
-        width: 138,
-        height: 138,
+        width: size,
+        height: size,
         child: Stack(alignment: Alignment.center, children: [
           SizedBox.expand(
             child: TweenAnimationBuilder<double>(
@@ -4217,7 +4352,7 @@ class Gauge extends StatelessWidget {
               duration: const Duration(milliseconds: 350),
               builder: (c, x, _) => CircularProgressIndicator(
                 value: x,
-                strokeWidth: 12,
+                strokeWidth: size / 11.5,
                 strokeCap: StrokeCap.round,
                 backgroundColor: kSurface2,
                 color: Color.lerp(kBad, color, x),
@@ -4225,13 +4360,171 @@ class Gauge extends StatelessWidget {
             ),
           ),
           Column(mainAxisSize: MainAxisSize.min, children: [
-            Text(value == null ? '—' : '${value!.round()}%', style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w800)),
+            Text(value == null ? '—' : '${value!.round()}%', style: TextStyle(fontSize: size * 0.22, fontWeight: FontWeight.w800)),
             Text(label, style: const TextStyle(fontSize: 12, color: kMuted)),
           ]),
         ]),
       ),
     ]);
   }
+}
+
+// ======== v6: ضبط الطبق — اختار القناة اللي عايز تظبط إشارتها ========
+// الترتيب: 1000 (غيّر القناة على الريسيفر) → لو الترددة معروفة: 401 + 402 + 403 كل 350ms
+// لو الترددة مش معروفة: 401 + 403 من غير قفل (تجريبي) → لو مفيش قراءة: 405 + نرجّع القناة + زرار Info على التلفزيون.
+// مفيش أي أمر كتابة غير المعروفين (1000 / 401 / 402 / 403 / 405 / زراير الريموت).
+
+/// ترددة محفوظة لقناة (لو الريسيفر مش باعتها وأحمد كتبها بإيده مرة)
+class DishTp {
+  static Map<String, dynamic> _all() {
+    try {
+      return Map<String, dynamic>.from(jsonDecode(Store.p.getString('dish_tp') ?? '{}') as Map);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static FinderCfg? of(FinderCfg base, StbChannel c) {
+    final m = _all()[stbKey(c)];
+    if (m is! Map) return null;
+    final f = int.tryParse('${m['f']}') ?? 0, sr = int.tryParse('${m['s']}') ?? 0;
+    if (f < 900 || sr < 1000) return null;
+    return base.copyWith(freq: f, sym: sr, pol: int.tryParse('${m['p']}') ?? base.pol);
+  }
+
+  static Future<void> save(StbChannel c, FinderCfg x) async {
+    final a = _all()..[stbKey(c)] = {'f': x.freq, 's': x.sym, 'p': x.pol};
+    await Store.p.setString('dish_tp', jsonEncode(a));
+  }
+
+  /// ترددة القناة: من رد الريسيفر الأول، وإلا المحفوظة
+  static FinderCfg? find(FinderCfg base, StbChannel c) => finderFromChannel(base, c.raw) ?? of(base, c);
+
+  static String label(FinderCfg? t) => t == null ? 'الترددة مش معروفة' : '${t.freq} ${t.pol == 0 ? 'H' : 'V'} ${t.sym}';
+
+  static List<String> get recent => Store.p.getStringList('dish_recent') ?? [];
+  static Future<void> addRecent(StbChannel c) async {
+    final l = recent.where((k) => k != stbKey(c)).toList()..insert(0, stbKey(c));
+    await Store.p.setStringList('dish_recent', l.take(8).toList());
+  }
+}
+
+/// ترتيب قايمة اختيار القناة: الشغالة دلوقتي ← آخر قنوات اتظبطت ← المفضلة ← الباقي (تلفزيون بس)
+List<(String, List<StbChannel>)> dishChannelSections(List<StbChannel> all, {String? playingId, required List<String> recent, required Set<String> favs, String q = ''}) {
+  final tv = all.where((c) => !c.radio).toList();
+  bool hit(StbChannel c) => q.trim().isEmpty || c.name.toLowerCase().contains(q.trim().toLowerCase()) || '${c.index + 1}' == q.trim();
+  final used = <String>{};
+  List<StbChannel> take(Iterable<StbChannel> it) => [
+        for (final c in it)
+          if (hit(c) && used.add(stbKey(c))) c
+      ];
+  final byKey = {for (final c in tv) stbKey(c): c};
+  final out = <(String, List<StbChannel>)>[];
+  final now = take(tv.where((c) => c.id == playingId));
+  if (now.isNotEmpty) out.add(('شغالة دلوقتي على التلفزيون', now));
+  final rec = take([for (final k in recent) if (byKey[k] != null) byKey[k]!]);
+  if (rec.isNotEmpty) out.add(('آخر قنوات ظبطت عليها', rec));
+  final fav = take(tv.where((c) => favs.contains(c.id) || c.fav));
+  if (fav.isNotEmpty) out.add(('المفضلة', fav));
+  final rest = take(tv);
+  if (rest.isNotEmpty) out.add(('كل القنوات', rest));
+  return out;
+}
+
+class DishChannelSheet extends StatefulWidget {
+  final List<StbChannel> channels;
+  final String? playingId;
+  final FinderCfg base;
+  const DishChannelSheet({super.key, required this.channels, required this.playingId, required this.base});
+  @override
+  State<DishChannelSheet> createState() => _DishChannelSheetState();
+}
+
+class _DishChannelSheetState extends State<DishChannelSheet> {
+  String q = '';
+  @override
+  Widget build(BuildContext context) {
+    final favs = (Store.p.getStringList('stb_favs') ?? []).toSet();
+    final secs = dishChannelSections(widget.channels, playingId: widget.playingId, recent: DishTp.recent, favs: favs, q: q);
+    return DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.85,
+      maxChildSize: 0.95,
+      builder: (c, sc) => Column(children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 0, 16, 6),
+          child: Text('اختار القناة اللي عايز تظبط إشارتها', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+          child: TextField(
+            autofocus: false,
+            decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'دوّر بالاسم أو الرقم', isDense: true),
+            onChanged: (v) => setState(() => q = v),
+          ),
+        ),
+        Expanded(
+          child: widget.channels.isEmpty
+              ? const EmptyState(icon: Icons.live_tv_rounded, title: 'القنوات لسه متحمّلتش', hint: 'افتح «القنوات» مرة علشان تتحمّل')
+              : secs.isEmpty
+                  ? const EmptyState(icon: Icons.search_off_rounded, title: 'مفيش قناة بالاسم ده')
+                  : ListView(controller: sc, children: [
+                      for (final sec in secs) ...[
+                        SectionTitle('${sec.$1} (${sec.$2.length})'),
+                        for (final ch in sec.$2.take(sec.$1 == 'كل القنوات' ? 400 : 50))
+                          ListTile(
+                            dense: true,
+                            leading: Container(
+                              width: 44,
+                              alignment: Alignment.center,
+                              padding: const EdgeInsets.symmetric(vertical: 6),
+                              decoration: BoxDecoration(color: kSurface2, borderRadius: BorderRadius.circular(10)),
+                              child: Text('${ch.index + 1}', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.white70)),
+                            ),
+                            title: Text(ch.name, overflow: TextOverflow.ellipsis),
+                            subtitle: Text(DishTp.label(DishTp.find(widget.base, ch)), textDirection: TextDirection.ltr, textAlign: TextAlign.right, style: const TextStyle(fontSize: 11, color: kMuted)),
+                            trailing: const Icon(Icons.network_check_rounded, color: kGold),
+                            onTap: () => Navigator.pop(context, ch),
+                          ),
+                      ],
+                    ]),
+        ),
+      ]),
+    );
+  }
+}
+
+/// خط صغير بيرسم آخر قراءات الجودة (علشان تعرف الطبق رايح للأحسن ولا للأوحش)
+class SignalSpark extends CustomPainter {
+  final List<double> v;
+  final Color color;
+  SignalSpark(this.v, this.color);
+  @override
+  void paint(Canvas c, Size s) {
+    final grid = Paint()
+      ..color = kLine
+      ..strokeWidth = 1;
+    for (final y in [0.25, 0.5, 0.75]) {
+      c.drawLine(Offset(0, s.height * y), Offset(s.width, s.height * y), grid);
+    }
+    if (v.length < 2) return;
+    final path = Path();
+    for (var i = 0; i < v.length; i++) {
+      final x = s.width * i / (v.length - 1);
+      final y = s.height * (1 - v[i].clamp(0, 100) / 100);
+      i == 0 ? path.moveTo(x, y) : path.lineTo(x, y);
+    }
+    c.drawPath(
+        path,
+        Paint()
+          ..color = color
+          ..strokeWidth = 2.5
+          ..style = PaintingStyle.stroke
+          ..strokeJoin = StrokeJoin.round);
+  }
+
+  @override
+  bool shouldRepaint(SignalSpark o) => true;
 }
 
 class DishPage extends StatefulWidget {
@@ -4244,15 +4537,26 @@ class DishPage extends StatefulWidget {
   State<DishPage> createState() => _DishPageState();
 }
 
+/// idle: مفيش قياس • zap: بيغيّر القناة • lock: بيقفل على الترددة • finder: قياس حقيقي من الريسيفر
+/// probe: قياس من غير ترددة (تجريبي) • tv: الريسيفر مش بيبعت الإشارة — اتفرج عليها على التلفزيون
+enum DishMode { idle, zap, lock, finder, probe, tv }
+
 class _DishPageState extends State<DishPage> {
   Timer? beep;
   SignalReading sig = const SignalReading();
   String raw = '';
-  bool running = false, busy = false, sound = true, finderOn = false;
+  bool sound = true, finderOn = false;
+  DishMode mode = DishMode.idle;
+  String note = '';
   int _gen = 0;
-  String q = '';
+  StbChannel? ch;
+  double peakQ = 0, peakS = 0;
+  final hist = <double>[];
   late FinderCfg cfg = _loadCfg();
   final freqC = TextEditingController(), symC = TextEditingController();
+
+  bool get running => mode == DishMode.finder || mode == DishMode.probe;
+  bool get busy => mode == DishMode.zap || mode == DishMode.lock;
 
   static FinderCfg _loadCfg() {
     try {
@@ -4267,6 +4571,17 @@ class _DishPageState extends State<DishPage> {
     super.initState();
     freqC.text = cfg.freq > 0 ? '${cfg.freq}' : '';
     symC.text = '${cfg.sym}';
+    final k = Store.p.getString('dish_ch');
+    if (k != null) ch = widget.channels.where((c) => stbKey(c) == k).firstOrNull;
+  }
+
+  @override
+  void didUpdateWidget(DishPage o) {
+    super.didUpdateWidget(o);
+    if (ch == null) {
+      final k = Store.p.getString('dish_ch');
+      if (k != null) ch = widget.channels.where((c) => stbKey(c) == k).firstOrNull;
+    }
   }
 
   void _save(FinderCfg c) {
@@ -4295,23 +4610,91 @@ class _DishPageState extends State<DishPage> {
     });
   }
 
-  Future<void> start() async {
-    final f = int.tryParse(freqC.text.trim()) ?? 0;
-    final sr = int.tryParse(symC.text.trim()) ?? 0;
-    if (f < 900 || sr < 1000) {
-      toast(context, 'اكتب الترددة (مثلاً 11013) والـSymbol Rate (مثلاً 27500) أو خدهم من قناة');
+  void _resetReadings() {
+    sig = const SignalReading();
+    peakQ = 0;
+    peakS = 0;
+    hist.clear();
+    raw = '';
+  }
+
+  void _take(SignalReading s) {
+    sig = s;
+    final q = s.quality ?? s.strength ?? 0;
+    hist.add(q);
+    if (hist.length > 60) hist.removeAt(0);
+    if ((s.quality ?? 0) > peakQ) peakQ = s.quality!;
+    if ((s.strength ?? 0) > peakS) peakS = s.strength!;
+    raw = 'القوة ${s.strength?.round() ?? '-'}%  الجودة ${s.quality?.round() ?? '-'}%';
+  }
+
+  // ---------- 1) اختيار القناة ----------
+  Future<void> pickChannel() async {
+    if (widget.channels.isEmpty) {
+      toast(context, 'القنوات لسه متحمّلتش — افتح «القنوات» الأول');
       return;
     }
-    _save(cfg.copyWith(freq: f, sym: sr));
-    final sup = widget.gm.info?.satFinder;
-    if (sup == false) {
-      final ok = await confirm(context, 'الريسيفر ده بيقول إنه مش بيدعم ضبط الطبق من الموبايل (SatFinder). G-MScreen نفسه بيخفي الخاصية دي عنده.\n\nتجرب برضه؟');
-      if (!ok || !mounted) return;
-    }
+    final c = await showModalBottomSheet<StbChannel>(
+      context: context,
+      backgroundColor: kSurface,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => DishChannelSheet(channels: widget.channels, playingId: widget.playingId, base: cfg),
+    );
+    if (c == null || !mounted) return;
+    await alignOn(c);
+  }
+
+  /// غيّر القناة على الريسيفر وابدأ قياسها
+  Future<void> alignOn(StbChannel c, {bool force = false}) async {
+    await stop(quiet: true);
     final my = ++_gen;
     setState(() {
-      busy = true;
-      raw = '';
+      ch = c;
+      mode = DishMode.zap;
+      note = 'بغيّر الريسيفر لـ «${c.name}»…';
+      _resetReadings();
+    });
+    Store.p.setString('dish_ch', stbKey(c));
+    await DishTp.addRecent(c);
+    try {
+      await widget.gm.zap(c); // 1000 — نفس أمر تغيير القناة المجرّب
+      widget.onZapped(c.id);
+      StbPrefs.addRecent(c);
+    } catch (e) {
+      AppLog.add('STB', 'dish zap failed: $e');
+      if (!mounted || my != _gen) return;
+      setState(() {
+        mode = DishMode.idle;
+        note = 'الريسيفر مغيّرش القناة: $e';
+      });
+      return;
+    }
+    await Future.delayed(const Duration(milliseconds: 1500));
+    if (!mounted || my != _gen) return;
+    final tp = DishTp.find(cfg, c);
+    if (tp != null) {
+      freqC.text = '${tp.freq}';
+      symC.text = '${tp.sym}';
+      _save(tp);
+    }
+    final sup = widget.gm.info?.satFinder;
+    if (sup == false && !force) {
+      await _tvMode(my, 'الريسيفر ده بيقول إنه مش بيدعم قياس الإشارة على الموبايل (SatFinder) — القناة اتغيّرت، والإشارة ظاهرة على شاشة التلفزيون (دوست Info).');
+      return;
+    }
+    if (tp != null) {
+      await _startFinder(my);
+    } else {
+      await _probe(my);
+    }
+  }
+
+  /// 401 + 402 + 403: قياس حقيقي على ترددة القناة
+  Future<void> _startFinder(int my) async {
+    setState(() {
+      mode = DishMode.lock;
+      note = 'بيقفل على ترددة ${DishTp.label(cfg)}…';
     });
     try {
       AppLog.add('STB', 'satfinder start ${jsonEncode(cfg.toJson())}');
@@ -4320,21 +4703,93 @@ class _DishPageState extends State<DishPage> {
       await widget.gm.finderLock(cfg);
       if (!mounted || my != _gen) return;
       setState(() {
-        busy = false;
-        running = true;
+        mode = DishMode.finder;
+        note = 'بيقيس من الريسيفر على ${DishTp.label(cfg)}';
       });
       _loop(my);
     } catch (e) {
       AppLog.add('STB', 'satfinder failed: $e');
-      if (mounted) {
-        setState(() {
-          busy = false;
-          raw = 'خطأ: $e';
-        });
-        toast(context, 'الريسيفر رفض: $e');
-      }
       await _end();
+      if (!mounted || my != _gen) return;
+      if (ch != null) {
+        try {
+          await widget.gm.zap(ch!);
+        } catch (_) {}
+      }
+      await _tvMode(my, 'الريسيفر مردّش على قياس الإشارة ($e) — رجّعت القناة، والإشارة ظاهرة على التلفزيون (دوست Info).');
     }
+  }
+
+  /// الترددة مش معروفة: 401 + 403 من غير قفل — لو الريسيفر رجّع قراءة نكمّل، وإلا التلفزيون
+  Future<void> _probe(int my) async {
+    setState(() {
+      mode = DishMode.lock;
+      note = 'الريسيفر مش باعت ترددة القناة — بجرّب أقرا الإشارة من غيرها…';
+    });
+    SignalReading? got;
+    try {
+      await widget.gm.finderStart();
+      finderOn = true;
+      for (var i = 0; i < 3 && got == null; i++) {
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (!mounted || my != _gen) return;
+        try {
+          final s = await widget.gm.finderSq();
+          if (!s.empty && ((s.strength ?? 0) > 0 || (s.quality ?? 0) > 0)) got = s;
+        } catch (_) {}
+      }
+    } catch (e) {
+      AppLog.add('STB', 'satfinder probe failed: $e');
+    }
+    if (!mounted || my != _gen) return;
+    if (got != null) {
+      setState(() {
+        _take(got!);
+        mode = DishMode.probe;
+        note = 'قراءة من الريسيفر من غير ترددة القناة (تجريبي) — لو الأرقام مش بتتحرك مع الطبق اكتب الترددة في «يدوي».';
+      });
+      _scheduleBeep();
+      _loop(my);
+      return;
+    }
+    await _end();
+    if (ch != null) {
+      try {
+        await widget.gm.zap(ch!);
+      } catch (_) {}
+    }
+    await _tvMode(my, 'الريسيفر مش بيبعت قوة الإشارة للموبايل على القناة دي (مش باعت ترددتها). القناة اتغيّرت على التلفزيون ودوست Info — الإشارة ظاهرة على الشاشة.\nلو عارف الترددة اكتبها في «يدوي» تحت وهتتحفظ للقناة دي.');
+  }
+
+  Future<void> _tvMode(int my, String why) async {
+    if (!mounted || my != _gen) return;
+    setState(() {
+      mode = DishMode.tv;
+      note = why;
+    });
+    await showOnTv();
+  }
+
+  // ---------- قياس يدوي (الترددة مكتوبة) ----------
+  Future<void> start() async {
+    final f = int.tryParse(freqC.text.trim()) ?? 0;
+    final sr = int.tryParse(symC.text.trim()) ?? 0;
+    if (f < 900 || sr < 1000) {
+      toast(context, 'اكتب الترددة (مثلاً 11013) والـSymbol Rate (مثلاً 27500) أو اختار قناة');
+      return;
+    }
+    _save(cfg.copyWith(freq: f, sym: sr));
+    final sup = widget.gm.info?.satFinder;
+    if (sup == false) {
+      final ok = await confirm(context, 'الريسيفر ده بيقول إنه مش بيدعم ضبط الطبق من الموبايل (SatFinder). G-MScreen نفسه بيخفي الخاصية دي عنده.\n\nتجرب برضه؟');
+      if (!ok || !mounted) return;
+    }
+    await stop(quiet: true);
+    final c = ch;
+    if (c != null && finderFromChannel(cfg, c.raw) == null) await DishTp.save(c, cfg);
+    final my = ++_gen;
+    setState(_resetReadings);
+    await _startFinder(my);
   }
 
   Future<void> _loop(int my) async {
@@ -4344,16 +4799,14 @@ class _DishPageState extends State<DishPage> {
         final s = await widget.gm.finderSq();
         fails = 0;
         if (!mounted || my != _gen) return;
-        setState(() {
-          sig = s;
-          raw = 'القوة ${s.strength?.round() ?? '-'}%  الجودة ${s.quality?.round() ?? '-'}%';
-        });
+        setState(() => _take(s));
         _scheduleBeep();
       } catch (e) {
         fails++;
         if (mounted) setState(() => raw = 'خطأ: $e');
         if (fails >= 5) {
-          stop();
+          await stop();
+          if (mounted) setState(() => note = 'القياس وقف: الريسيفر بطّل يرد ($e)');
           return;
         }
       }
@@ -4369,11 +4822,16 @@ class _DishPageState extends State<DishPage> {
     } catch (_) {}
   }
 
-  void stop() {
+  Future<void> stop({bool quiet = false}) async {
     _gen++;
     beep?.cancel();
-    _end();
-    if (mounted) setState(() => running = false);
+    await _end();
+    if (mounted) {
+      setState(() {
+        if (!quiet && mode != DishMode.idle) note = 'القياس وقف — الريسيفر رجع للقناة';
+        mode = DishMode.idle;
+      });
+    }
   }
 
   Future<void> pickFromDb() async {
@@ -4384,18 +4842,6 @@ class _DishPageState extends State<DishPage> {
     symC.text = '${t.$2}';
     _save(cfg.copyWith(satName: s.name, angle: s.angle, dir: s.west ? 1 : 0, freq: t.$1, sym: t.$2, pol: t.$3));
     toast(context, '${s.label}: ${t.$1} ${t.$3 == 0 ? 'H' : 'V'} ${t.$2}');
-  }
-
-  void fromChannel(StbChannel c) {
-    final n = finderFromChannel(cfg, c.raw);
-    if (n == null) {
-      toast(context, 'الريسيفر مش باعت ترددة القناة دي — اكتبها بإيدك');
-      return;
-    }
-    freqC.text = '${n.freq}';
-    symC.text = '${n.sym}';
-    _save(n);
-    toast(context, '${c.name}: ${n.freq} ${n.pol == 0 ? 'H' : 'V'} ${n.sym}');
   }
 
   Widget _drop(String label, List<String> items, int value, void Function(int) on) => DropdownButtonFormField<int>(
@@ -4415,9 +4861,141 @@ class _DishPageState extends State<DishPage> {
     }
   }
 
+  String get _modeText => switch (mode) {
+        DishMode.idle => 'مفيش قياس شغال',
+        DishMode.zap => 'بيغيّر القناة…',
+        DishMode.lock => 'بيقفل على الترددة…',
+        DishMode.finder => 'قياس حقيقي من الريسيفر',
+        DishMode.probe => 'قياس تجريبي (من غير ترددة)',
+        DishMode.tv => 'الإشارة على شاشة التلفزيون',
+      };
+
+  Color get _modeColor => switch (mode) {
+        DishMode.finder => kOk,
+        DishMode.probe || DishMode.zap || DishMode.lock => kGold,
+        DishMode.tv => Colors.lightBlueAccent,
+        DishMode.idle => kMuted,
+      };
+
+  Widget _channelCard() {
+    final c = ch;
+    final recentCh = [
+      for (final k in DishTp.recent)
+        if (widget.channels.where((x) => stbKey(x) == k).firstOrNull case final x? when stbKey(x) != (c == null ? '' : stbKey(c))) x
+    ].take(5).toList();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          if (c == null) ...[
+            const Text('اختار القناة اللي عايز تظبط إشارتها — التطبيق هيحوّل الريسيفر عليها ويبدأ يقيس لوحده.', style: TextStyle(fontSize: 13, color: kMuted)),
+            const SizedBox(height: 10),
+            FilledButton.icon(onPressed: busy ? null : pickChannel, icon: const Icon(Icons.live_tv_rounded), label: const Text('اختار القناة')),
+          ] else
+            Row(children: [
+              Container(
+                width: 46,
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(color: kGold.withValues(alpha: 0.14), borderRadius: BorderRadius.circular(12)),
+                child: Text('${c.index + 1}', style: const TextStyle(fontWeight: FontWeight.w800, color: kGold)),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(c.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700), overflow: TextOverflow.ellipsis),
+                  Text(DishTp.label(DishTp.find(cfg, c)), textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 12, color: kMuted)),
+                ]),
+              ),
+              OutlinedButton(onPressed: busy ? null : pickChannel, child: const Text('غيّر')),
+            ]),
+          if (recentCh.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Wrap(spacing: 6, runSpacing: 6, children: [
+              for (final x in recentCh) ActionChip(avatar: const Icon(Icons.history_rounded, size: 16), label: Text(x.name, style: const TextStyle(fontSize: 12)), onPressed: busy ? null : () => alignOn(x)),
+            ]),
+          ],
+        ]),
+      ),
+    );
+  }
+
+  Widget _signalCard() {
+    final tv = mode == DishMode.tv;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(children: [
+          Row(children: [
+            Container(width: 9, height: 9, decoration: BoxDecoration(color: _modeColor, shape: BoxShape.circle)),
+            const SizedBox(width: 8),
+            Expanded(child: Text(_modeText, style: TextStyle(fontWeight: FontWeight.w700, color: _modeColor))),
+            if (busy) const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+            IconButton(
+              tooltip: 'الصفارة',
+              visualDensity: VisualDensity.compact,
+              onPressed: () {
+                setState(() => sound = !sound);
+                _scheduleBeep();
+              },
+              icon: Icon(sound ? Icons.volume_up_rounded : Icons.volume_off_rounded, color: kGold),
+            ),
+          ]),
+          if (note.isNotEmpty) Align(alignment: AlignmentDirectional.centerStart, child: Text(note, style: const TextStyle(fontSize: 12, color: Colors.white70, height: 1.5))),
+          const SizedBox(height: 10),
+          if (tv)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Column(children: [
+                const Icon(Icons.tv_rounded, size: 64, color: Colors.lightBlueAccent),
+                const SizedBox(height: 8),
+                const Text('بص على شريط الإشارة على التلفزيون وحرّك الطبق', textAlign: TextAlign.center),
+                const SizedBox(height: 10),
+                Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
+                  FilledButton.tonalIcon(onPressed: showOnTv, icon: const Icon(Icons.signal_cellular_alt_rounded), label: const Text('Info تاني')),
+                  if (ch != null) OutlinedButton.icon(onPressed: () => alignOn(ch!, force: true), icon: const Icon(Icons.refresh_rounded), label: const Text('جرّب القياس على الموبايل')),
+                ]),
+              ]),
+            )
+          else ...[
+            Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, crossAxisAlignment: CrossAxisAlignment.end, children: [
+              Gauge(label: 'الجودة', value: sig.quality, color: kOk, size: 176),
+              Gauge(label: 'القوة', value: sig.strength, color: kGold, size: 112),
+            ]),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(child: Text('أعلى جودة: ${peakQ.round()}%  •  أعلى قوة: ${peakS.round()}%', style: const TextStyle(fontSize: 12, color: kGold))),
+              TextButton(onPressed: () => setState(() {
+                    peakQ = 0;
+                    peakS = 0;
+                  }), child: const Text('صفّر')),
+            ]),
+            SizedBox(height: 56, width: double.infinity, child: CustomPaint(painter: SignalSpark(List.of(hist), kOk))),
+          ],
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: busy
+                    ? null
+                    : running
+                        ? () => stop()
+                        : (ch != null ? () => alignOn(ch!) : pickChannel),
+                icon: Icon(running ? Icons.stop_rounded : Icons.play_arrow_rounded),
+                label: Text(running ? 'وقّف القياس' : (ch != null ? 'قيس تاني' : 'اختار قناة وابدأ')),
+              ),
+            ),
+          ]),
+          const SizedBox(height: 6),
+          const Text('حرّك الطبق شوية شوية (يمين/شمال الأول، وبعدين فوق/تحت) واستنى ثانية بعد كل حركة. الصفارة بتسرع كل ما الجودة تعلى.',
+              style: TextStyle(fontSize: 12, color: kMuted)),
+        ]),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final list = q.isEmpty ? <StbChannel>[] : widget.channels.where((c) => c.name.toLowerCase().contains(q.toLowerCase())).take(8).toList();
     final presetIdx = kSatPresets.indexWhere((p) => p.$2 == cfg.angle && p.$3 == cfg.dir);
     final sup = widget.gm.info?.satFinder;
     return ListView(padding: const EdgeInsets.only(bottom: 16), children: [
@@ -4426,113 +5004,74 @@ class _DishPageState extends State<DishPage> {
           color: kBad.withValues(alpha: 0.12),
           child: const Padding(
             padding: EdgeInsets.all(12),
-            child: Text('الريسيفر ده مش معلن إنه بيدعم ضبط الطبق من الموبايل — ممكن ميردش. استخدم زرار Info تحت.', style: TextStyle(fontSize: 12)),
+            child: Text('الريسيفر ده مش معلن إنه بيدعم قياس الإشارة على الموبايل — هنغيّر القناة ونوريك الإشارة على التلفزيون.', style: TextStyle(fontSize: 12)),
           ),
         ),
-      const SectionTitle('١. القمر والترددة', icon: Icons.satellite_alt_rounded),
-      Card(
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            DropdownButtonFormField<int>(
-              initialValue: presetIdx < 0 ? null : presetIdx,
-              isExpanded: true,
-              decoration: const InputDecoration(labelText: 'القمر', isDense: true),
-              hint: Text('${cfg.satName} ${cfg.angle}°${cfg.dir == 0 ? 'E' : 'W'}'),
-              items: [for (var i = 0; i < kSatPresets.length; i++) DropdownMenuItem(value: i, child: Text(kSatPresets[i].$1))],
-              onChanged: running ? null : (i) => i == null ? null : _save(cfg.copyWith(satName: kSatPresets[i].$1, angle: kSatPresets[i].$2, dir: kSatPresets[i].$3)),
-            ),
-            const SizedBox(height: 6),
-            OutlinedButton.icon(onPressed: running ? null : pickFromDb, icon: const Icon(Icons.travel_explore_rounded), label: const Text('اختار قمر وترددة من القاعدة (تجريبي)')),
-            const SizedBox(height: 10),
-            Row(children: [
-              Expanded(child: TextField(controller: freqC, enabled: !running, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'الترددة MHz', hintText: '11013', isDense: true))),
-              const SizedBox(width: 8),
-              Expanded(child: TextField(controller: symC, enabled: !running, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Symbol Rate', isDense: true))),
-            ]),
-            const SizedBox(height: 8),
-            SegmentedButton<int>(
-              showSelectedIcon: false,
-              segments: const [ButtonSegment(value: 0, label: Text('H أفقي')), ButtonSegment(value: 1, label: Text('V رأسي'))],
-              selected: {cfg.pol},
-              onSelectionChanged: running ? null : (v) => _save(cfg.copyWith(pol: v.first)),
-            ),
-            const SizedBox(height: 8),
-            TextField(decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'أو خد الترددة من قناة (اكتب اسمها)', isDense: true), onChanged: (v) => setState(() => q = v)),
-            for (final c in list)
-              ListTile(
-                dense: true,
-                leading: const Icon(Icons.tv_rounded),
-                title: Text(c.name),
-                trailing: const Icon(Icons.download_rounded, size: 18),
-                onTap: () {
-                  fromChannel(c);
-                  setState(() => q = '');
-                },
-              ),
-            ExpansionTile(
-              tilePadding: EdgeInsets.zero,
-              title: const Text('إعدادات الـLNB (سيبها زي ما هي لو مش متأكد)', style: TextStyle(fontSize: 13)),
-              children: [
-                _drop('نوع الـLNB', kLnbTypes, cfg.lnbType, (v) => _save(cfg.copyWith(lnbType: v))),
-                const SizedBox(height: 8),
-                _drop('باور الـLNB', kLnbPowers, cfg.lnbPower, (v) => _save(cfg.copyWith(lnbPower: v))),
-                const SizedBox(height: 8),
-                _drop('22K', k22kModes, cfg.k22, (v) => _save(cfg.copyWith(k22: v))),
-                const SizedBox(height: 8),
-                _drop('DiSEqC 1.0', kDiseqcModes, cfg.diseqc, (v) => _save(cfg.copyWith(diseqc: v))),
-                const SizedBox(height: 8),
-              ],
-            ),
-          ]),
-        ),
-      ),
+      const SectionTitle('١. القناة', icon: Icons.live_tv_rounded),
+      _channelCard(),
       const SectionTitle('٢. الإشارة', icon: Icons.network_check_rounded),
-      Card(
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Column(children: [
-            Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-              Gauge(label: 'القوة', value: sig.strength, color: kGold),
-              Gauge(label: 'الجودة', value: sig.quality, color: kOk),
-            ]),
-            const SizedBox(height: 12),
-            Row(children: [
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: busy ? null : (running ? stop : start),
-                  icon: busy ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : Icon(running ? Icons.stop_rounded : Icons.play_arrow_rounded),
-                  label: Text(busy ? 'بيقفل على الترددة…' : (running ? 'وقّف القياس' : 'ابدأ القياس')),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton.filledTonal(
-                tooltip: 'الصفارة',
-                onPressed: () {
-                  setState(() => sound = !sound);
-                  _scheduleBeep();
-                },
-                icon: Icon(sound ? Icons.volume_up_rounded : Icons.volume_off_rounded),
-              ),
-            ]),
-            const SizedBox(height: 8),
-            const Text('وقت القياس الريسيفر بيسيب القناة ويقفل على الترددة دي. لما توقف بيرجع. الصفارة بتسرع كل ما الجودة تعلى.', style: TextStyle(fontSize: 12, color: kMuted)),
-            if (raw.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(raw, style: const TextStyle(fontSize: 12, color: kMuted))),
-          ]),
-        ),
-      ),
+      _signalCard(),
       const SectionTitle('٣. على شاشة التلفزيون', icon: Icons.tv_rounded),
       Card(
         child: Padding(
           padding: const EdgeInsets.all(12),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            FilledButton.tonalIcon(onPressed: showOnTv, icon: const Icon(Icons.signal_cellular_alt_rounded), label: const Text('زرار Info')),
-            const SizedBox(height: 6),
-            OutlinedButton.icon(onPressed: () => widget.gm.key(K.exit), icon: const Icon(Icons.close_rounded), label: const Text('Exit')),
-            const SizedBox(height: 8),
-            const Text('حرّك الطبق شوية شوية (يمين/شمال الأول، وبعدين فوق/تحت) واستنى ثانية بعد كل حركة.', style: TextStyle(fontSize: 12, color: kMuted)),
+          child: Row(children: [
+            Expanded(child: FilledButton.tonalIcon(onPressed: showOnTv, icon: const Icon(Icons.signal_cellular_alt_rounded), label: const Text('زرار Info'))),
+            const SizedBox(width: 8),
+            Expanded(child: OutlinedButton.icon(onPressed: () => widget.gm.key(K.exit), icon: const Icon(Icons.close_rounded), label: const Text('Exit'))),
           ]),
         ),
+      ),
+      FoldCard(
+        id: 'dish_manual',
+        title: 'يدوي: القمر والترددة والـLNB',
+        subtitle: ch == null ? 'لو عارف الترددة بنفسك' : 'الترددة اللي تكتبها هنا بتتحفظ لـ «${ch!.name}»',
+        icon: Icons.tune_rounded,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          DropdownButtonFormField<int>(
+            initialValue: presetIdx < 0 ? null : presetIdx,
+            isExpanded: true,
+            decoration: const InputDecoration(labelText: 'القمر', isDense: true),
+            hint: Text('${cfg.satName} ${cfg.angle}°${cfg.dir == 0 ? 'E' : 'W'}'),
+            items: [for (var i = 0; i < kSatPresets.length; i++) DropdownMenuItem(value: i, child: Text(kSatPresets[i].$1))],
+            onChanged: running ? null : (i) => i == null ? null : _save(cfg.copyWith(satName: kSatPresets[i].$1, angle: kSatPresets[i].$2, dir: kSatPresets[i].$3)),
+          ),
+          const SizedBox(height: 6),
+          OutlinedButton.icon(onPressed: running ? null : pickFromDb, icon: const Icon(Icons.travel_explore_rounded), label: const Text('اختار قمر وترددة من القاعدة (تجريبي)')),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: TextField(controller: freqC, enabled: !running, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'الترددة MHz', hintText: '11013', isDense: true))),
+            const SizedBox(width: 8),
+            Expanded(child: TextField(controller: symC, enabled: !running, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Symbol Rate', isDense: true))),
+          ]),
+          const SizedBox(height: 8),
+          SegmentedButton<int>(
+            showSelectedIcon: false,
+            segments: const [ButtonSegment(value: 0, label: Text('H أفقي')), ButtonSegment(value: 1, label: Text('V رأسي'))],
+            selected: {cfg.pol},
+            onSelectionChanged: running ? null : (v) => _save(cfg.copyWith(pol: v.first)),
+          ),
+          ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            title: const Text('إعدادات الـLNB (سيبها زي ما هي لو مش متأكد)', style: TextStyle(fontSize: 13)),
+            children: [
+              _drop('نوع الـLNB', kLnbTypes, cfg.lnbType, (v) => _save(cfg.copyWith(lnbType: v))),
+              const SizedBox(height: 8),
+              _drop('باور الـLNB', kLnbPowers, cfg.lnbPower, (v) => _save(cfg.copyWith(lnbPower: v))),
+              const SizedBox(height: 8),
+              _drop('22K', k22kModes, cfg.k22, (v) => _save(cfg.copyWith(k22: v))),
+              const SizedBox(height: 8),
+              _drop('DiSEqC 1.0', kDiseqcModes, cfg.diseqc, (v) => _save(cfg.copyWith(diseqc: v))),
+              const SizedBox(height: 8),
+            ],
+          ),
+          const SizedBox(height: 6),
+          FilledButton.icon(
+            onPressed: busy ? null : (running ? () => stop() : start),
+            icon: Icon(running ? Icons.stop_rounded : Icons.play_arrow_rounded),
+            label: Text(running ? 'وقّف القياس' : 'قيس على الترددة دي'),
+          ),
+        ]),
       ),
     ]);
   }
@@ -9105,6 +9644,7 @@ class Native4 {
       if (c.method == 'openChannel') await openChannel('${c.arguments}');
       if (c.method == 'notifKey') await notifKey((c.arguments as num).toInt());
       if (c.method == 'shareIn') await ShareIn.handle('${c.arguments}');
+      if (c.method == 'pipChanged') kPip.value = c.arguments == true;
       return null;
     });
   }
@@ -11158,45 +11698,73 @@ class _PcMousePadState extends State<PcMousePad> {
           _k('↑', () => key('up')),
           _k('↓', () => key('down')),
           _k('→', () => key('right')),
-          _k('Win', () => key('win')),
-          _k('Alt+Tab', () => key('tab', ['alt'])),
-          _k('Ctrl+C', () => key('c', ['ctrl'])),
-          _k('Ctrl+V', () => key('v', ['ctrl'])),
-          _k('Ctrl+Z', () => key('z', ['ctrl'])),
-          _k('Space', () => key('space')),
-          _k('F5', () => key('f5')),
-          _k('F11', () => key('f11')),
-          _k('Alt+F4', () => key('f4', ['alt'])),
         ]),
       ),
-      const SectionTitle('صوت وميديا', icon: Icons.music_note_rounded),
-      Directionality(
-        textDirection: TextDirection.ltr,
-        child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-          for (final e in const [
-            ('prev', Icons.skip_previous_rounded),
-            ('play', Icons.play_arrow_rounded),
-            ('next', Icons.skip_next_rounded),
-            ('voldown', Icons.volume_down_rounded),
-            ('volup', Icons.volume_up_rounded),
-            ('mute', Icons.volume_off_rounded),
-          ])
-            IconButton.filledTonal(icon: Icon(e.$2), onPressed: () => b.cmd({'t': 'media', 'k': e.$1})),
-        ]),
-      ),
-      const SectionTitle('الكمبيوتر', icon: Icons.power_settings_new_rounded),
-      Wrap(spacing: 8, runSpacing: 8, children: [
-        OutlinedButton.icon(onPressed: () => power('lock', 'قفل'), icon: const Icon(Icons.lock_rounded), label: const Text('قفل')),
-        OutlinedButton.icon(onPressed: () => power('sleep', 'نوّم'), icon: const Icon(Icons.bedtime_rounded), label: const Text('سليب')),
-        OutlinedButton.icon(onPressed: () => power('restart', 'ريستارت'), icon: const Icon(Icons.restart_alt_rounded), label: const Text('ريستارت')),
-        OutlinedButton.icon(
-          onPressed: () => power('shutdown', 'اطفي'),
-          icon: const Icon(Icons.power_settings_new_rounded, color: kBad),
-          label: const Text('اطفي', style: TextStyle(color: kBad)),
+      const SizedBox(height: 6),
+      // v6: الباقي في كروت بتتقفل وتتفتح علشان الشاشة متبقاش زحمة
+      FoldCard(
+        id: 'pc_keys',
+        title: 'مفاتيح أكتر',
+        subtitle: 'Win • Alt+Tab • Ctrl+C/V/Z • F5 • F11 • Alt+F4',
+        icon: Icons.keyboard_rounded,
+        child: Directionality(
+          textDirection: TextDirection.ltr,
+          child: Wrap(children: [
+            _k('Win', () => key('win')),
+            _k('Alt+Tab', () => key('tab', ['alt'])),
+            _k('Ctrl+C', () => key('c', ['ctrl'])),
+            _k('Ctrl+V', () => key('v', ['ctrl'])),
+            _k('Ctrl+Z', () => key('z', ['ctrl'])),
+            _k('Space', () => key('space')),
+            _k('F5', () => key('f5')),
+            _k('F11', () => key('f11')),
+            _k('Alt+F4', () => key('f4', ['alt'])),
+          ]),
         ),
-        TextButton(onPressed: () => widget.pc.power('cancel').catchError(widget.onErr), child: const Text('إلغاء الإطفاء')),
-      ]),
-      PcExtras(pc: widget.pc, onErr: widget.onErr),
+      ),
+      FoldCard(
+        id: 'pc_media',
+        title: 'صوت وميديا',
+        icon: Icons.music_note_rounded,
+        child: Directionality(
+          textDirection: TextDirection.ltr,
+          child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+            for (final e in const [
+              ('prev', Icons.skip_previous_rounded),
+              ('play', Icons.play_arrow_rounded),
+              ('next', Icons.skip_next_rounded),
+              ('voldown', Icons.volume_down_rounded),
+              ('volup', Icons.volume_up_rounded),
+              ('mute', Icons.volume_off_rounded),
+            ])
+              IconButton.filledTonal(icon: Icon(e.$2), onPressed: () => b.cmd({'t': 'media', 'k': e.$1})),
+          ]),
+        ),
+      ),
+      FoldCard(
+        id: 'pc_power',
+        title: 'تشغيل وإطفاء الكمبيوتر',
+        subtitle: 'قفل • سليب • ريستارت • اطفي',
+        icon: Icons.power_settings_new_rounded,
+        child: Wrap(spacing: 8, runSpacing: 8, children: [
+          OutlinedButton.icon(onPressed: () => power('lock', 'قفل'), icon: const Icon(Icons.lock_rounded), label: const Text('قفل')),
+          OutlinedButton.icon(onPressed: () => power('sleep', 'نوّم'), icon: const Icon(Icons.bedtime_rounded), label: const Text('سليب')),
+          OutlinedButton.icon(onPressed: () => power('restart', 'ريستارت'), icon: const Icon(Icons.restart_alt_rounded), label: const Text('ريستارت')),
+          OutlinedButton.icon(
+            onPressed: () => power('shutdown', 'اطفي'),
+            icon: const Icon(Icons.power_settings_new_rounded, color: kBad),
+            label: const Text('اطفي', style: TextStyle(color: kBad)),
+          ),
+          TextButton(onPressed: () => widget.pc.power('cancel').catchError(widget.onErr), child: const Text('إلغاء الإطفاء')),
+        ]),
+      ),
+      FoldCard(
+        id: 'pc_extras',
+        title: 'إضافات',
+        subtitle: 'الحافظة • فتح رابط • العرض • البرامج • المعلومات • مؤقت الإطفاء',
+        icon: Icons.extension_rounded,
+        child: PcExtras(pc: widget.pc, onErr: widget.onErr),
+      ),
     ]);
   }
 }
@@ -14815,7 +15383,6 @@ class PcExtras extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      const SectionTitle('إضافات', icon: Icons.extension_rounded),
       Wrap(spacing: 8, runSpacing: 8, children: [
         OutlinedButton.icon(
           icon: const Icon(Icons.content_paste_go_rounded),
@@ -16875,11 +17442,77 @@ String stbPlayerError(String raw) {
   return 'القناة مشتغلتش — جرّب تاني أو «مشغل خارجي» من ⋮';
 }
 
+/// v6: أوامر أندرويد للمشغل (صورة جوه صورة + الإضاءة) — من MainActivity في build.yml
+final ValueNotifier<bool> kPip = ValueNotifier<bool>(false);
+
+class PlayerNative {
+  static const _ch = MethodChannel('a2r/native');
+  static Future<bool> pip(int w, int h) async {
+    try {
+      return await _ch.invokeMethod<bool>('pip', {'w': w, 'h': h}) == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 0..1 ، أو -1 = إضاءة الموبايل العادية
+  static Future<bool> brightness(double v) async {
+    try {
+      return await _ch.invokeMethod<bool>('brightness', {'v': v}) == true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+/// قراية من Store من غير ما تقع لو لسه متجهزش (الاختبارات)
+T? _spGet<T>(T? Function() f) {
+  try {
+    return f();
+  } catch (_) {
+    return null;
+  }
+}
+
+/// شكل الصورة في المشغل
+const kAspectModes = ['ملائم', 'ملء الشاشة', '16:9', '4:3'];
+const kZoomSteps = [1.0, 1.15, 1.3, 1.5];
+
+/// القناة اللي رقمها n في القايمة (رقم الريسيفر = index+1) — null لو مش موجودة
+int? playerIndexOfNumber(List<StbChannel> list, int n) {
+  final i = list.indexWhere((c) => c.index + 1 == n);
+  return i < 0 ? null : i;
+}
+
+/// الفلتر بتاع قايمة القنوات جوه المشغل: all / fav / recent / group:<name>
+List<int> playerFilter(List<StbChannel> list, String tab, String q, {Set<String> favs = const {}, List<String> recentKeys = const []}) {
+  bool hit(StbChannel c) => q.isEmpty || c.name.toLowerCase().contains(q.toLowerCase()) || '${c.index + 1}' == q;
+  if (tab == 'recent') {
+    return [
+      for (final k in recentKeys)
+        for (var i = 0; i < list.length; i++)
+          if (stbKey(list[i]) == k && hit(list[i])) i
+    ];
+  }
+  return [
+    for (var i = 0; i < list.length; i++)
+      if (hit(list[i]) &&
+          (tab == 'all' ||
+              (tab == 'fav' && (favs.contains(list[i].id) || list[i].fav)) ||
+              (tab.startsWith('group:') && StbPrefs.groupHas(tab.substring(6), list[i]))))
+        i
+  ];
+}
+
+/// الاستال: البث "شغال" بس الوقت مش بيتحرك — لازم نعيد الاتصال
+bool playerStalled({required bool playing, required Duration pos, required Duration lastPos, required int sameForMs}) => playing && pos == lastPos && sameForMs >= 10000;
+
 class StbPlayerPage extends StatefulWidget {
   final GmClient gm;
   final List<StbChannel> list;
   final int index;
-  const StbPlayerPage({super.key, required this.gm, required this.list, required this.index});
+  final bool demo; // للصور التوضيحية بس: من غير اتصال
+  const StbPlayerPage({super.key, required this.gm, required this.list, required this.index, this.demo = false});
   @override
   State<StbPlayerPage> createState() => _StbPlayerPageState();
 }
@@ -16888,47 +17521,82 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   VideoPlayerController? vc;
   late int idx = widget.index;
   String? err, url;
-  bool loading = true, overlay = true, full = false, noPicture = false;
-  double vol = 1;
-  int retries = 0, _gen = 0;
-  Timer? _hide;
+  bool loading = true, overlay = true, full = false, noPicture = false, rotLock = false, listOpen = false;
+  double vol = _spGet(() => Store.p.getDouble('player_vol')) ?? 1, bright = -1;
+  bool _dimOnly = false;
+  int retries = 0, _gen = 0, aspect = _spGet(() => Store.p.getInt('player_aspect')) ?? 0, zoom = 0;
+  Timer? _hide, _watch, _hud;
+  String hud = '';
+  Duration _lastPos = Duration.zero;
+  int _sameMs = 0, _goodMs = 0;
+  String listTab = 'all', listQ = '';
+  double? _dragStartX;
+  double _dragAcc = 0;
 
   StbChannel get ch => widget.list[idx];
 
   @override
   void initState() {
     super.initState();
-    _open();
+    kPip.addListener(_onPip);
+    _watch = Timer.periodic(const Duration(seconds: 2), (_) => _watchdog());
+    if (widget.demo) {
+      loading = false;
+    } else {
+      _open();
+    }
   }
 
   @override
   void dispose() {
+    kPip.removeListener(_onPip);
     _hide?.cancel();
+    _watch?.cancel();
+    _hud?.cancel();
     final c = vc;
     vc = null;
     c?.removeListener(_onTick);
     c?.dispose();
-    widget.gm.stopStream().catchError((_) {});
-    if (full) _setFull(false);
+    if (!widget.demo) widget.gm.stopStream().catchError((_) {});
+    if (bright >= 0) PlayerNative.brightness(-1);
+    if (full || rotLock) {
+      SystemChrome.setPreferredOrientations(const []);
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
     super.dispose();
+  }
+
+  void _onPip() {
+    if (mounted) setState(() => overlay = !kPip.value);
   }
 
   void _poke() {
     _hide?.cancel();
     if (!overlay) setState(() => overlay = true);
     _hide = Timer(const Duration(seconds: 4), () {
-      if (mounted && vc?.value.isPlaying == true) setState(() => overlay = false);
+      if (mounted && vc?.value.isPlaying == true && !listOpen) setState(() => overlay = false);
+    });
+  }
+
+  void _showHud(String t) {
+    _hud?.cancel();
+    setState(() => hud = t);
+    _hud = Timer(const Duration(milliseconds: 900), () {
+      if (mounted) setState(() => hud = '');
     });
   }
 
   Future<void> _open({bool retry = false}) async {
     final gen = ++_gen;
     if (!retry) retries = 0;
+    _sameMs = 0;
+    _goodMs = 0;
     setState(() {
       loading = true;
       err = null;
       noPicture = false;
     });
+    _spGet(() => Store.p.setString('stb_last_play', jsonEncode({'id': ch.id, 'n': ch.name, 'r': ch.radio})));
     final old = vc;
     vc = null;
     old?.removeListener(_onTick);
@@ -16970,25 +17638,50 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     }
   }
 
+  void _retryLater(String why) {
+    final c = vc;
+    c?.removeListener(_onTick);
+    if (retries < 3) {
+      retries++;
+      setState(() => err = '$why — بعيد الاتصال ($retries/3)...');
+      Future.delayed(const Duration(seconds: 2), () {
+        if (mounted) _open(retry: true);
+      });
+    } else {
+      setState(() => err = stbPlayerError(why));
+    }
+  }
+
   void _onTick() {
     final c = vc;
     if (c == null || !mounted) return;
     if (c.value.hasError) {
       final d = c.value.errorDescription ?? '';
       AppLog.add('PLAYER', 'وقف: $d');
-      c.removeListener(_onTick);
-      if (retries < 3) {
-        retries++;
-        setState(() => err = 'البث وقف — بعيد الاتصال ($retries/3)...');
-        Future.delayed(const Duration(seconds: 2), () {
-          if (mounted) _open(retry: true);
-        });
-      } else {
-        setState(() => err = stbPlayerError(d));
-      }
+      _retryLater('البث وقف');
       return;
     }
     setState(() {});
+  }
+
+  /// كل 2 ثانية: لو البث واقف (الوقت مش بيتحرك 10 ثواني) نعيد الاتصال
+  void _watchdog() {
+    final c = vc;
+    if (c == null || !mounted || loading || err != null) return;
+    final pos = c.value.position, prev = _lastPos;
+    if (pos == prev) {
+      _sameMs += 2000;
+    } else {
+      _sameMs = 0;
+      _goodMs += 2000;
+      if (_goodMs >= 30000) retries = 0; // اشتغل كويس 30 ثانية → نرجّع العداد
+    }
+    _lastPos = pos;
+    if (playerStalled(playing: c.value.isPlaying, pos: pos, lastPos: prev, sameForMs: _sameMs)) {
+      AppLog.add('PLAYER', 'البث علّق ${_sameMs ~/ 1000} ثانية — بعيد');
+      _sameMs = 0;
+      _retryLater('البث علّق');
+    }
   }
 
   void _step(int d) {
@@ -16996,6 +17689,13 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     HapticFeedback.selectionClick();
     idx = (idx + d) % widget.list.length;
     if (idx < 0) idx += widget.list.length;
+    _showHud('${ch.index + 1}  ${ch.name}');
+    _open();
+  }
+
+  void _goTo(int i) {
+    idx = i;
+    _showHud('${ch.index + 1}  ${ch.name}');
     _open();
   }
 
@@ -17005,8 +17705,21 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
       await SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     } else {
-      await SystemChrome.setPreferredOrientations(const []);
+      await SystemChrome.setPreferredOrientations(rotLock ? [DeviceOrientation.portraitUp] : const []);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _toggleRotLock() async {
+    rotLock = !rotLock;
+    if (rotLock) {
+      final land = MediaQuery.of(context).orientation == Orientation.landscape;
+      await SystemChrome.setPreferredOrientations(land ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight] : [DeviceOrientation.portraitUp]);
+      _showHud(land ? 'الشاشة اتقفلت بالعرض' : 'الشاشة اتقفلت بالطول');
+    } else {
+      await SystemChrome.setPreferredOrientations(full ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight] : const []);
+      _showHud('اللف رجع عادي');
     }
     if (mounted) setState(() {});
   }
@@ -17021,57 +17734,184 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     }
   }
 
-  void _pickList() {
-    var q = '';
-    showModalBottomSheet(
+  Future<void> _pip() async {
+    final s = vc?.value.size ?? Size.zero;
+    final ok = await PlayerNative.pip(s.width > 0 ? s.width.round() : 16, s.height > 0 ? s.height.round() : 9);
+    if (!ok && mounted) toast(context, 'الموبايل ده مش بيدعم صورة جوه صورة (محتاج أندرويد 8+)');
+  }
+
+  Future<void> _numberEntry() async {
+    final t = await askText(context, 'رقم القناة', type: TextInputType.number, hint: 'مثلاً 25');
+    final n = int.tryParse(t?.trim() ?? '');
+    if (n == null || !mounted) return;
+    final i = playerIndexOfNumber(widget.list, n);
+    if (i == null) {
+      toast(context, 'مفيش قناة رقم $n في القايمة دي');
+      return;
+    }
+    _goTo(i);
+  }
+
+  Future<void> _audioTracks() async {
+    final c = vc;
+    if (c == null) return;
+    if (!c.isAudioTrackSupportAvailable()) {
+      toast(context, 'المشغل مش بيدعم اختيار الصوت على الموبايل ده');
+      return;
+    }
+    final tracks = await c.getAudioTracks();
+    if (!mounted) return;
+    if (tracks.length < 2) {
+      toast(context, tracks.isEmpty ? 'القناة مش باعتة معلومات الصوت' : 'القناة دي فيها صوت واحد بس');
+      return;
+    }
+    final id = await showModalBottomSheet<String>(
       context: context,
       backgroundColor: kSurface,
       showDragHandle: true,
-      isScrollControlled: true,
-      builder: (c) => StatefulBuilder(
-        builder: (c, set) {
-          final shown = [
-            for (var i = 0; i < widget.list.length; i++)
-              if (q.isEmpty || widget.list[i].name.toLowerCase().contains(q.toLowerCase()) || '${widget.list[i].index + 1}' == q) i
-          ];
-          return SizedBox(
-            height: MediaQuery.of(c).size.height * 0.7,
-            child: Column(children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                child: TextField(
-                  decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'دوّر على قناة'),
-                  onChanged: (v) => set(() => q = v.trim()),
-                ),
-              ),
-              Expanded(
-                child: ListView.builder(
-                  itemCount: shown.length,
-                  itemBuilder: (_, j) {
-                    final i = shown[j];
-                    return ListTile(
-                      selected: i == idx,
-                      selectedColor: kGold,
-                      leading: Text('${widget.list[i].index + 1}', style: const TextStyle(color: kMuted)),
-                      title: Text(widget.list[i].name),
-                      onTap: () {
-                        Navigator.pop(c);
-                        idx = i;
-                        _open();
-                      },
-                    );
-                  },
-                ),
-              ),
+      builder: (s) => SafeArea(
+        child: ListView(shrinkWrap: true, children: [
+          const ListTile(title: Text('الصوت / اللغة', style: TextStyle(fontWeight: FontWeight.w700))),
+          for (var i = 0; i < tracks.length; i++)
+            ListTile(
+              leading: Icon(tracks[i].isSelected ? Icons.radio_button_checked_rounded : Icons.radio_button_off_rounded, color: kGold),
+              title: Text([tracks[i].label, tracks[i].language].whereType<String>().where((x) => x.isNotEmpty).join(' • ').ifEmpty('صوت ${i + 1}')),
+              subtitle: tracks[i].channelCount == null ? null : Text('${tracks[i].channelCount} قنوات صوت${tracks[i].codec == null ? '' : ' • ${tracks[i].codec}'}'),
+              onTap: () => Navigator.pop(s, tracks[i].id),
+            ),
+        ]),
+      ),
+    );
+    if (id != null) await c.selectAudioTrack(id);
+  }
+
+  Future<void> _setBright(double v) async {
+    bright = v.clamp(0.02, 1.0);
+    final ok = await PlayerNative.brightness(bright);
+    if (mounted) setState(() => _dimOnly = !ok);
+  }
+
+  // ---------- السحب: يمين = الصوت • شمال = الإضاءة • النص = القناة ----------
+  void _vStart(DragStartDetails d) {
+    _dragStartX = d.localPosition.dx;
+    _dragAcc = 0;
+  }
+
+  void _vUpdate(DragUpdateDetails d, double w, double h) {
+    final x = _dragStartX ?? w / 2;
+    final dv = -d.delta.dy / (h * 0.7);
+    if (x > w * 0.62) {
+      vol = (vol + dv).clamp(0.0, 1.0);
+      vc?.setVolume(vol);
+      _showHud('الصوت ${(vol * 100).round()}%');
+    } else if (x < w * 0.38) {
+      final b = ((bright < 0 ? 0.5 : bright) + dv).clamp(0.02, 1.0);
+      _setBright(b);
+      _showHud('الإضاءة ${(b * 100).round()}%');
+    } else {
+      _dragAcc += d.delta.dy;
+    }
+  }
+
+  void _vEnd(DragEndDetails d, double w) {
+    final x = _dragStartX ?? w / 2;
+    if (x > w * 0.62) Store.p.setDouble('player_vol', vol);
+    if (x >= w * 0.38 && x <= w * 0.62 && (_dragAcc.abs() > 60 || (d.primaryVelocity ?? 0).abs() > 500)) {
+      _step(_dragAcc < 0 ? 1 : -1); // لفوق = القناة اللي بعدها
+    }
+    _dragStartX = null;
+  }
+
+  Widget _video(VideoPlayerController c, Size box) {
+    final ar = c.value.aspectRatio == 0 ? 16 / 9 : c.value.aspectRatio;
+    Widget v = VideoPlayer(c);
+    switch (aspect) {
+      case 1:
+        v = SizedBox.expand(child: FittedBox(fit: BoxFit.cover, clipBehavior: Clip.hardEdge, child: SizedBox(width: c.value.size.width > 0 ? c.value.size.width : 1600, height: c.value.size.height > 0 ? c.value.size.height : 900, child: v)));
+      case 2:
+        v = AspectRatio(aspectRatio: 16 / 9, child: v);
+      case 3:
+        v = AspectRatio(aspectRatio: 4 / 3, child: v);
+      default:
+        v = AspectRatio(aspectRatio: ar, child: v);
+    }
+    final z = kZoomSteps[zoom];
+    return ClipRect(child: Transform.scale(scale: z, child: Center(child: v)));
+  }
+
+  // ---------- قايمة القنوات جوه المشغل ----------
+  Widget _listPanel(double w) {
+    final favs = (_spGet(() => Store.p.getStringList('stb_favs')) ?? []).toSet();
+    final recent = [for (final r in _spGet(() => StbPrefs.recent) ?? const <({String id, String name, bool radio})>[]) '${r.radio ? 1 : 0}:${r.id}'];
+    final shown = playerFilter(widget.list, listTab, listQ, favs: favs, recentKeys: recent);
+    final tabs = <(String, String)>[('all', 'الكل'), ('fav', 'المفضلة'), ('recent', 'آخر قنوات'), for (final g in _spGet(() => StbPrefs.groups) ?? const <StbGroup>[]) ('group:${g.name}', g.name)];
+    return Positioned(
+      top: 0,
+      bottom: 0,
+      right: 0,
+      width: min(w * 0.86, 380),
+      child: Material(
+        color: const Color(0xEE101317),
+        child: SafeArea(
+          left: false,
+          child: Column(children: [
+            Row(children: [
+              const SizedBox(width: 12),
+              Expanded(child: Text('القنوات (${widget.list.length})', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700))),
+              IconButton(icon: const Icon(Icons.close_rounded, color: Colors.white), onPressed: () => setState(() => listOpen = false)),
             ]),
-          );
-        },
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: TextField(
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'دوّر بالاسم أو الرقم', isDense: true),
+                onChanged: (v) => setState(() => listQ = v.trim()),
+              ),
+            ),
+            SizedBox(
+              height: 44,
+              child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4), children: [
+                for (final t in tabs)
+                  Padding(
+                    padding: const EdgeInsetsDirectional.only(end: 6),
+                    child: ChoiceChip(label: Text(t.$2, style: const TextStyle(fontSize: 12)), selected: listTab == t.$1, showCheckmark: false, onSelected: (_) => setState(() => listTab = t.$1)),
+                  ),
+              ]),
+            ),
+            Expanded(
+              child: shown.isEmpty
+                  ? const Center(child: Text('مفيش قنوات هنا', style: TextStyle(color: kMuted)))
+                  : ListView.builder(
+                      itemCount: shown.length,
+                      itemBuilder: (_, j) {
+                        final i = shown[j];
+                        final c = widget.list[i];
+                        return ListTile(
+                          dense: true,
+                          selected: i == idx,
+                          selectedColor: kGold,
+                          textColor: Colors.white,
+                          leading: SizedBox(width: 40, child: Text('${c.index + 1}', style: const TextStyle(color: kMuted))),
+                          title: Text(c.name, overflow: TextOverflow.ellipsis),
+                          trailing: (favs.contains(c.id) || c.fav) ? const Icon(Icons.star_rounded, size: 16, color: kGold) : null,
+                          onTap: () {
+                            setState(() => listOpen = false);
+                            _goTo(i);
+                          },
+                        );
+                      },
+                    ),
+            ),
+          ]),
+        ),
       ),
     );
   }
 
-  Widget _btn(IconData i, String tip, VoidCallback on, {double size = 30}) =>
-      IconButton(icon: Icon(i, size: size, color: Colors.white), tooltip: tip, onPressed: () {
+  Widget _btn(IconData i, String tip, VoidCallback on, {double size = 30}) => IconButton(
+      icon: Icon(i, size: size, color: Colors.white),
+      tooltip: tip,
+      onPressed: () {
         on();
         _poke();
       });
@@ -17080,126 +17920,213 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   Widget build(BuildContext context) {
     final c = vc;
     final playing = c?.value.isPlaying == true;
+    final buffering = c != null && c.value.isBuffering && !loading && err == null;
+    final pip = kPip.value;
     return PopScope(
-      canPop: !full,
+      canPop: !full && !listOpen,
       onPopInvokedWithResult: (did, _) {
-        if (!did && full) _setFull(false);
+        if (did) return;
+        if (listOpen) {
+          setState(() => listOpen = false);
+        } else if (full) {
+          _setFull(false);
+        }
       },
       child: Scaffold(
         backgroundColor: Colors.black,
         body: SafeArea(
-          top: !full,
-          bottom: !full,
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => overlay ? setState(() => overlay = false) : _poke(),
-            onHorizontalDragEnd: (d) {
-              final v = d.primaryVelocity ?? 0;
-              if (v.abs() > 400) _step(v < 0 ? 1 : -1);
-            },
-            child: Stack(children: [
-              Center(
-                child: c != null && c.value.isInitialized && !noPicture
-                    ? AspectRatio(aspectRatio: c.value.aspectRatio == 0 ? 16 / 9 : c.value.aspectRatio, child: VideoPlayer(c))
-                    : (noPicture
-                        ? const Padding(
-                            padding: EdgeInsets.all(24),
-                            child: Text('الصوت شغال بس الموبايل مش بيعرف يعرض صورة القناة دي — جرّب «مشغل خارجي» من ⋮',
-                                textAlign: TextAlign.center, style: TextStyle(color: kMuted)),
-                          )
-                        : null),
-              ),
-              if (loading) const Center(child: CircularProgressIndicator(color: kGold)),
-              if (err != null && !loading)
-                Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
+          top: !full && !pip,
+          bottom: !full && !pip,
+          child: LayoutBuilder(builder: (context, box) {
+            final w = box.maxWidth, h = box.maxHeight;
+            return GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => overlay ? setState(() => overlay = false) : _poke(),
+              onHorizontalDragEnd: (d) {
+                final v = d.primaryVelocity ?? 0;
+                if (v.abs() > 400) _step(v < 0 ? 1 : -1);
+              },
+              onVerticalDragStart: _vStart,
+              onVerticalDragUpdate: (d) => _vUpdate(d, w, h),
+              onVerticalDragEnd: (d) => _vEnd(d, w),
+              child: Stack(children: [
+                Positioned.fill(
+                  child: Center(
+                    child: c != null && c.value.isInitialized && !noPicture
+                        ? _video(c, Size(w, h))
+                        : (noPicture
+                            ? const Padding(
+                                padding: EdgeInsets.all(24),
+                                child: Text('الصوت شغال بس الموبايل مش بيعرف يعرض صورة القناة دي — جرّب «مشغل خارجي» من ⋮', textAlign: TextAlign.center, style: TextStyle(color: kMuted)),
+                              )
+                            : widget.demo
+                                ? Container(
+                                    decoration: const BoxDecoration(gradient: LinearGradient(colors: [Color(0xFF1B2735), Color(0xFF090A0F)], begin: Alignment.topLeft, end: Alignment.bottomRight)),
+                                    alignment: Alignment.center,
+                                    child: const Icon(Icons.live_tv_rounded, size: 80, color: Colors.white12),
+                                  )
+                                : null),
+                  ),
+                ),
+                if (_dimOnly && bright >= 0) Positioned.fill(child: IgnorePointer(child: Container(color: Colors.black.withValues(alpha: (1 - bright) * 0.7)))),
+                if (loading || buffering)
+                  Center(
                     child: Column(mainAxisSize: MainAxisSize.min, children: [
-                      const Icon(Icons.error_outline_rounded, color: kBad, size: 40),
-                      const SizedBox(height: 8),
-                      Text(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white)),
-                      const SizedBox(height: 12),
-                      Wrap(spacing: 8, children: [
-                        FilledButton.icon(onPressed: () => _open(), icon: const Icon(Icons.refresh_rounded), label: const Text('جرّب تاني')),
-                        if (url != null) OutlinedButton.icon(onPressed: _external, icon: const Icon(Icons.open_in_new_rounded), label: const Text('مشغل خارجي')),
-                      ]),
+                      const CircularProgressIndicator(color: kGold),
+                      const SizedBox(height: 10),
+                      Text(loading ? 'بيفتح ${ch.name}…' : 'بيحمّل…', style: const TextStyle(color: Colors.white70)),
                     ]),
                   ),
-                ),
-              if (overlay) ...[
-                Positioned(
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  child: Container(
-                    color: Colors.black54,
-                    child: Row(children: [
-                      _btn(Icons.arrow_back_rounded, 'رجوع', () => full ? _setFull(false) : Navigator.pop(context), size: 26),
-                      Expanded(
-                        child: Text('${ch.index + 1}  ${ch.name}',
-                            maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
-                      ),
-                      PopupMenuButton<String>(
-                        icon: const Icon(Icons.more_vert_rounded, color: Colors.white),
-                        onSelected: (v) async {
-                          if (v == 'ext') await _external();
-                          if (v == 'tv') {
-                            await widget.gm.zap(ch).catchError((_) {});
-                            if (context.mounted) toast(context, 'اتشغلت على التلفزيون');
-                          }
-                          if (v == 'copy' && url != null) {
-                            await Clipboard.setData(ClipboardData(text: url!));
-                            if (context.mounted) toast(context, 'الرابط اتنسخ');
-                          }
-                        },
-                        itemBuilder: (_) => const [
-                          PopupMenuItem(value: 'ext', child: Text('مشغل خارجي (VLC...)')),
-                          PopupMenuItem(value: 'tv', child: Text('شغّلها على التلفزيون كمان')),
-                          PopupMenuItem(value: 'copy', child: Text('انسخ رابط البث')),
-                        ],
-                      ),
-                    ]),
+                if (hud.isNotEmpty)
+                  Align(
+                    alignment: const Alignment(0, -0.35),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                      decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(14)),
+                      child: Text(hud, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700)),
+                    ),
                   ),
-                ),
-                Positioned(
-                  bottom: 0,
-                  left: 0,
-                  right: 0,
-                  child: Container(
-                    color: Colors.black54,
-                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                    child: Directionality(
-                      textDirection: TextDirection.ltr,
-                      child: Row(children: [
-                        _btn(Icons.skip_previous_rounded, 'القناة اللي قبلها', () => _step(-1)),
-                        _btn(playing ? Icons.pause_rounded : Icons.play_arrow_rounded, playing ? 'وقف' : 'شغّل', () {
-                          if (c == null) return;
-                          playing ? c.pause() : c.play();
-                        }, size: 36),
-                        _btn(Icons.skip_next_rounded, 'القناة اللي بعدها', () => _step(1)),
-                        Icon(vol == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded, color: Colors.white, size: 20),
-                        Expanded(
-                          child: Slider(
-                            value: vol,
-                            activeColor: kGold,
-                            onChanged: (v) {
-                              setState(() => vol = v);
-                              c?.setVolume(v);
-                              _poke();
-                            },
-                          ),
-                        ),
-                        _btn(Icons.list_rounded, 'القنوات', _pickList, size: 26),
-                        _btn(full ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded, 'ملء الشاشة', () => _setFull(!full), size: 28),
+                if (err != null && !loading)
+                  Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        const Icon(Icons.error_outline_rounded, color: kBad, size: 40),
+                        const SizedBox(height: 8),
+                        Text(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white)),
+                        const SizedBox(height: 12),
+                        Wrap(spacing: 8, children: [
+                          FilledButton.icon(onPressed: () => _open(), icon: const Icon(Icons.refresh_rounded), label: const Text('جرّب تاني')),
+                          if (url != null) OutlinedButton.icon(onPressed: _external, icon: const Icon(Icons.open_in_new_rounded), label: const Text('مشغل خارجي')),
+                        ]),
                       ]),
                     ),
                   ),
-                ),
-              ],
-            ]),
-          ),
+                if (overlay && !pip) ...[
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    child: Container(
+                      decoration: const BoxDecoration(gradient: LinearGradient(colors: [Colors.black87, Colors.transparent], begin: Alignment.topCenter, end: Alignment.bottomCenter)),
+                      padding: const EdgeInsets.only(bottom: 18),
+                      child: Row(children: [
+                        _btn(Icons.arrow_back_rounded, 'رجوع', () => full ? _setFull(false) : Navigator.pop(context), size: 26),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(color: kGold, borderRadius: BorderRadius.circular(8)),
+                          child: Text('${ch.index + 1}', style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800)),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(ch.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 16))),
+                        if (ch.hd) const Badge2('HD'),
+                        _btn(Icons.picture_in_picture_alt_rounded, 'صورة جوه صورة', _pip, size: 24),
+                        PopupMenuButton<String>(
+                          icon: const Icon(Icons.more_vert_rounded, color: Colors.white),
+                          onSelected: (v) async {
+                            if (v == 'ext') await _external();
+                            if (v == 'audio') await _audioTracks();
+                            if (v == 'num') await _numberEntry();
+                            if (v == 'zoom') {
+                              setState(() => zoom = (zoom + 1) % kZoomSteps.length);
+                              _showHud('تكبير ×${kZoomSteps[zoom]}');
+                            }
+                            if (v == 'tv') {
+                              await widget.gm.zap(ch).catchError((_) {});
+                              if (context.mounted) toast(context, 'اتشغلت على التلفزيون');
+                            }
+                            if (v == 'copy' && url != null) {
+                              await Clipboard.setData(ClipboardData(text: url!));
+                              if (context.mounted) toast(context, 'الرابط اتنسخ');
+                            }
+                          },
+                          itemBuilder: (_) => [
+                            PopupMenuItem(value: 'zoom', child: Text('تكبير الصورة (دلوقتي ×${kZoomSteps[zoom]})')),
+                            const PopupMenuItem(value: 'audio', child: Text('الصوت / اللغة')),
+                            const PopupMenuItem(value: 'num', child: Text('اكتب رقم القناة')),
+                            const PopupMenuItem(value: 'tv', child: Text('شغّلها على التلفزيون كمان')),
+                            const PopupMenuItem(value: 'ext', child: Text('مشغل خارجي (VLC...)')),
+                            const PopupMenuItem(value: 'copy', child: Text('انسخ رابط البث')),
+                          ],
+                        ),
+                      ]),
+                    ),
+                  ),
+                  // أزرار القناة اللي قبل/بعد على الجنب (زي ريموت)
+                  Positioned(
+                    right: 6,
+                    top: h * 0.3,
+                    child: Column(children: [
+                      _round(Icons.keyboard_arrow_up_rounded, 'القناة اللي بعدها', () => _step(1)),
+                      const SizedBox(height: 10),
+                      _round(Icons.keyboard_arrow_down_rounded, 'القناة اللي قبلها', () => _step(-1)),
+                    ]),
+                  ),
+                  Positioned(
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                    child: Container(
+                      decoration: const BoxDecoration(gradient: LinearGradient(colors: [Colors.transparent, Colors.black87], begin: Alignment.topCenter, end: Alignment.bottomCenter)),
+                      padding: const EdgeInsets.fromLTRB(4, 18, 4, 2),
+                      child: Directionality(
+                        textDirection: TextDirection.ltr,
+                        child: Row(children: [
+                          _btn(Icons.skip_previous_rounded, 'القناة اللي قبلها', () => _step(-1)),
+                          _btn(playing ? Icons.pause_rounded : Icons.play_arrow_rounded, playing ? 'وقف' : 'شغّل', () {
+                            if (c == null) return;
+                            playing ? c.pause() : c.play();
+                          }, size: 36),
+                          _btn(Icons.skip_next_rounded, 'القناة اللي بعدها', () => _step(1)),
+                          Icon(vol == 0 ? Icons.volume_off_rounded : Icons.volume_up_rounded, color: Colors.white, size: 20),
+                          Expanded(
+                            child: Slider(
+                              value: vol,
+                              activeColor: kGold,
+                              onChanged: (v) {
+                                setState(() => vol = v);
+                                c?.setVolume(v);
+                                _poke();
+                              },
+                              onChangeEnd: (v) => Store.p.setDouble('player_vol', v),
+                            ),
+                          ),
+                          _btn(Icons.aspect_ratio_rounded, 'شكل الصورة', () {
+                            setState(() => aspect = (aspect + 1) % kAspectModes.length);
+                            Store.p.setInt('player_aspect', aspect);
+                            _showHud(kAspectModes[aspect]);
+                          }, size: 24),
+                          _btn(rotLock ? Icons.screen_lock_rotation_rounded : Icons.screen_rotation_rounded, rotLock ? 'فك قفل اللف' : 'اقفل اللف', _toggleRotLock, size: 24),
+                          _btn(Icons.format_list_numbered_rounded, 'القنوات', () => setState(() => listOpen = true), size: 26),
+                          _btn(full ? Icons.fullscreen_exit_rounded : Icons.fullscreen_rounded, 'ملء الشاشة', () => _setFull(!full), size: 28),
+                        ]),
+                      ),
+                    ),
+                  ),
+                ],
+                if (listOpen) _listPanel(w),
+              ]),
+            );
+          }),
         ),
       ),
     );
   }
+
+  Widget _round(IconData i, String tip, VoidCallback on) => Material(
+        color: Colors.black54,
+        shape: const CircleBorder(),
+        child: IconButton(
+          tooltip: tip,
+          icon: Icon(i, color: Colors.white, size: 30),
+          onPressed: () {
+            on();
+            _poke();
+          },
+        ),
+      );
+}
+
+extension _StrEmpty on String {
+  String ifEmpty(String d) => isEmpty ? d : this;
 }
