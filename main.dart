@@ -489,6 +489,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
   Map<String, dynamic> st = {};
   final Map<String, LanHost> hosts = {}; // key = ip
   List<String> blockedMacs = [];
+  ZteAcl? acl; // fix19
   bool scanning = false;
   double progress = 0;
   Timer? auto;
@@ -674,7 +675,9 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
         unawaited(NetLog.sample(st, source: 'app'));
         final list = await router!.stations();
         try {
-          blockedMacs = (await router!.blockList()).macs;
+          final a = await router!.readAcl();
+          acl = a;
+          blockedMacs = a.activeBlocked;
         } catch (_) {}
         unawaited(DeviceWatch.update({for (final s in list) s.mac.isNotEmpty ? s.mac : s.ip}));
         unawaited(NewDevAlert.check(list));
@@ -702,8 +705,8 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     if (!quiet || router == null) await scan(silentNotify: before.isEmpty);
     // v5: الأجهزة اللي الراوتر رجّعلها "--" → NetBIOS / mDNS / DNS / المحفوظ
     try {
-      if (Oui.table.isEmpty && !Store.p.containsKey('oui_auto_tried')) {
-        await Store.p.setBool('oui_auto_tried', true);
+      if (Oui.table.isEmpty && !Store.p.containsKey('oui_auto_tried2')) {
+        await Store.p.setBool('oui_auto_tried2', true);
         unawaited(Oui.download().then((_) {
           for (final h in hosts.values) {
             h.vendor = Oui.vendorOf(h.mac);
@@ -815,7 +818,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           child: ListTile(
             leading: const Icon(Icons.wifi_tethering_rounded, color: kGold),
             title: const Text('الأكسس بوينت (TOTOLINK)'),
-            subtitle: Text('${TotoStore.ip}${TotoStore.macs.isEmpty ? '' : ' • ${TotoStore.macs.length} جهاز عليه'}', style: const TextStyle(fontSize: 12)),
+            subtitle: Text('${TotoStore.ip.isEmpty ? 'العنوان لسه متحددش — دوس وهدوّر عليه' : TotoStore.ip}${TotoStore.macs.isEmpty ? '' : ' • ${TotoStore.macs.length} جهاز عليه'}', style: const TextStyle(fontSize: 12)),
             trailing: const Icon(Icons.chevron_left_rounded),
             onTap: () async {
               await Navigator.push(context, MaterialPageRoute(builder: (_) => TotoPage(router: router, hosts: hosts.values.toList(), labelOf: label)));
@@ -882,16 +885,51 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           }),
           _ActTile(icon: Icons.history_rounded, label: const Text('سجل الأجهزة'), onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const HistoryPage()))),
           _ActTile(icon: Icons.business, label: Text(Oui.table.isEmpty ? 'نزّل أسماء الشركات' : 'شركات: ${Oui.table.length}'), onTap: () async {
-              toast(context, 'بنزّل القايمة (حوالي 6 ميجا)…');
+              final prog = ValueNotifier<String>('بجهّز التحميل…');
+              showDialog<void>(
+                context: context,
+                barrierDismissible: false,
+                builder: (_) => AlertDialog(
+                  title: const Text('أسماء الشركات'),
+                  content: ValueListenableBuilder<String>(
+                    valueListenable: prog,
+                    builder: (_, v, __) => Row(children: [
+                      const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2.5)),
+                      const SizedBox(width: 14),
+                      Expanded(child: Text(v)),
+                    ]),
+                  ),
+                ),
+              );
+              var lastPaint = 0;
               try {
-                final n = await Oui.download();
+                final n = await Oui.download(onProgress: (src, got, total) {
+                  final now = DateTime.now().millisecondsSinceEpoch;
+                  if (now - lastPaint < 200) return;
+                  lastPaint = now;
+                  final mb = (got / 1048576).toStringAsFixed(1);
+                  prog.value = total != null && total > 0
+                      ? 'بنزّل من $src… ${(got * 100 ~/ total)}% ($mb ميجا)'
+                      : 'بنزّل من $src… $mb ميجا';
+                });
                 for (final h in hosts.values) {
                   h.vendor = Oui.vendorOf(h.mac);
                 }
-                if (mounted) toast(context, 'تم: $n شركة');
-                setState(() {});
+                if (mounted) Navigator.of(context, rootNavigator: true).pop();
+                if (mounted) toast(context, 'تم: $n شركة (من ${Oui.source})');
+                if (mounted) setState(() {});
               } catch (e) {
-                if (mounted) toast(context, 'فشل: $e');
+                if (mounted) Navigator.of(context, rootNavigator: true).pop();
+                if (!mounted) return;
+                final msg = e is OuiDownloadError ? e.arabic : 'مقدرتش أنزّل القايمة — جرّب تاني\n$e';
+                showDialog<void>(
+                  context: context,
+                  builder: (dctx) => AlertDialog(
+                    title: const Text('أسماء الشركات'),
+                    content: Text(Oui.table.isEmpty ? msg : '$msg\n\nالقايمة القديمة (${Oui.table.length} شركة) لسه شغالة.'),
+                    actions: [TextButton(onPressed: () => Navigator.pop(dctx), child: const Text('تمام'))],
+                  ),
+                );
               }
             },
           ),
@@ -946,6 +984,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
                 PopupMenuItem(value: 'wifi_off', child: Text('قفل الواي فاي (تجريبي)')),
                 PopupMenuItem(value: 'wifi_on', child: Text('فتح الواي فاي (تجريبي)')),
                 PopupMenuItem(value: 'dns', child: Text('DNS الراوتر (تجريبي)')),
+                PopupMenuItem(value: 'acl', child: Text('ابعتلي حالة الحظر (للسجل)')),
                 PopupMenuItem(value: 'signal', child: Text('سجل الإشارة + الانقطاعات')),
                 PopupMenuItem(value: 'place', child: Text('مكان الراوتر (أحسن إشارة)')),
                 PopupMenuItem(value: 'reboot', child: Text('ريستارت الراوتر')),
@@ -968,6 +1007,16 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
             if (g('sms_unread_num').isNotEmpty && g('sms_unread_num') != '0') _kv('رسايل جديدة', g('sms_unread_num')),
           ]),
           if (g('lte_rsrp').isNotEmpty) _signalHint(int.tryParse(g('lte_rsrp')) ?? 0),
+          // fix19: أزرار واضحة للـ DNS والحظر
+          if (router != null) ...[
+            const SizedBox(height: 6),
+            if (acl != null) Text('فلتر الـ MAC (واي فاي الراوتر): ${acl!.kindAr}${acl!.black.isEmpty ? '' : ' • في القايمة السودا ${acl!.black.length}'}', style: const TextStyle(fontSize: 12, color: kMuted)),
+            Wrap(spacing: 8, runSpacing: 4, children: [
+              OutlinedButton.icon(onPressed: () => _routerAction('dns'), icon: const Icon(Icons.dns_rounded, size: 18), label: const Text('DNS الراوتر')),
+              OutlinedButton.icon(onPressed: _openToto, icon: const Icon(Icons.wifi_tethering_rounded, size: 18), label: const Text('DNS/حظر الأكسس')),
+              OutlinedButton.icon(onPressed: () => _routerAction('acl'), icon: const Icon(Icons.bug_report_rounded, size: 18), label: const Text('ابعتلي حالة الحظر')),
+            ]),
+          ],
         ]),
       ),
     );
@@ -1015,6 +1064,8 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           if (mounted) toast(context, 'رد الراوتر: ${res['result']}');
         case 'dns':
           await Navigator.push(context, MaterialPageRoute(builder: (_) => RouterDnsPage(router: r)));
+        case 'acl':
+          await _aclDump(r);
         case 'signal':
           await Navigator.push(context, MaterialPageRoute(builder: (_) => const SignalHistoryPage()));
         case 'place':
@@ -1036,7 +1087,9 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
   Widget _hostTile(LanHost h) {
     final isMe = h.ip == net?.ip, isGw = h.ip == (router?.host ?? net?.gateway);
     final type = guessDeviceType(h.name, h.vendor, h.openPorts, isGateway: isGw, isMe: isMe);
-    final blocked = h.mac.isNotEmpty && blockedMacs.contains(h.mac);
+    final blocked = h.mac.isNotEmpty && blockedMacs.contains(normMac(h.mac));
+    final allowed = !blocked && h.mac.isNotEmpty && (acl?.activeAllowed.contains(normMac(h.mac)) ?? false);
+    final route = _route(h);
     final sub = [
       type,
       if (h.mac.isNotEmpty) h.mac,
@@ -1044,7 +1097,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       if (h.vendor.isEmpty && isRandomMac(h.mac)) 'MAC عشوائي',
       if (h.nameSrc.isNotEmpty && !Store.deviceNames.containsKey(h.mac)) 'الاسم ${kNameSrcAr[h.nameSrc] ?? h.nameSrc}',
       if (h.source != 'scan') (h.wifi ? 'واي فاي' : 'كابل'),
-      if (h.mac.isNotEmpty && TotoStore.macs.contains(h.mac)) 'عن طريق الأكسس',
+      if (h.source != 'scan' || route != 'direct') kRouteAr[route] ?? '',
       if (h.connectTime.isNotEmpty) 'متصل من ${_dur(h.connectTime)}',
     ].join(' • ');
     return Card(
@@ -1057,12 +1110,104 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           Flexible(child: Text(label(h), overflow: TextOverflow.ellipsis)),
           if (h.isNew) const Padding(padding: EdgeInsets.only(right: 6), child: Text('جديد', style: TextStyle(color: Colors.greenAccent, fontSize: 12))),
           if (blocked) const Padding(padding: EdgeInsets.only(right: 6), child: Text('محظور', style: TextStyle(color: Colors.redAccent, fontSize: 12))),
+          if (allowed) const Padding(padding: EdgeInsets.only(right: 6), child: Text('مسموح', style: TextStyle(color: Colors.greenAccent, fontSize: 12))),
         ]),
         subtitle: Text('${h.ip}\n$sub', style: const TextStyle(fontSize: 12)),
         isThreeLine: true,
         onTap: () => _hostSheet(h, blocked, isMe),
       ),
     );
+  }
+
+  /// fix19: «ابعتلي الحالة» — كل حقول فلتر الـ MAC الخام + قرار كل جهاز، في السجل
+  Future<void> _aclDump(ZteRouter r) async {
+    toast(context, 'بقرا حالة الحظر…');
+    AppLog.add('ACL', '===== حالة الحظر (ZTE ${r.host}) =====');
+    await ZteAclLearn.learn(r.host);
+    final f = ZteAclLearn.fields;
+    for (final k in [f.mode, f.blackMacs, f.blackNames, f.whiteMacs, f.whiteNames, 'wifi_mac_filter', 'MAC_FILTER', 'wifi_acl_mode']) {
+      final v = await r.getOne(k);
+      AppLog.add('ACL', 'RAW $k="$v"');
+    }
+    final a = await r.readAcl();
+    acl = a;
+    blockedMacs = a.activeBlocked;
+    final mi = _macIps;
+    AppLog.add('ACL', 'تفسير: ${a.kindAr} • محظورين فعلًا=${a.activeBlocked.length} • الأكسس=${TotoStore.ip.isEmpty ? '؟' : TotoStore.ip} عملاؤه=${TotoStore.macs.length} • MACs الأكسس=${repeaterMacs(TotoStore.ip, mi).join(',')}');
+    for (final h in hosts.values) {
+      if (h.mac.isEmpty && h.source == 'scan') continue;
+      final m = normMac(h.mac);
+      AppLog.add('ACL', 'DEV ${h.ip} $m ${label(h)} • ${h.source == 'scan' ? 'من الفحص' : (h.wifi ? 'واي فاي' : 'كابل')} • ${kRouteAr[_route(h)]} • ${a.black.contains(m) ? (a.kind == 'black' ? 'محظور' : 'في القايمة السودا بس الفلتر ${a.kindAr}') : '-'}${a.white.contains(m) ? ' • في قايمة المسموح' : ''}');
+    }
+    if (mounted) {
+      setState(() {});
+      toast(context, 'اتكتب في السجل ✓ — افتح السجل وابعتهولي');
+    }
+  }
+
+  /// fix19: MAC → العناوين اللي الراوتر شايفها بيه
+  Map<String, Set<String>> get _macIps {
+    final m = <String, Set<String>>{};
+    for (final x in hosts.values) {
+      if (x.mac.isNotEmpty && x.source != 'scan') m.putIfAbsent(normMac(x.mac), () => <String>{}).add(x.ip);
+    }
+    return m;
+  }
+
+  String _route(LanHost h) => routeOf(ip: h.ip, mac: h.mac, apIp: TotoStore.ip, apClientMacs: TotoStore.macs.map(normMac).toSet(), macIps: _macIps);
+
+  Future<void> _openToto() async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => TotoPage(router: router, hosts: hosts.values.toList(), labelOf: label)));
+    if (mounted) setState(() {});
+  }
+
+  /// fix19: الحظر بيتعمل من الجهاز الصح: الأكسس لو الجهاز عليه، الراوتر لو مباشر
+  Future<void> _blockFlow(LanHost h, bool blocked) async {
+    final route = _route(h);
+    if (!blocked && route != 'direct') {
+      final msg = route == 'ap'
+          ? '«${label(h)}» متوصل بالأكسس (TOTOLINK) مش بالراوتر مباشرة — الحظر من الراوتر مش هيأثر عليه. احظره من صفحة الأكسس.'
+          : route == 'apSelf'
+              ? 'ده الأكسس نفسه — لو اتحظر هيقطع النت عن كل الأجهزة اللي عليه. مش هحظره.'
+              : 'الراوتر شايف «${label(h)}» بـ MAC الأكسس نفسه (نفس الـ MAC على أكتر من عنوان). لو حظرته من الراوتر هتقطع النت عن كل اللي على الأكسس. احظره من صفحة الأكسس.';
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (d) => AlertDialog(
+          title: const Text('الجهاز ده عن طريق الأكسس'),
+          content: Text(msg),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('إلغاء')),
+            if (route != 'apSelf') FilledButton(onPressed: () => Navigator.pop(d, true), child: const Text('افتح صفحة الأكسس')),
+          ],
+        ),
+      );
+      AppLog.add('ACL', 'block ${h.ip} ${h.mac} route=$route → ${go == true ? 'فتح الأكسس' : 'اتلغى'}');
+      if (go == true) await _openToto();
+      return;
+    }
+    if (!blocked && h.source != 'scan' && !h.wifi) {
+      toast(context, 'الجهاز ده على كابل — الحظر بالـMAC بيشتغل على الواي فاي بس');
+      AppLog.add('ACL', 'block ${h.ip} ${h.mac}: wired → اترفض');
+      return;
+    }
+    if (!blocked && !await confirm(context, 'تحظر «${label(h)}» من واي فاي الراوتر؟ (تجريبي)')) return;
+    try {
+      toast(context, blocked ? 'بفك الحظر…' : 'بحظر… هستنى لحد 15 ثانية أتأكد إن الجهاز فصل');
+      var r = await router!.blockDevice(h.mac, label(h), !blocked);
+      if (r.needsEnable && mounted) {
+        final ok = await confirm(context,
+            'فلتر الـ MAC على الراوتر مقفول دلوقتي، وعشان كده الحظر قبل كده مكانش بيعمل حاجة.\n\nهشغّله بنظام «القايمة السودا» (الممنوعين بس): «${label(h)}» بس اللي هيتمنع، وكل الأجهزة التانية هتفضل شغالة عادي. عمري ما هشغّل نظام «المسموح بس».\n\nأشغّله وأحظر؟ (تجريبي)');
+        if (!ok) return;
+        r = await router!.blockDevice(h.mac, label(h), true, enableBlack: true);
+      }
+      AppLog.add('ACL', 'نتيجة ${blocked ? 'فك' : 'حظر'} ${h.mac}: ${r.ok} ${r.msg}');
+      if (mounted) {
+        await showDialog(context: context, builder: (d) => AlertDialog(title: Text(r.ok ? 'تمام' : 'متمش'), content: Text(r.msg)));
+      }
+      await refresh(quiet: true);
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
   }
 
   String _dur(String secs) {
@@ -1118,17 +1263,10 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
             ListTile(
               leading: Icon(blocked ? Icons.lock_open : Icons.block, color: blocked ? Colors.green : Colors.redAccent),
               title: Text(blocked ? 'فك الحظر' : 'احظر من الواي فاي'),
-              subtitle: const Text('عن طريق فلتر MAC في الراوتر (القايمة السودا)'),
+              subtitle: Text(_route(h) == 'direct' ? 'مباشر على الراوتر — فلتر MAC في الراوتر (القايمة السودا)' : 'عن طريق الأكسس — الحظر من صفحة الأكسس'),
               onTap: () async {
                 Navigator.pop(c);
-                if (!blocked && !await confirm(context, 'تحظر "${label(h)}" من الواي فاي؟')) return;
-                try {
-                  final ok = await router!.setBlocked(h.mac, label(h), !blocked);
-                  if (mounted) toast(context, ok ? 'تم' : 'الراوتر مأكدش — شوف السجل');
-                  await refresh(quiet: true);
-                } catch (e) {
-                  if (mounted) toast(context, 'خطأ: $e');
-                }
+                await _blockFlow(h, blocked);
               },
             ),
           ListTile(leading: const Icon(Icons.network_ping), title: const Text('Ping'), onTap: () {
@@ -5734,6 +5872,236 @@ class ZteLoginResult {
 }
 
 /// اللي بيكلم الراوتر
+// ---------------- fix19: فلتر MAC بتاع ZTE ----------------
+/// أسماء الحقول. الافتراضي = اللي التطبيق كان بيستخدمه (WIFI_MAC_FILTER / ACL_mode / wifi_mac_black_list / wifi_hostname_black_list).
+/// لو لقينا أمر الفلتر في جافاسكريبت صفحة الراوتر نفسه (ZteAclLearn.learn) بنستخدم الأسماء اللي هناك.
+class ZteAclFields {
+  final String goform, mode, blackMacs, blackNames, whiteMacs, whiteNames;
+  final String blackValue; // قيمة «قايمة سودا» في ACL_mode
+  final bool learned;
+  const ZteAclFields({
+    this.goform = 'WIFI_MAC_FILTER',
+    this.mode = 'ACL_mode',
+    this.blackMacs = 'wifi_mac_black_list',
+    this.blackNames = 'wifi_hostname_black_list',
+    this.whiteMacs = 'wifi_mac_white_list',
+    this.whiteNames = 'wifi_hostname_white_list',
+    this.blackValue = '2',
+    this.learned = false,
+  });
+  String describe() => '$goform{$mode=$blackValue,$blackMacs,$blackNames|$whiteMacs,$whiteNames}${learned ? ' (من صفحة الراوتر)' : ' (افتراضي)'}';
+  Map<String, dynamic> toJson() => {'g': goform, 'm': mode, 'b': blackMacs, 'bn': blackNames, 'w': whiteMacs, 'wn': whiteNames, 'bv': blackValue};
+  static ZteAclFields fromJson(Map<String, dynamic> j) => ZteAclFields(
+        goform: '${j['g'] ?? 'WIFI_MAC_FILTER'}',
+        mode: '${j['m'] ?? 'ACL_mode'}',
+        blackMacs: '${j['b'] ?? 'wifi_mac_black_list'}',
+        blackNames: '${j['bn'] ?? 'wifi_hostname_black_list'}',
+        whiteMacs: '${j['w'] ?? 'wifi_mac_white_list'}',
+        whiteNames: '${j['wn'] ?? 'wifi_hostname_white_list'}',
+        blackValue: '${j['bv'] ?? '2'}',
+        learned: true,
+      );
+}
+
+/// اللي اتفهم من جافاسكريبت الراوتر
+class ZteAclJs {
+  final ZteAclFields fields;
+  final String snippet;
+  final Map<String, String> modeValues; // black/white → القيمة لو باينة
+  ZteAclJs(this.fields, this.snippet, this.modeValues);
+}
+
+/// يدوّر في نص جافاسكريبت على الأمر اللي بيبعت فلتر الـ MAC ويطلّع أسماء الحقول. null = ملقاش.
+ZteAclJs? parseZteAclJs(String js) {
+  final m = RegExp('goformId["\']?\\s*[:=]\\s*["\']([A-Z_]*MAC_FILTER[A-Z_]*)["\']').firstMatch(js);
+  if (m == null) return null;
+  final from = (m.start - 900).clamp(0, js.length);
+  final to = (m.end + 900).clamp(0, js.length);
+  final snip = js.substring(from, to);
+  final keys = <String>{
+    for (final k in RegExp('["\']?([A-Za-z][A-Za-z0-9_]*)["\']?\\s*:').allMatches(snip)) k[1]!,
+  };
+  String? pick(bool Function(String) t) => keys.where(t).firstOrNull;
+  final mode = pick((k) => RegExp(r'^acl_?mode$', caseSensitive: false).hasMatch(k)) ??
+      pick((k) => k.toLowerCase().contains('acl') && k.toLowerCase().contains('mode'));
+  final bm = pick((k) => k.toLowerCase().contains('mac') && k.toLowerCase().contains('black'));
+  if (mode == null || bm == null) return null;
+  final bn = pick((k) => k.toLowerCase().contains('host') && k.toLowerCase().contains('black'));
+  final wm = pick((k) => k.toLowerCase().contains('mac') && k.toLowerCase().contains('white'));
+  final wn = pick((k) => k.toLowerCase().contains('host') && k.toLowerCase().contains('white'));
+  // قيم الوضع لو مكتوبة جنب كلمة black/white في نفس الملف
+  final mv = <String, String>{};
+  final em = RegExp.escape(mode);
+  for (final x in RegExp('$em["\']?\\s*[=!:]=?=?\\s*["\']?(\\d)["\']?[^;\\n]{0,80}', caseSensitive: false).allMatches(js)) {
+    final tail = x[0]!.toLowerCase();
+    if (tail.contains('black')) mv.putIfAbsent('black', () => x[1]!);
+    if (tail.contains('white')) mv.putIfAbsent('white', () => x[1]!);
+  }
+  const d = ZteAclFields();
+  final f = ZteAclFields(
+    goform: m[1]!,
+    mode: mode,
+    blackMacs: bm,
+    blackNames: bn ?? d.blackNames,
+    whiteMacs: wm ?? d.whiteMacs,
+    whiteNames: wn ?? d.whiteNames,
+    // بنقبل قيمة من الجافاسكريبت بس لو مش هي نفس قيمة «المسموح بس»
+    blackValue: (mv['black'] != null && mv['black'] != mv['white']) ? mv['black']! : d.blackValue,
+    learned: true,
+  );
+  return ZteAclJs(f, snip, mv);
+}
+
+class ZteAclLearn {
+  static ZteAclFields get fields {
+    final raw = Store.p.getString('zte_acl_fields');
+    if (raw == null || raw.isEmpty) return const ZteAclFields();
+    try {
+      return ZteAclFields.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return const ZteAclFields();
+    }
+  }
+
+  /// بيقرا ملفات الجافاسكريبت بتاعة صفحة الراوتر (GET بس — مفيش أي أمر بيتبعت) ويدوّر على أمر فلتر الـ MAC.
+  static Future<ZteAclJs?> learn(String host) async {
+    final c = http.Client();
+    try {
+      final base = 'http://$host';
+      final seen = <String>{};
+      final queue = <String>['/index.html', '/js/service.js', '/js/main.js', '/js/set.js', '/js/config/config.js'];
+      var fetched = 0;
+      final linkRe = RegExp('(?:src|href)\\s*=\\s*["\']([^"\']+\\.js)["\']|["\']((?:\\./)?js/[A-Za-z0-9_\\-/.]+?)(?:\\.js)?["\']');
+      while (queue.isNotEmpty && fetched < 30) {
+        final path = queue.removeAt(0);
+        if (!seen.add(path)) continue;
+        http.Response r;
+        try {
+          r = await c.get(Uri.parse('$base$path'), headers: {'Referer': '$base/index.html'}).timeout(const Duration(seconds: 6));
+        } catch (_) {
+          continue;
+        }
+        fetched++;
+        if (r.statusCode != 200 || r.bodyBytes.length > 3000000) continue;
+        final body = utf8.decode(r.bodyBytes, allowMalformed: true);
+        final hit = parseZteAclJs(body);
+        if (hit != null) {
+          AppLog.add('ACL', 'لقيت أمر الفلتر في $path: ${hit.fields.describe()} قيم الوضع=${hit.modeValues}');
+          AppLog.add('ACL', 'SNIPPET $path:\n${hit.snippet}');
+          await Store.p.setString('zte_acl_fields', jsonEncode(hit.fields.toJson()));
+          return hit;
+        }
+        for (final s in linkRe.allMatches(body)) {
+          var q = s[1] ?? s[2]!;
+          if (q.startsWith('http')) continue;
+          if (!q.endsWith('.js')) q = '$q.js';
+          q = q.replaceFirst(RegExp(r'^\./'), '');
+          if (!q.startsWith('/')) q = '/$q';
+          if (!seen.contains(q) && !q.contains('..')) queue.add(q);
+        }
+      }
+      AppLog.add('ACL', 'ملقتش أمر فلتر الـ MAC في $fetched ملف من صفحة الراوتر — هستخدم الأسماء الافتراضية (تجريبي)');
+      return null;
+    } finally {
+      c.close();
+    }
+  }
+}
+
+/// حالة فلتر الـ MAC زي ما الراوتر قالها
+class ZteAcl {
+  final String modeRaw;
+  final List<String> black, blackNames, white, whiteNames;
+  final String blackValue;
+  ZteAcl(this.modeRaw, this.black, this.blackNames, this.white, this.whiteNames, {this.blackValue = '2'});
+  factory ZteAcl.from({String mode = '', String black = '', String blackNames = '', String white = '', String whiteNames = '', String blackValue = '2'}) => ZteAcl(
+        mode.trim(),
+        splitList(black).map(normMac).where((m) => m.length == 17).toList(),
+        splitList(blackNames),
+        splitList(white).map(normMac).where((m) => m.length == 17).toList(),
+        splitList(whiteNames),
+        blackValue: blackValue,
+      );
+
+  /// off / black / white / unknown — المعنى (0 مقفول، 1 مسموح بس، 2 ممنوعين) من موديلات ZTE التانية، مش متأكد منه على MF286R1
+  String get kind {
+    if (modeRaw.isEmpty || modeRaw == '0') return 'off';
+    if (modeRaw == blackValue) return 'black';
+    if (modeRaw == '1') return 'white';
+    return 'unknown';
+  }
+
+  String get kindAr => switch (kind) {
+        'off' => 'الفلتر مقفول',
+        'black' => 'قايمة سودا (الممنوعين)',
+        'white' => 'المسموح بس',
+        _ => 'وضع مش معروف ($modeRaw)',
+      };
+
+  /// الأجهزة المحظورة فعلًا: بس لو الوضع قايمة سودا
+  List<String> get activeBlocked => kind == 'black' ? black : const [];
+  List<String> get activeAllowed => kind == 'white' ? white : const [];
+}
+
+class ZteBlockResult {
+  final bool ok;
+  final String msg;
+  final bool needsEnable;
+  ZteBlockResult(this.ok, this.msg, {this.needsEnable = false});
+}
+
+/// قرار قبل ما نبعت أي حاجة (pure — عليه اختبارات)
+({String? refuse, bool needsEnable}) planZteBlock(ZteAcl cur, String mac, bool block, {bool enableBlack = false}) {
+  if (cur.kind == 'white') {
+    return (refuse: 'الراوتر شغال بنظام «المسموح بس» — التطبيق مش هيغيّر الوضع ده. احذف الجهاز من قايمة المسموح من صفحة الراوتر.', needsEnable: false);
+  }
+  if (cur.kind == 'unknown') {
+    return (refuse: 'وضع فلتر الـ MAC على الراوتر «${cur.modeRaw}» مش معروف — مش هبعت حاجة. ابعتلي السجل (⋮ ← ابعتلي حالة الحظر).', needsEnable: false);
+  }
+  if (!block) {
+    if (!cur.black.contains(mac)) return (refuse: 'الجهاز ده مش في القايمة السودا أصلًا', needsEnable: false);
+    return (refuse: null, needsEnable: false);
+  }
+  if (cur.kind == 'off' && !enableBlack) {
+    return (refuse: 'الفلتر مقفول — لازم يتشغّل بنظام القايمة السودا الأول', needsEnable: true);
+  }
+  return (refuse: null, needsEnable: false);
+}
+
+/// الطلب اللي هيتبعت (pure — عليه اختبارات). الوضع + القايمتين مع بعض في أمر واحد، MAC كابيتال ومفصولة بـ ;
+Map<String, String> zteBlackRequest(ZteAclFields f, List<String> macs, List<String> names) {
+  final n = [...names];
+  while (n.length < macs.length) {
+    n.add('A2R');
+  }
+  return {
+    f.mode: f.blackValue,
+    f.blackMacs: macs.map(normMac).join(';'),
+    f.blackNames: n.take(macs.length).map((e) => e.replaceAll(';', ' ')).join(';'),
+  };
+}
+
+/// fix19: الجهاز ده الراوتر شايفه إزاي؟ direct = مباشر، ap = عن طريق الأكسس، apSelf = الأكسس نفسه
+/// [macIps] = كل MAC والعناوين اللي الراوتر شايفها بيه (الأكسس في وضع Repeater بيخلّي الأجهزة اللي وراه تظهر بالـ MAC بتاعه)
+String routeOf({required String ip, required String mac, required String apIp, required Set<String> apClientMacs, required Map<String, Set<String>> macIps}) {
+  final m = normMac(mac);
+  if (apIp.isNotEmpty && ip == apIp) return 'apSelf';
+  if (m.length != 17) return 'direct';
+  if (apClientMacs.contains(m)) return 'ap';
+  if (apIp.isNotEmpty) {
+    final apMac = macIps.entries.where((e) => e.value.contains(apIp)).map((e) => e.key).firstOrNull;
+    if (apMac != null && apMac == m) return 'apMac'; // نفس MAC الأكسس بعنوان تاني = جهاز وراه والراوتر شايفه بـ MAC الأكسس
+  }
+  if ((macIps[m]?.length ?? 0) >= 2) return 'apMac'; // MAC واحد بأكتر من عنوان = غالبًا MAC الأكسس
+  return 'direct';
+}
+
+/// MAC الأكسس نفسه (لو الراوتر شايفه): اللي عنوانه = عنوان الأكسس، أو أي MAC عليه أكتر من عنوان
+Set<String> repeaterMacs(String apIp, Map<String, Set<String>> macIps) => {
+      for (final e in macIps.entries)
+        if ((apIp.isNotEmpty && e.value.contains(apIp)) || e.value.length >= 2) e.key,
+    };
+
 class ZteRouter {
   String host;
   ZteRouter(this.host);
@@ -5890,21 +6258,61 @@ class ZteRouter {
     return list;
   }
 
-  // ---- الحظر (قايمة سودا في فلتر MAC بتاع الواي فاي) ----
-  Future<({String mode, List<String> macs, List<String> names})> blockList() async {
-    final j = await get(['ACL_mode', 'wifi_mac_black_list', 'wifi_hostname_black_list']);
-    return (
-      mode: '${j['ACL_mode'] ?? ''}',
-      macs: splitList('${j['wifi_mac_black_list'] ?? ''}').map(normMac).toList(),
-      names: splitList('${j['wifi_hostname_black_list'] ?? ''}'),
+  // ---- الحظر (فلتر MAC بتاع الواي فاي) ----
+  // fix19: بنقرا وضع الفلتر (ACL_mode) والقايمتين، وبنفسّرهم حسب الوضع:
+  // «محظور» بس لو الوضع قايمة سودا والجهاز فيها. مفيش أي تغيير للوضع من غير ما المستخدم يوافق،
+  // ومفيش تشغيل لنظام «المسموح بس» أبدًا.
+  Future<ZteAcl> readAcl() async {
+    final f = ZteAclLearn.fields;
+    final keys = [f.mode, f.blackMacs, f.blackNames];
+    Map<String, dynamic> j = {};
+    try {
+      j = await get(keys);
+    } catch (e) {
+      AppLog.add('ACL', 'multi read ✗ $e');
+    }
+    // fix19: على راوتره multi_data بيرجّع فاضي لبعض الحقول (زي station_list) — نقرا كل واحد لوحده
+    if (keys.every((k) => '${j[k] ?? ''}'.isEmpty)) {
+      for (final k in keys) {
+        j[k] = await getOne(k);
+      }
+    }
+    final white = {
+      f.whiteMacs: await getOne(f.whiteMacs),
+      f.whiteNames: await getOne(f.whiteNames),
+    };
+    final acl = ZteAcl.from(
+      mode: '${j[f.mode] ?? ''}',
+      black: '${j[f.blackMacs] ?? ''}',
+      blackNames: '${j[f.blackNames] ?? ''}',
+      white: white[f.whiteMacs] ?? '',
+      whiteNames: white[f.whiteNames] ?? '',
+      blackValue: f.blackValue,
     );
+    AppLog.add('ACL', 'mode="${acl.modeRaw}" (${acl.kindAr}) black=${acl.black.length} white=${acl.white.length} fields=${f.describe()}');
+    return acl;
   }
 
-  /// حظر/فك أكتر من جهاز في أمر واحد (المواعيد)
+  /// للتوافق مع الكود القديم (المواعيد): الـ MACs المحظورة فعلًا بس
+  Future<({String mode, List<String> macs, List<String> names})> blockList() async {
+    final a = await readAcl();
+    return (mode: a.modeRaw, macs: a.activeBlocked, names: a.blackNames);
+  }
+
+  Future<Map<String, dynamic>> _sendBlack(List<String> macs, List<String> names) async {
+    final f = ZteAclLearn.fields;
+    return set(f.goform, zteBlackRequest(f, macs, names));
+  }
+
+  /// حظر/فك أكتر من جهاز في أمر واحد (المواعيد). مش بيشغّل الفلتر لو الوضع «مسموح بس» أو مش معروف.
   Future<bool> setBlockedMany({Map<String, String> add = const {}, Set<String> remove = const {}}) async {
-    final cur = await blockList();
-    final macs = [...cur.macs];
-    final names = [...cur.names];
+    final cur = await readAcl();
+    if (cur.kind == 'white' || cur.kind == 'unknown') {
+      AppLog.add('ACL', 'schedule: مش هغيّر حاجة — الوضع ${cur.kindAr} (${cur.modeRaw})');
+      return false;
+    }
+    final macs = [...cur.black];
+    final names = [...cur.blackNames];
     for (final m0 in remove) {
       final i = macs.indexOf(normMac(m0));
       if (i >= 0) {
@@ -5915,38 +6323,70 @@ class ZteRouter {
     for (final e in add.entries) {
       final m = normMac(e.key);
       if (!macs.contains(m)) {
+        while (names.length < macs.length) {
+          names.add('A2R');
+        }
         macs.add(m);
         names.add(e.value.isEmpty ? 'A2R' : e.value.replaceAll(';', ' '));
       }
     }
-    final r = await set('WIFI_MAC_FILTER', {
-      'ACL_mode': macs.isEmpty ? '0' : '2',
-      'wifi_mac_black_list': macs.join(';'),
-      'wifi_hostname_black_list': names.join(';'),
-    });
+    if (cur.kind == 'off' && add.isEmpty) return true; // مفيش حاجة تتفك
+    if (cur.kind == 'off') {
+      // fix19: مش هنشغّل الفلتر لوحدنا من ميعاد — لازم يتشغّل مرة من زرار الحظر بموافقته
+      AppLog.add('ACL', 'schedule: الفلتر مقفول — الميعاد مش هيشغّله لوحده. احظر أي جهاز مرة من التطبيق ووافق على تشغيل القايمة السودا.');
+      return false;
+    }
+    final r = await _sendBlack(macs, names);
     return '${r['result']}' == 'success' || '${r['result']}' == '0';
   }
 
-  Future<bool> setBlocked(String mac, String name, bool block) async {
-    final cur = await blockList();
-    final macs = [...cur.macs];
-    final names = [...cur.names];
+  /// fix19: حظر/فك جهاز واحد متوصل بالراوتر مباشرة.
+  /// [enableBlack] لازم تبقى true لو الفلتر مقفول (المستخدم وافق إن الفلتر يتشغّل بنظام القايمة السودا).
+  /// بعد الأمر: بنقرا تاني، ولو حظر بنستنى لحد 15 ثانية نشوف الجهاز فصل ولا لأ.
+  Future<ZteBlockResult> blockDevice(String mac, String name, bool block, {bool enableBlack = false}) async {
     final m = normMac(mac);
+    if (!ZteAclLearn.fields.learned) await ZteAclLearn.learn(host);
+    final cur = await readAcl();
+    final plan = planZteBlock(cur, m, block, enableBlack: enableBlack);
+    if (plan.refuse != null) return ZteBlockResult(false, plan.refuse!, needsEnable: plan.needsEnable);
+    final names = [...cur.blackNames];
+    while (names.length < cur.black.length) {
+      names.add('A2R');
+    }
+    final macs = [...cur.black];
     final i = macs.indexOf(m);
     if (block && i < 0) {
       macs.add(m);
       names.add(name.isEmpty ? 'A2R' : name.replaceAll(';', ' '));
     } else if (!block && i >= 0) {
       macs.removeAt(i);
-      if (i < names.length) names.removeAt(i);
+      names.removeAt(i);
     }
-    final r = await set('WIFI_MAC_FILTER', {
-      'ACL_mode': macs.isEmpty ? '0' : '2',
-      'wifi_mac_black_list': macs.join(';'),
-      'wifi_hostname_black_list': names.join(';'),
-    });
-    return '${r['result']}' == 'success' || '${r['result']}' == '0';
+    final r = await _sendBlack(macs, names);
+    final res = '${r['result'] ?? ''}';
+    await Future.delayed(const Duration(seconds: 2));
+    final after = await readAcl();
+    final listed = after.black.contains(m);
+    if (block) {
+      if (after.kind != 'black' || !listed) {
+        return ZteBlockResult(false, 'الراوتر رد «$res» بس لما قريت تاني: الوضع ${after.kindAr}${listed ? '' : ' والجهاز مش في القايمة'} — يعني الأمر متنفذش. ابعتلي السجل.');
+      }
+      for (var k = 0; k < 5; k++) {
+        await Future.delayed(const Duration(seconds: 3));
+        final st = await stations();
+        if (!st.any((s) => normMac(s.mac) == m)) {
+          return ZteBlockResult(true, 'اتحظر ✓ — الجهاز في القايمة السودا وفصل من الراوتر (اتأكدت)');
+        }
+      }
+      return ZteBlockResult(true, 'الجهاز اتضاف للقايمة السودا والفلتر شغال، بس لسه ظاهر متوصل بعد 15 ثانية — بعض الراوترات مش بتفصل اللي متوصل غير لما يعيد الاتصال. لو لسه شغال، اقفل/افتح الواي فاي عنده أو ابعتلي السجل.');
+    }
+    return listed
+        ? ZteBlockResult(false, 'الراوتر رد «$res» بس الجهاز لسه في القايمة السودا — ابعتلي السجل')
+        : ZteBlockResult(true, 'اتفك الحظر ✓ (اتأكدت من القايمة)');
   }
+
+  /// للتوافق: نفس الاسم القديم
+  Future<bool> setBlocked(String mac, String name, bool block) async => (await blockDevice(mac, name, block)).ok;
 
   Future<Map<String, dynamic>> status() => get([
         'network_type', 'network_provider', 'signalbar', 'lte_rsrp', 'lte_rsrq', 'lte_rssi',
@@ -6089,8 +6529,23 @@ bool isRandomMac(String mac) {
   return (b & 0x02) != 0;
 }
 
-// ---- قاعدة الشركات (OUI) من IEEE — بتتحمّل مرة واحدة لو عايز ----
+// ---- قاعدة الشركات (OUI) — بتتحمّل مرة واحدة لو عايز ----
+// fix18: موقع IEEE بيرجّع HTTP 418 لأي برنامج مش متصفح (User-Agent بتاع Dart)،
+// فبنجرّب كذا مصدر بالترتيب وبـ User-Agent متصفح.
 const String kOuiUrl = 'https://standards-oui.ieee.org/oui/oui.txt';
+const String kBrowserUA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36';
+
+class OuiSource {
+  final String name, url, format; // format: manuf | csv | txt | json
+  const OuiSource(this.name, this.url, this.format);
+}
+
+const List<OuiSource> kOuiSources = [
+  OuiSource('Wireshark', 'https://www.wireshark.org/download/automated/data/manuf', 'manuf'),
+  OuiSource('IEEE CSV', 'https://standards-oui.ieee.org/oui/oui.csv', 'csv'),
+  OuiSource('IEEE TXT', kOuiUrl, 'txt'),
+  OuiSource('oui-data (GitHub)', 'https://raw.githubusercontent.com/silverwind/oui-data/master/index.json', 'json'),
+];
 
 /// يقرا سطور "28-6F-B9   (hex)\t\tNokia Shanghai Bell" → {"286FB9": "Nokia Shanghai Bell"}
 Map<String, String> parseOuiText(String txt) {
@@ -6102,8 +6557,138 @@ Map<String, String> parseOuiText(String txt) {
   return out;
 }
 
+/// ملف Wireshark manuf: "14:7F:CE<TAB>Apple<TAB>Apple, Inc." — بناخد الاسم الكامل (العمود التالت) لو موجود.
+/// السطور اللي فيها /28 أو /36 (بلوكات أصغر) بنسيبها لأن الجدول بالـ 6 حروف بس.
+Map<String, String> parseOuiManuf(String txt) {
+  final out = <String, String>{};
+  for (final raw in const LineSplitter().convert(txt)) {
+    final line = raw.trimRight();
+    if (line.isEmpty || line.startsWith('#')) continue;
+    final parts = line.split('\t');
+    if (parts.length < 2) continue;
+    final key = parts[0].trim();
+    if (key.contains('/')) continue;
+    final hex = key.replaceAll(RegExp(r'[^0-9A-Fa-f]'), '').toUpperCase();
+    if (hex.length != 6) continue;
+    final full = parts.length >= 3 ? parts[2].trim() : '';
+    final short = parts[1].trim();
+    final name = full.isNotEmpty ? full : short;
+    if (name.isNotEmpty) out[hex] = name;
+  }
+  return out;
+}
+
+List<String> _csvRow(String line) {
+  final cells = <String>[];
+  final b = StringBuffer();
+  var q = false;
+  for (var i = 0; i < line.length; i++) {
+    final c = line[i];
+    if (q) {
+      if (c == '"') {
+        if (i + 1 < line.length && line[i + 1] == '"') {
+          b.write('"');
+          i++;
+        } else {
+          q = false;
+        }
+      } else {
+        b.write(c);
+      }
+    } else if (c == '"') {
+      q = true;
+    } else if (c == ',') {
+      cells.add(b.toString());
+      b.clear();
+    } else {
+      b.write(c);
+    }
+  }
+  cells.add(b.toString());
+  return cells;
+}
+
+/// IEEE oui.csv: "MA-L,286FB9,"Nokia Shanghai Bell Co., Ltd.",..."
+Map<String, String> parseOuiCsv(String txt) {
+  final out = <String, String>{};
+  for (final raw in const LineSplitter().convert(txt)) {
+    final line = raw.trim();
+    if (line.isEmpty || line.startsWith('Registry,')) continue;
+    final c = _csvRow(line);
+    if (c.length < 3) continue;
+    final hex = c[1].trim().toUpperCase();
+    if (!RegExp(r'^[0-9A-F]{6}$').hasMatch(hex)) continue;
+    final name = c[2].trim();
+    if (name.isNotEmpty) out[hex] = name;
+  }
+  return out;
+}
+
+/// oui-data index.json: {"000000": "XEROX CORPORATION\nM/S 105-50C..."} → أول سطر بس
+Map<String, String> parseOuiJson(String txt) {
+  final out = <String, String>{};
+  final m = jsonDecode(txt);
+  if (m is! Map) return out;
+  m.forEach((k, v) {
+    final hex = '$k'.replaceAll(RegExp(r'[^0-9A-Fa-f]'), '').toUpperCase();
+    if (hex.length != 6) return;
+    final name = '$v'.split('\n').first.trim();
+    if (name.isNotEmpty) out[hex] = name;
+  });
+  return out;
+}
+
+Map<String, String> parseOuiAny(String format, String txt) {
+  switch (format) {
+    case 'manuf':
+      return parseOuiManuf(txt);
+    case 'csv':
+      return parseOuiCsv(txt);
+    case 'json':
+      return parseOuiJson(txt);
+    default:
+      return parseOuiText(txt);
+  }
+}
+
+class OuiDownloadError implements Exception {
+  final List<String> tried; // "Wireshark: HTTP 418"
+  OuiDownloadError(this.tried);
+  String get arabic => 'مقدرتش أنزّل القايمة — جرّب تاني\n${tried.join('\n')}';
+  @override
+  String toString() => arabic;
+}
+
+typedef OuiFetch = Future<({int status, List<int> body})> Function(Uri url, void Function(int got, int? total)? onProgress);
+
+Future<({int status, List<int> body})> _ouiHttpFetch(Uri url, void Function(int got, int? total)? onProgress) async {
+  final c = http.Client();
+  try {
+    final req = http.Request('GET', url)
+      ..headers['User-Agent'] = kBrowserUA
+      ..headers['Accept'] = 'text/plain,text/csv,application/json,*/*';
+    final res = await c.send(req).timeout(const Duration(seconds: 30));
+    if (res.statusCode != 200) {
+      await res.stream.drain<void>().catchError((_) {});
+      return (status: res.statusCode, body: <int>[]);
+    }
+    final total = res.contentLength;
+    final buf = <int>[];
+    await for (final chunk in res.stream.timeout(const Duration(seconds: 60))) {
+      buf.addAll(chunk);
+      onProgress?.call(buf.length, total);
+    }
+    return (status: 200, body: buf);
+  } finally {
+    c.close();
+  }
+}
+
 class Oui {
   static Map<String, String> table = {};
+  static String source = '';
+  /// للاختبار: نقدر نبدّل طريقة التحميل
+  static OuiFetch fetch = _ouiHttpFetch;
   static Future<File> _file() async => File('${(await getApplicationSupportDirectory()).path}/oui.json');
   static Future<void> load() async {
     try {
@@ -6112,12 +6697,43 @@ class Oui {
     } catch (_) {}
   }
 
-  static Future<int> download() async {
+  /// بيجرّب المصادر بالترتيب؛ أول واحد يرجّع قايمة كاملة (≥ 1000 شركة) بيتحفظ.
+  /// لو كلهم فشلوا: OuiDownloadError بالعربي + كل مصدر وسبب فشله، والقايمة القديمة بتفضل زي ما هي.
+  static Future<Map<String, String>> fetchBest({void Function(String source, int got, int? total)? onProgress, List<OuiSource> sources = kOuiSources}) async {
+    final tried = <String>[];
+    for (final s in sources) {
+      AppLog.add('LAN', 'OUI ← ${s.name} ${s.url}');
+      try {
+        final r = await fetch(Uri.parse(s.url), (g, t) => onProgress?.call(s.name, g, t));
+        if (r.status != 200) {
+          tried.add('${s.name}: HTTP ${r.status}');
+          AppLog.add('LAN', 'OUI ${s.name} ✗ HTTP ${r.status}');
+          continue;
+        }
+        final t = parseOuiAny(s.format, utf8.decode(r.body, allowMalformed: true));
+        if (t.length < 1000) {
+          tried.add('${s.name}: الملف ناقص (${t.length})');
+          AppLog.add('LAN', 'OUI ${s.name} ✗ only ${t.length}');
+          continue;
+        }
+        source = s.name;
+        AppLog.add('LAN', 'OUI ${s.name} ✓ ${t.length}');
+        return t;
+      } on TimeoutException {
+        tried.add('${s.name}: النت بطيء (وقت انتهى)');
+        AppLog.add('LAN', 'OUI ${s.name} ✗ timeout');
+      } catch (e) {
+        final m = e is SocketException ? 'مفيش اتصال بالموقع' : (e is FormatException ? 'شكل الملف غلط' : '$e');
+        tried.add('${s.name}: $m');
+        AppLog.add('LAN', 'OUI ${s.name} ✗ $e');
+      }
+    }
+    throw OuiDownloadError(tried);
+  }
+
+  static Future<int> download({void Function(String source, int got, int? total)? onProgress}) async {
     AppLog.add('LAN', 'downloading OUI list');
-    final r = await http.get(Uri.parse(kOuiUrl)).timeout(const Duration(seconds: 90));
-    if (r.statusCode != 200) throw HttpException('HTTP ${r.statusCode}');
-    final t = parseOuiText(utf8.decode(r.bodyBytes, allowMalformed: true));
-    if (t.length < 1000) throw const FormatException('الملف ناقص');
+    final t = await fetchBest(onProgress: onProgress);
     table = t;
     await (await _file()).writeAsString(jsonEncode(t));
     return t.length;
@@ -12852,6 +13468,12 @@ class _RouterDnsPageState extends State<RouterDnsPage> {
     setState(() => loading = true);
     try {
       raw = await widget.router.get(kDnsReadCmds);
+      // fix19: لو multi_data رجّع فاضي (حصل قبل كده مع station_list على راوتره) نقرا كل حقل لوحده
+      if ('${raw['dns_mode'] ?? ''}'.isEmpty) {
+        for (final k in kDnsReadCmds) {
+          raw[k] = await widget.router.getOne(k);
+        }
+      }
       AppLog.add('DNS', 'قراية: ${jsonEncode(raw)}');
     } catch (e) {
       msg = 'مقدرتش أقرا الـ DNS: $e';
@@ -12954,6 +13576,11 @@ class _RouterDnsPageState extends State<RouterDnsPage> {
                 icon: const Icon(Icons.open_in_browser_rounded),
                 label: const Text('افتح صفحة الراوتر'),
                 onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BrowserPage(initialUrl: widget.router.base))),
+              ),
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text('ده الـ DNS اللي الراوتر بيوزّعه على كل الأجهزة — حتى اللي متوصلين بالأكسس (TOTOLINK)، لأن الأكسس شغال Repeater والـ DHCP بتاعه مقفول. DNS الأكسس نفسه من صفحة الأكسس ← «DNS الأكسس».',
+                    style: TextStyle(color: kMuted, fontSize: 12, height: 1.5)),
               ),
               const SectionTitle('DNS للموبايل ده بس', icon: Icons.smartphone_rounded),
               const Text(
@@ -14379,7 +15006,7 @@ class PcPresentPage extends StatelessWidget {
 /// المفاتيح اللي مش بتتنقل (توكن الكمبيوتر، القفل، الكاش المؤقت)
 bool backupSkipKey(String k) {
   final l = k.toLowerCase();
-  return l == 'pc_saved' || l.startsWith('app_lock') || l.contains('password') || l.contains('token') || l == 'oui_auto_tried' || l == 'router_last_ok' || l == 'bg_last';
+  return l == 'pc_saved' || l.startsWith('app_lock') || l.contains('password') || l.contains('token') || l == 'oui_auto_tried' || l == 'oui_auto_tried2' || l == 'router_last_ok' || l == 'bg_last';
 }
 
 Map<String, dynamic> buildBackup(Map<String, Object?> prefs, DateTime now) => {
@@ -14740,8 +15367,15 @@ List<HtmlForm> parseForms(String html, String page) {
     final fa = attrsOf('<form${fm[1]}>');
     final body = fm[2]!;
     final fields = <HtmlField>[];
-    for (final m in RegExp(r'<(input|select|textarea)\b([^>]*)>([\s\S]*?</select>|[\s\S]*?</textarea>)?', caseSensitive: false).allMatches(body)) {
+    // fix19: الجزء اللي بعد التاج (options / نص textarea) بيتاخد للـ select و textarea بس —
+    // قبل كده regex واحد كان بيبلع الـ inputs اللي بعد input لحد أقرب </select> فكانت حقول بتختفي من الفورم.
+    for (final m in RegExp(r'<(input|select|textarea)\b([^>]*)>', caseSensitive: false).allMatches(body)) {
       final tag = m[1]!.toLowerCase();
+      String? tail;
+      if (tag != 'input') {
+        final close = body.toLowerCase().indexOf('</$tag', m.end);
+        tail = close < 0 ? body.substring(m.end) : '${body.substring(m.end, close)}</$tag>';
+      }
       final a = attrsOf('<$tag${m[2]}>');
       final name = a['name'] ?? '';
       final ml = int.tryParse(a['maxlength'] ?? '');
@@ -14749,14 +15383,14 @@ List<HtmlForm> parseForms(String html, String page) {
         fields.add(HtmlField(name, (a['type'] ?? 'text').toLowerCase(), a['value'] ?? '', checked: a.containsKey('checked'), maxLength: ml));
       } else if (tag == 'select') {
         final opts = <HtmlOption>[];
-        for (final o in RegExp(r'<option\b([^>]*)>([^<]*)', caseSensitive: false).allMatches(m[3] ?? '')) {
+        for (final o in RegExp(r'<option\b([^>]*)>([^<]*)', caseSensitive: false).allMatches(tail ?? '')) {
           final oa = attrsOf('<option${o[1]}>');
           final text = htmlDecode(o[2]!).trim();
           opts.add(HtmlOption(oa['value'] ?? text, text, oa.containsKey('selected')));
         }
         fields.add(HtmlField(name, 'select', '', options: opts));
       } else {
-        final t = (m[3] ?? '').replaceFirst(RegExp(r'</textarea>$', caseSensitive: false), '');
+        final t = (tail ?? '').replaceFirst(RegExp(r'</textarea>$', caseSensitive: false), '');
         fields.add(HtmlField(name, 'textarea', htmlDecode(t), maxLength: ml));
       }
     }
@@ -14768,7 +15402,7 @@ List<HtmlForm> parseForms(String html, String page) {
 // ---- الأمان: قايمة الحظر ----
 const List<String> kTotoBlockWords = [
   'upload', 'reset', 'default', 'factory', 'syscmd', 'wps', 'wsc', 'upgrade', 'firmware', 'flash', 'config', 'saveconf', 'reload',
-  'opmode', 'operation', 'wan', 'repeater', 'vxd', 'wisp', 'tcpip', 'lan_ip', 'lanip', 'dhcp', 'passwordsetup', 'password', 'admin',
+  'opmode', 'operation', 'wan', 'repeater', 'advance', 'vxd', 'wisp', 'tcpip', 'lan_ip', 'lanip', 'dhcp', 'passwordsetup', 'password', 'admin',
   'ntp', 'ping', 'diag', 'tracert', 'syslog', 'telnet', 'ssh', 'remote', 'ddns', 'dmz', 'route', 'iptv', 'vpn', 'schedule', 'cmd', 'shell',
 ];
 
@@ -14981,8 +15615,16 @@ String prefixOf(String ip) {
 }
 
 // ---- تخزين ----
+/// fix19: الراوتر شايف الجهاز إزاي
+const kRouteAr = {
+  'direct': 'مباشر على الراوتر',
+  'ap': 'عن طريق الأكسس',
+  'apMac': 'عن طريق الأكسس (بـ MAC الأكسس)',
+  'apSelf': 'الأكسس نفسه',
+};
+
 class TotoStore {
-  static String get ip => Store.p.getString('toto_ip') ?? '192.168.2.2';
+  static String get ip => Store.p.getString('toto_ip') ?? ''; // fix19: مفيش عنوان افتراضي — فاضي لحد ما يتكتب أو يتلاقى
   static set ip(String v) => Store.p.setString('toto_ip', v);
   static String get user => Store.p.getString('toto_user') ?? 'admin';
   static set user(String v) => Store.p.setString('toto_user', v);
@@ -14991,6 +15633,52 @@ class TotoStore {
   /// الأجهزة اللي جدول الأكسس قال إنها متوصلة بيه (MAC)
   static Set<String> get macs => (Store.p.getStringList('toto_macs') ?? []).toSet();
   static set macs(Set<String> v) => Store.p.setStringList('toto_macs', v.toList());
+  /// fix18: شبكة البيت (من عنوان الراوتر ZTE) — علشان نعرف إن الأكسس على شبكة تانية حتى لو الموبايل على عنوان يدوي
+  static String get homePrefix => Store.p.getString('toto_home_prefix') ?? '';
+  static set homePrefix(String v) => Store.p.setString('toto_home_prefix', v);
+  /// fix18: آخر وضع تشغيل اتقرا من صفحة Operation Mode (قراية بس)
+  static String get opMode => Store.p.getString('toto_opmode') ?? '';
+  static set opMode(String v) => Store.p.setString('toto_opmode', v);
+}
+
+/// fix18: يقرا الاختيار المعلَّم في صفحة Operation Mode (radio checked) والكلام اللي جنبه.
+/// قراية بس — فورم الصفحة دي ممنوع في قايمة الحظر.
+String totoOpModeFrom(String html) {
+  final noComments = html.replaceAll(RegExp(r'<!--[\s\S]*?-->'), '');
+  for (final m in RegExp(r'<input\b[^>]*>', caseSensitive: false).allMatches(noComments)) {
+    final a = attrsOf(m[0]!);
+    if ((a['type'] ?? '').toLowerCase() != 'radio' || !a.containsKey('checked')) continue;
+    final n = (a['name'] ?? '').toLowerCase();
+    if (!n.contains('mode') && !n.contains('op')) continue;
+    final rest = noComments.substring(m.end);
+    final cut = rest.indexOf(RegExp(r'<input\b|</tr>|</td>|<td\b|<br', caseSensitive: false));
+    final label = stripTags(cut < 0 ? rest : rest.substring(0, cut));
+    if (label.isNotEmpty) return label.length > 60 ? label.substring(0, 60) : label;
+  }
+  return '';
+}
+
+/// fix18: نوع الوضع: safe = Repeater/Bridge/AP (تغيير عنوانه آمن)، risky = WISP/Router/Gateway/Client، '' = مش معروف
+String totoOpModeKind(String mode) {
+  final l = mode.toLowerCase();
+  if (l.isEmpty) return '';
+  if (l.contains('wisp') || l.contains('isp') || l.contains('router') || l.contains('gateway')) return 'risky';
+  if (l.contains('repeater') || l.contains('extender') || l.contains('bridge') || l.contains('access point') || RegExp(r'\bap\b').hasMatch(l)) return 'safe';
+  if (l.contains('client')) return 'risky';
+  return '';
+}
+
+/// fix18: العناوين اللي نجرّبها لو الأكسس مش بيرد على العنوان المحفوظ
+List<String> totoFallbackIps(String saved, {String phonePrefix = '', String homePrefix = ''}) {
+  final out = <String>[];
+  void add(String ip) {
+    if (isIpv4(ip) && ip != saved && !out.contains(ip)) out.add(ip);
+  }
+  if (homePrefix.isNotEmpty) add('$homePrefix.2');
+  if (phonePrefix.isNotEmpty) add('$phonePrefix.2');
+  add('192.168.7.2');
+  add('192.168.2.2');
+  return out;
 }
 
 // ---- الاتصال بالجهاز ----
@@ -15103,7 +15791,7 @@ class TotoDevice {
     return 'مش لاقي صفحة دخول مفهومة (${r.status})';
   }
 
-  static const List<String> kExtraPages = ['/status.htm', '/wlstatbl.htm', '/dhcptbl.htm', '/wlactrl.htm', '/wlbasic.htm', '/wlwpa.htm', '/reboot.htm', '/menu.htm'];
+  static const List<String> kExtraPages = ['/status.htm', '/wlstatbl.htm', '/dhcptbl.htm', '/wlactrl.htm', '/wlbasic.htm', '/wlwpa.htm', '/reboot.htm', '/menu.htm', '/opmode.htm', '/tcpiplan.htm', '/wladvanced.htm'];
 
   /// يقرا صفحات الجهاز (من القايمة + أسماء Realtek المعروفة) — GET بس
   Future<void> crawl({int maxPages = 40}) async {
@@ -15131,9 +15819,21 @@ class TotoDevice {
   List<HtmlForm> get forms => [for (final e in pages.entries) ...parseForms(e.value, e.key)];
 
   /// بيبعت فورم الجهاز (بعد كل فحوص الأمان)
-  Future<int> submit(HtmlForm f, Map<String, String> payload) async {
-    final reason = totoBlockReason(f, allowNames: payload.keys.where((k) => !f.dataFields.any((x) => x.name == k)).toSet());
-    if (reason != null) throw StateError('ممنوع: $reason');
+  /// [only]: fix19 — استثناءين ضيقين بس: 'acl' (إضافة/مسح MAC في Wireless Access Control) و 'dns' (DNS بس في LAN Settings بعد الحارس)
+  Future<int> submit(HtmlForm f, Map<String, String> payload, {String? only}) async {
+    if (only == 'acl') {
+      final base = formPayload(f, const {});
+      final why = totoAclPreflight(f, pages[f.page] ?? '', payload.keys.where((k) => base[k] != payload[k]).toSet());
+      if (why != null) throw StateError('ممنوع: $why');
+    } else if (only == 'dns') {
+      final d = findTotoDnsForm([f], pages);
+      if (d == null) throw StateError('ممنوع: ده مش فورم الـ DNS');
+      final why = totoDnsGuard(f, pages[f.page] ?? '', payload, d.dnsNames);
+      if (why != null) throw StateError('ممنوع: $why');
+    } else {
+      final reason = totoBlockReason(f, allowNames: payload.keys.where((k) => !f.dataFields.any((x) => x.name == k)).toSet());
+      if (reason != null) throw StateError('ممنوع: $reason');
+    }
     final action = f.action.startsWith('/') ? f.action : '/${f.action}';
     final r = f.method == 'post' ? await _req('POST', action, form: payload, referer: 'http://$host${f.page}') : throw StateError('الفورم مش POST');
     return r.status;
@@ -15249,6 +15949,237 @@ Future<bool> port80Open(String ip) async {
 }
 
 // ---- الشاشة ----
+// ---------------- fix19: Wireless Access Control بتاع TOTOLINK (Realtek boa) ----------------
+/// حالة قايمة التحكم بالـ MAC زي ما صفحة الجهاز نفسها بتقول.
+/// mode: allow (المسموح بس) / deny (امنع اللي في القايمة) / off (مقفول) / '' (مش معروف)
+class TotoAcl {
+  final String mode;
+  final String modeText;
+  final String modeValue; // القيمة الحالية بالظبط زي ما الجهاز بيبعتها
+  final List<TotoClient> entries;
+  final HtmlForm? addForm;
+  final String page;
+  TotoAcl(this.mode, this.modeText, this.modeValue, this.entries, this.addForm, this.page);
+  bool has(String mac) => entries.any((e) => e.mac == normMac(mac));
+  String get modeAr => switch (mode) {
+        'allow' => 'المسموح بس (Allow Listed)',
+        'deny' => 'امنع اللي في القايمة (Deny Listed)',
+        'off' => 'مقفول (Disabled)',
+        _ => 'مش معروف',
+      };
+}
+
+String totoAclKind(String text) {
+  final l = text.toLowerCase();
+  if (l.contains('allow')) return 'allow';
+  if (l.contains('deny')) return 'deny';
+  if (l.contains('disab') || l.contains('off') || l.contains('none')) return 'off';
+  return '';
+}
+
+/// الاختيار الحالي في select — لو الصفحة بتختاره بالجافاسكريبت (زي Realtek: `x.selectedIndex = <% getIndex %>`) بناخد اللي في السكريبت
+HtmlOption? selectedOptionWithJs(HtmlField sel, String pageHtml) {
+  final scripts = RegExp(r'<script[^>]*>([\s\S]*?)</script>', caseSensitive: false).allMatches(pageHtml).map((m) => m[1]!).join('\n');
+  final e = RegExp.escape(sel.name);
+  final mi = RegExp('$e["\']?\\]?\\s*\\.\\s*selectedIndex\\s*=\\s*["\']?(\\d+)').firstMatch(scripts);
+  if (mi != null) {
+    final i = int.parse(mi[1]!);
+    if (i >= 0 && i < sel.options.length) return sel.options[i];
+  }
+  final mv = RegExp('$e["\']?\\]?\\s*\\.\\s*value\\s*=\\s*["\']([^"\']*)["\']').firstMatch(scripts);
+  if (mv != null) {
+    final o = sel.options.where((o) => o.value == mv[1]).firstOrNull;
+    if (o != null) return o;
+  }
+  return sel.options.where((o) => o.selected).firstOrNull ?? sel.options.firstOrNull;
+}
+
+/// بيقرا التحكم بالـ MAC من فورمز وصفحات الجهاز نفسه (pure — عليه اختبارات)
+TotoAcl? totoAclFrom(List<HtmlForm> forms, Map<String, String> pages) {
+  final r = findMacAddForm(forms);
+  if (r == null) return null;
+  final html = pages[r.form.page] ?? '';
+  var modeText = '', modeValue = '';
+  if (r.mode != null) {
+    final o = selectedOptionWithJs(r.mode!, html);
+    modeText = o?.text ?? '';
+    modeValue = o?.value ?? '';
+  }
+  // القايمة: صفوف فيها MAC في نفس صفحة الفورم بس (مش جدول العملاء)
+  final entries = <TotoClient>[];
+  final seen = <String>{};
+  for (final row in tableRows(html)) {
+    for (final cell in row.cells) {
+      final hex = cell.replaceAll(RegExp(r'[^0-9A-Fa-f]'), '');
+      if (hex.length != 12 || !RegExp(r'^[0-9A-Fa-f:\-\s]+$').hasMatch(cell.trim())) continue;
+      final m = normMac(hex);
+      if (m == '00:00:00:00:00:00' || !seen.add(m)) continue;
+      final c = TotoClient(m)..page = r.form.page;
+      final other = row.cells.where((x) => x != cell && x.trim().isNotEmpty && !RegExp(r'^(select|\d+)$', caseSensitive: false).hasMatch(x.trim())).toList();
+      if (other.isNotEmpty) c.name = other.first;
+      entries.add(c);
+    }
+  }
+  return TotoAcl(totoAclKind(modeText), modeText, modeValue, entries, r.form, r.form.page);
+}
+
+/// قرار الحظر/الفك على الأكسس قبل ما يتبعت أي حاجة (pure — عليه اختبارات)
+/// op: remove (شيله من قايمة المسموح) / add (ضيفه للقايمة) — والوضع عمره ما بيتغيّر لـ allow من التطبيق
+({String? refuse, String op, String note}) planTotoBlock(TotoAcl acl, String mac, bool block, {Set<String> myMacs = const {}}) {
+  final m = normMac(mac);
+  final mine = myMacs.map(normMac).toSet();
+  switch (acl.mode) {
+    case 'allow':
+      if (block) {
+        if (!acl.has(m)) return (refuse: 'الجهاز ده مش في قايمة المسموح أصلًا — يعني الأكسس مش هيدخّله', op: '', note: '');
+        if (mine.contains(m)) return (refuse: 'ده الموبايل ده نفسه — لو شيلته من قايمة المسموح هتتقفل برا الأكسس. مش هعملها.', op: '', note: '');
+        if (acl.entries.length <= 1) return (refuse: 'ده آخر جهاز في قايمة المسموح — لو اتشال محدش هيقدر يدخل الأكسس. مش هعملها.', op: '', note: '');
+        return (refuse: null, op: 'remove', note: 'هشيله من قايمة المسموح (باقي الأجهزة زي ما هي، والوضع هيفضل «المسموح بس»).');
+      }
+      if (acl.has(m)) return (refuse: 'الجهاز ده مسموح أصلًا', op: '', note: '');
+      return (refuse: null, op: 'add', note: 'هرجّعه لقايمة المسموح (الوضع هيفضل «المسموح بس»).');
+    case 'deny':
+      if (block) {
+        if (acl.has(m)) return (refuse: 'الجهاز ده محظور أصلًا', op: '', note: '');
+        return (refuse: null, op: 'add', note: 'هضيفه لقايمة الممنوعين.');
+      }
+      if (!acl.has(m)) return (refuse: 'الجهاز ده مش في قايمة الممنوعين', op: '', note: '');
+      return (refuse: null, op: 'remove', note: 'هشيله من قايمة الممنوعين.');
+    case 'off':
+      if (block) return (refuse: null, op: 'add', note: 'التحكم بالـ MAC مقفول دلوقتي — هيتشغل بنظام «امنع اللي في القايمة» (Deny).');
+      if (!acl.has(m)) return (refuse: 'الجهاز ده مش في القايمة', op: '', note: '');
+      return (refuse: null, op: 'remove', note: 'هشيله من القايمة.');
+    default:
+      return (refuse: 'مش عارف وضع التحكم بالـ MAC على الأكسس — مش هبعت حاجة. ابعتلي «شارك صفحات الجهاز».', op: '', note: '');
+  }
+}
+
+/// fix19: استثناء ضيق من قايمة الحظر لفورم التحكم بالـ MAC بس (إضافة/مسح MAC).
+/// الفورم لازم يكون رايح لـ boafrm/formWlAc (أو فيه حقل mac + اختيار Allow/Deny)، ومفيش فيه أي حقل غير المعروفين.
+bool isTotoAclForm(HtmlForm f) {
+  final a = '${f.action} ${f.name}'.toLowerCase();
+  if (a.contains('wlac') || a.contains('macfilter') || a.contains('wlacl')) return true;
+  final hasMode = f.fields.any((x) => x.type == 'select' && x.options.any((o) => o.text.toLowerCase().contains('allow')) && x.options.any((o) => o.text.toLowerCase().contains('deny')));
+  return hasMode && f.fields.any((x) => RegExp(r'^mac(addr)?\d*$', caseSensitive: false).hasMatch(x.name));
+}
+
+String? totoAclPreflight(HtmlForm f, String pageHtml, Set<String> changing) {
+  if (!isTotoAclForm(f)) return 'ده مش فورم التحكم بالـ MAC';
+  if (f.fields.any((x) => x.type == 'file')) return 'فورم رفع ملفات ممنوع';
+  final names = {for (final x in f.dataFields) x.name};
+  // الحقول اللي ممكن تبقى في فورم التحكم بالـ MAC: الوضع، الـ MAC، التعليق، checkboxes الصفوف، wlan_idx، submit-url
+  final allowed = names.where((n) =>
+      changing.contains(n) ||
+      RegExp(r'^(mac(addr)?\d*|comment|desc.*|select\d*|wlan_?idx|submit-url|wlanacenabled|wlanacnum|wlan_?disabled|acnum|.*filtermac.*)$', caseSensitive: false).hasMatch(n)).toSet();
+  final extra = names.difference(allowed);
+  // أي حقل تاني لازم ميكونش في قايمة الحظر
+  final probe = HtmlForm(f.page, f.action, f.method, f.name, f.fields.where((x) => extra.contains(x.name) || x.isButton).toList(), '');
+  final b = totoBlockReason(probe);
+  if (b != null) return b;
+  final js = jsFilledFields(pageHtml, f.dataFields.map((x) => x.name).where((n) => !changing.contains(n)));
+  if (js.isNotEmpty) return 'الصفحة بتملا قيم (${js.take(4).join('، ')}) بالجافاسكريبت — لو بعتّ هيتبعت قيم غلط';
+  if (f.method != 'post') return 'الفورم مش POST';
+  return null;
+}
+
+/// MACs الموبايل ده (علشان منشيلوش من قايمة المسموح): من جدول الراوتر بعنوان الموبايل، ومن جدول الأكسس بعنوانه
+Set<String> myMacsFrom(String phoneIp, List<LanHost> hosts, List<TotoClient> clients) => {
+      for (final h in hosts)
+        if (phoneIp.isNotEmpty && h.ip == phoneIp && h.mac.isNotEmpty) normMac(h.mac),
+      for (final c in clients)
+        if (phoneIp.isNotEmpty && c.ip == phoneIp) normMac(c.mac),
+    };
+
+// ---------------- fix19: DNS الأكسس (TOTOLINK — صفحة LAN Settings / tcpiplan.htm) ----------------
+// التعديل المسموح: DNS بس. الفورم بيتبعت بكل قيمه الحالية زي ما هي (IP، Mask، DHCP، المدى، STP…)
+// والتغيير في حقول الـ DNS بس. قبل الإرسال بنقارن اللي هيتبعت باللي اتقرا، ولو أي حقل تاني اختلف بنوقف.
+class TotoDnsForm {
+  final HtmlForm form;
+  final HtmlField? mode; // select أو radio
+  final String? manualValue; // قيمة «DNS Manually»
+  final String modeText; // الوضع الحالي
+  final HtmlField dns1;
+  final HtmlField? dns2;
+  final HtmlField? lanIp;
+  TotoDnsForm(this.form, this.mode, this.manualValue, this.modeText, this.dns1, this.dns2, this.lanIp);
+  Set<String> get dnsNames => {dns1.name, if (dns2 != null) dns2!.name, if (mode != null) mode!.name};
+}
+
+/// قيم الـ select اللي الصفحة بتختارها بالجافاسكريبت (selectedIndex/value) — علشان نبعتها زي ما هي فعلًا
+Map<String, String> jsResolvedSelects(HtmlForm f, String pageHtml) => {
+      for (final x in f.dataFields)
+        if (x.type == 'select')
+          if (selectedOptionWithJs(x, pageHtml) case final o? when o.value != x.selectedValue) x.name: o.value,
+    };
+
+TotoDnsForm? findTotoDnsForm(List<HtmlForm> forms, Map<String, String> pages) {
+  for (final f in forms) {
+    final d1 = f.field((x) => RegExp(r'^(dns1|dns_?1|dnsserver1|primary_?dns|wan_?dns1|lan_?dns1)$', caseSensitive: false).hasMatch(x.name) && x.type == 'text');
+    if (d1 == null) continue;
+    final d2 = f.field((x) => RegExp(r'^(dns2|dns_?2|dnsserver2|secondary_?dns|wan_?dns2|lan_?dns2)$', caseSensitive: false).hasMatch(x.name) && x.type == 'text');
+    final html = pages[f.page] ?? '';
+    HtmlField? mode;
+    String? manual;
+    var cur = '';
+    final sel = f.field((x) => x.type == 'select' && x.name.toLowerCase().contains('dns') && x.options.any((o) => '${o.text} ${o.value}'.toLowerCase().contains('manual')));
+    if (sel != null) {
+      mode = sel;
+      manual = sel.options.firstWhere((o) => '${o.text} ${o.value}'.toLowerCase().contains('manual')).value;
+      cur = selectedOptionWithJs(sel, html)?.text ?? '';
+    } else {
+      final radios = f.fields.where((x) => x.type == 'radio' && x.name.toLowerCase().contains('dns')).toList();
+      final man = radios.where((x) => x.value.toLowerCase().contains('manual')).firstOrNull;
+      if (man != null) {
+        mode = man;
+        manual = man.value;
+        cur = radios.where((x) => x.checked).firstOrNull?.value ?? '';
+      }
+    }
+    final ip = f.field((x) => RegExp(r'^(lan_?ip(addr)?|ip(addr)?)$', caseSensitive: false).hasMatch(x.name) && x.type == 'text');
+    return TotoDnsForm(f, mode, manual, cur, d1, d2, ip);
+  }
+  return null;
+}
+
+/// التغييرات المطلوبة (DNS بس)
+Map<String, String> totoDnsChanges(TotoDnsForm d, String dns1, String dns2) => {
+      d.dns1.name: dns1,
+      if (d.dns2 != null) d.dns2!.name: dns2,
+      if (d.mode != null && d.manualValue != null) d.mode!.name: d.manualValue!,
+    };
+
+/// الحارس: يقارن اللي هيتبعت باللي اتقرا. null = تمام؛ غير كده = سبب الإيقاف.
+String? totoDnsGuard(HtmlForm f, String pageHtml, Map<String, String> payload, Set<String> dnsNames, {String? submit}) {
+  if (f.method != 'post') return 'الفورم مش POST';
+  if (f.fields.any((x) => x.type == 'file')) return 'فورم رفع ملفات ممنوع';
+  if (!f.action.contains('boafrm/') && !f.action.toLowerCase().contains('goform/')) return 'الفورم مش بيروح لـ boafrm (${f.action})';
+  // نفس قايمة الحظر، من غير كلمات صفحة الـ LAN نفسها (الحقول دي بتتبعت زي ما هي بالظبط — الحارس بيتأكد)
+  const lanWords = {'tcpip', 'lan_ip', 'lanip', 'dhcp'};
+  final hard = kTotoBlockWords.where((w) => !lanWords.contains(w)).toList();
+  String? hit(String s) => hard.where((w) => s.toLowerCase().contains(w)).firstOrNull;
+  final a = hit(f.action) ?? hit(f.name);
+  if (a != null) return 'الفورم ($a) ممنوع';
+  for (final x in f.dataFields) {
+    if (x.name.toLowerCase() == 'submit-url') continue;
+    final h = hit(x.name);
+    if (h != null && !dnsNames.contains(x.name)) return 'فيه حقل ممنوع (${x.name})';
+  }
+  final resolved = jsResolvedSelects(f, pageHtml);
+  final js = jsFilledFields(pageHtml, f.dataFields.where((x) => x.type != 'select').map((x) => x.name).where((n) => !dnsNames.contains(n)));
+  if (js.isNotEmpty) return 'الصفحة بتملا قيم (${js.take(4).join('، ')}) بالجافاسكريبت — لو بعتّ هيتبعت قيم غلط';
+  final base = formPayload(f, resolved, submit: submit);
+  final keys = {...base.keys, ...payload.keys};
+  final btns = {for (final b in f.buttons) b.name};
+  final diff = [for (final k in keys) if (base[k] != payload[k] && !dnsNames.contains(k) && !btns.contains(k)) k];
+  if (diff.isNotEmpty) return 'حقول غير الـ DNS هتتغيّر (${diff.take(4).join('، ')}) — وقفت';
+  return null;
+}
+
+/// fix19: ملحوظة الـ DNS على الأكسس
+const String kTotoDnsNote =
+    'مهم: الأكسس شغال Repeater والـ DHCP بتاعه مقفول — يعني الأجهزة اللي عليه بتاخد الـ DNS من الراوتر ZTE (هو اللي بيوزّع العناوين). '
+    'DNS الأكسس هنا بيأثر على الأكسس نفسه بس. عشان تغيّر الـ DNS لكل البيت غيّره من «DNS الراوتر».';
+
 class TotoPage extends StatefulWidget {
   final ZteRouter? router;
   final List<LanHost> hosts;
@@ -15270,9 +16201,13 @@ class _TotoPageState extends State<TotoPage> {
   List<TotoClient> clients = [];
   List<MapEntry<String, String>> info = [];
 
+  bool _autoScanned = false;
+
   @override
   void initState() {
     super.initState();
+    final rh = widget.router?.host ?? '';
+    if (isIpv4(rh)) TotoStore.homePrefix = prefixOf(rh);
     _check();
   }
 
@@ -15301,10 +16236,49 @@ class _TotoPageState extends State<TotoPage> {
   Future<void> _check() => _run('بشوف الأكسس…', () async {
         net = await readPhoneNet();
         final ip = ipC.text.trim();
-        reachable = await port80Open(ip);
-        status = reachable! ? 'الأكسس رد على $ip' : 'الأكسس مش بيرد على $ip';
+        // fix19: لو العنوان فاضي (أول مرة) منجربش أي عنوان افتراضي في الخانة — ندوّر على طول
+        reachable = ip.isEmpty ? false : await port80Open(ip);
+        status = ip.isEmpty ? 'العنوان فاضي — بدوّر على الأكسس…' : (reachable! ? 'الأكسس رد على $ip' : 'الأكسس مش بيرد على $ip');
+        if (!reachable!) {
+          // fix18: يمكن اتنقل لعنوان من شبكة البيت (زي 192.168.7.2) — نجرّب العناوين المتوقعة الأول، وبعدين ندوّر في الشبكة مرة واحدة
+          final found = await _findElsewhere(ip);
+          if (found != null) {
+            ipC.text = found;
+            TotoStore.ip = found;
+            reachable = true;
+            status = ip.isEmpty ? 'لقيت الأكسس على $found ✓ (اتحفظ)' : 'الأكسس مكانش على $ip — لقيته على $found ✓';
+            return;
+          }
+          if (ip.isEmpty) {
+            status = 'ملقتش الأكسس لوحدي — اكتب عنوانه في الخانة (زي ما غيرته) ودوس دخول';
+            return;
+          }
+        }
         if (!reachable! && net?.prefix.isNotEmpty == true && prefixOf(ip) != net!.prefix) await _suggest();
       });
+
+  Future<String?> _findElsewhere(String saved) async {
+    final cands = totoFallbackIps(saved, phonePrefix: net?.prefix ?? '', homePrefix: TotoStore.homePrefix);
+    for (final c in cands) {
+      if (!await port80Open(c)) continue;
+      final d = TotoDevice(c);
+      try {
+        if (await d.identify() != null) {
+          AppLog.add('TOTO', 'found at fallback $c');
+          return c;
+        }
+      } catch (_) {
+      } finally {
+        d.close();
+      }
+    }
+    final prefix = net?.prefix ?? '';
+    if (_autoScanned || prefix.isEmpty) return null;
+    _autoScanned = true;
+    if (mounted) setState(() => status = '${saved.isEmpty ? 'العنوان فاضي' : 'الأكسس مش بيرد على $saved'} — بدوّر عليه في $prefix.x…');
+    final f = await scanForToto(prefix);
+    return f.isEmpty ? null : f.first;
+  }
 
   Future<void> _suggest() async {
     final prefix = net?.prefix ?? '';
@@ -15404,6 +16378,15 @@ class _TotoPageState extends State<TotoPage> {
         }
       }
     }
+    for (final e in d.pages.entries) {
+      if (!e.key.toLowerCase().contains('opmode')) continue;
+      final m = totoOpModeFrom(e.value);
+      if (m.isNotEmpty) {
+        TotoStore.opMode = m;
+        inf.insert(0, MapEntry('Operation Mode', m));
+        AppLog.add('TOTO', 'operation mode = $m');
+      }
+    }
     final seen = <String>{};
     info = [for (final e in inf) if (seen.add(e.key)) e];
     clients = cl.values.toList();
@@ -15421,8 +16404,12 @@ class _TotoPageState extends State<TotoPage> {
     }
     for (final f in d.forms) {
       final why = totoBlockReason(f);
-      AppLog.add('TOTO', '${f.describe()}  → ${why == null ? 'مسموح' : 'ممنوع: $why'}');
+      AppLog.add('TOTO', '${f.describe()}  → ${why == null ? 'مسموح' : 'ممنوع: $why'}${isTotoAclForm(f) ? ' | فورم التحكم بالـ MAC (استثناء: إضافة/مسح MAC بس)' : ''}');
     }
+    final acl = _acl;
+    AppLog.add('TOTO', acl == null
+        ? 'ACL: ملقتش فورم Wireless Access Control'
+        : 'ACL: page=${acl.page} mode=${acl.mode} text="${acl.modeText}" value="${acl.modeValue}" entries=${acl.entries.map((e) => '${e.mac}${e.name.isEmpty ? '' : '(${e.name})'}').join(', ')} myMacs=${_myMacs.join(',')}');
     toast(context, 'اتكتبت في السجل ✓ — افتح السجل وشاركه');
   }
 
@@ -15518,106 +16505,248 @@ class _TotoPageState extends State<TotoPage> {
     });
   }
 
-  Future<void> _block(TotoClient c) => _run('بحظر ${c.mac}…', () async {
-        final r = findMacAddForm(dev!.forms);
-        if (r == null) {
-          status = 'ملقتش فورم التحكم بالـ MAC';
-          return;
-        }
-        final ch = <String, String>{r.mac.name: macForField(c.mac, r.mac)};
-        if (r.comment != null) ch[r.comment!.name] = 'A2R';
-        var note = '';
-        if (r.mode != null) {
-          final cur = r.mode!.selectedText.toLowerCase();
-          if (cur.contains('allow')) {
-            status = 'الأكسس شغال بنظام «المسموح بس» — الإضافة هتسمح للجهاز مش تحظره. مش هعمل حاجة.';
-            return;
-          }
-          if (r.deny == null) {
-            status = 'مش لاقي اختيار «Deny» في الفورم';
-            return;
-          }
-          if (!cur.contains('deny')) note = '\nالتحكم بالـ MAC مقفول دلوقتي — هيتشغل بنظام «امنع اللي في القايمة» (القايمة فيها الجهاز ده بس).';
-          ch[r.mode!.name] = r.deny!.value;
-        }
-        if (await _apply('حظر', r.form, ch, submit: r.addBtn, summary: 'حظر ${c.name.isEmpty ? c.mac : c.name} من واي فاي الأكسس؟ (هيقدر يتوصل بالراوتر الأساسي عادي)$note')) {
-          await Future.delayed(const Duration(seconds: 2));
-          await _read();
-          status = findMacDelete(dev!.forms, c.mac) != null ? 'اتحظر ✓ (ظهر في قايمة الجهاز)' : 'اتبعت — بس مش لاقيه في قايمة الحظر بعد القراية';
-        }
-      });
+  // fix19: التحكم بالـ MAC بيتقرا حسب الوضع (Allow/Deny/Disabled) من فورم الجهاز نفسه
+  TotoAcl? get _acl => dev == null ? null : totoAclFrom(dev!.forms, dev!.pages);
 
-  Future<void> _unblock(TotoClient c) => _run('بفك الحظر…', () async {
-        final r = findMacDelete(dev!.forms, c.mac);
-        if (r == null) {
-          status = 'الجهاز ده مش في قايمة الحظر بتاعة الأكسس';
-          return;
-        }
-        if (await _apply('فك الحظر', r.form, {r.checkbox: 'ON'}, submit: r.delBtn, summary: 'فك حظر ${c.mac}؟')) {
-          await Future.delayed(const Duration(seconds: 2));
-          await _read();
-          status = findMacDelete(dev!.forms, c.mac) == null ? 'اتفك الحظر ✓' : 'اتبعت — بس لسه موجود في القايمة';
-        }
-      });
+  Set<String> get _myMacs => myMacsFrom(net?.ip ?? '', widget.hosts, clients);
 
-  List<TotoClient> get _blockedList {
-    final d = dev;
-    if (d == null) return [];
-    final out = <TotoClient>[];
-    for (final e in d.pages.entries) {
-      final l = e.key.toLowerCase();
-      if (!(l.contains('ac') && l.contains('ctrl') || l.contains('filter'))) continue;
-      out.addAll(clientsFromRows(tableRows(e.value), e.key));
+  Future<bool> _applyAcl(String title, HtmlForm f, Map<String, String> changes, {String? submit, required String summary}) async {
+    final pageHtml = dev!.pages[f.page] ?? '';
+    final why = totoAclPreflight(f, pageHtml, changes.keys.toSet());
+    if (why != null) {
+      AppLog.add('TOTO', '$title: مش هبعت — $why\n${f.describe()}');
+      if (mounted) toast(context, 'مش هقدر أعملها من التطبيق بأمان: $why');
+      return false;
     }
-    return out;
+    if (!mounted || !await confirm(context, '«تجريبي» $summary\nهيتبعت نفس فورم الجهاز (${f.action}) بكل قيمه الحالية والتغيير ده بس.')) return false;
+    final body = formPayload(f, changes, submit: submit);
+    AppLog.add('TOTO', '$title POST ${f.action} ${totoMask(body.entries.map((e) => '${e.key}=${e.value}').join('&'))}');
+    final code = await dev!.submit(f, body, only: 'acl');
+    AppLog.add('TOTO', '$title → HTTP $code');
+    return code < 400;
   }
+
+  /// block=true: امنعه — في وضع «المسموح بس» ده معناه شيله من القايمة
+  Future<void> _aclEdit(TotoClient c, bool block) => _run(block ? 'بحظر ${c.mac}…' : 'بفك الحظر…', () async {
+        final acl = _acl;
+        if (acl == null || acl.addForm == null) {
+          status = 'ملقتش فورم التحكم بالـ MAC (Wireless Access Control) في صفحات الجهاز';
+          return;
+        }
+        final plan = planTotoBlock(acl, c.mac, block, myMacs: _myMacs);
+        AppLog.add('TOTO', 'ACL mode=${acl.mode}(${acl.modeText}/${acl.modeValue}) entries=${acl.entries.length} ${block ? 'block' : 'unblock'} ${c.mac} → ${plan.refuse ?? plan.op}');
+        if (plan.refuse != null) {
+          status = plan.refuse!;
+          return;
+        }
+        final who = c.name.isEmpty ? c.mac : '${c.name} (${c.mac})';
+        bool sent;
+        if (plan.op == 'remove') {
+          final r = findMacDelete(dev!.forms, c.mac);
+          if (r == null) {
+            status = 'لقيت الجهاز في القايمة بس ملقتش زرار «Delete Selected» جنبه — اعملها من صفحة الجهاز';
+            return;
+          }
+          sent = await _applyAcl(block ? 'حظر (شيل من المسموح)' : 'فك الحظر', r.form, {r.checkbox: 'ON'}, submit: r.delBtn,
+              summary: '${block ? 'حظر' : 'فك حظر'} $who؟\n${plan.note}${block && acl.mode == 'allow' ? '\nالجهاز هيفصل من واي فاي الأكسس.' : ''}');
+        } else {
+          final r = findMacAddForm(dev!.forms)!;
+          final ch = <String, String>{r.mac.name: macForField(c.mac, r.mac)};
+          if (r.comment != null) {
+            final cm = c.name.replaceAll(RegExp(r'[^\x20-\x7E]'), '').trim();
+            ch[r.comment!.name] = cm.isEmpty ? 'A2R' : (cm.length > 16 ? cm.substring(0, 16) : cm);
+          }
+          if (r.mode != null) {
+            if (acl.mode == 'off') {
+              if (r.deny == null) {
+                status = 'مش لاقي اختيار «Deny» في الفورم';
+                return;
+              }
+              ch[r.mode!.name] = r.deny!.value;
+            } else {
+              ch[r.mode!.name] = acl.modeValue; // نفس الوضع الحالي بالظبط — مفيش تغيير
+            }
+          }
+          sent = await _applyAcl(block ? 'حظر' : 'فك الحظر (رجوع للمسموح)', r.form, ch, submit: r.addBtn, summary: '${block ? 'حظر' : 'رجّع'} $who؟\n${plan.note}');
+        }
+        if (!sent) return;
+        await Future.delayed(const Duration(seconds: 2));
+        await _read();
+        final after = _acl;
+        final listed = after?.has(c.mac) ?? false;
+        final wantListed = plan.op == 'add';
+        final modeSame = after?.mode == (acl.mode == 'off' ? 'deny' : acl.mode);
+        AppLog.add('TOTO', 'بعد القراية: mode=${after?.mode} entries=${after?.entries.length} listed=$listed');
+        status = (listed == wantListed && modeSame)
+            ? '${block ? 'اتحظر' : 'اتفك الحظر'} ✓ (اتأكدت من قايمة الجهاز — الوضع ${after!.modeAr})'
+            : 'اتبعت، بس لما قريت تاني: الجهاز ${listed ? 'لسه' : 'مش'} في القايمة والوضع ${after?.modeAr ?? '؟'} — ابعتلي «شارك صفحات الجهاز»';
+      });
+
+  // fix19: DNS الأكسس (تعديل DNS بس من فورم صفحة LAN Settings)
+  Future<void> _dns() async {
+    final d = findTotoDnsForm(dev!.forms, dev!.pages);
+    if (d == null) {
+      setState(() => status = 'ملقتش خانات الـ DNS في صفحات الجهاز (LAN Settings) — دوس «شارك صفحات الجهاز» وابعتلي السجل');
+      return;
+    }
+    AppLog.add('TOTO', 'DNS read: page=${d.form.page} action=${d.form.action} mode="${d.modeText}" ${d.dns1.name}=${d.dns1.value} ${d.dns2?.name}=${d.dns2?.value} ip=${d.lanIp?.value}');
+    final prev = _jsonMap('toto_dns_prev');
+    final pick = await showModalBottomSheet<(String, String)>(
+      context: context,
+      isScrollControlled: true,
+      builder: (c) {
+        final p1 = TextEditingController(), p2 = TextEditingController();
+        return SafeArea(
+          child: Padding(
+            padding: EdgeInsets.only(bottom: MediaQuery.of(c).viewInsets.bottom),
+            child: ListView(shrinkWrap: true, padding: const EdgeInsets.all(12), children: [
+              Text('DNS الأكسس دلوقتي: ${d.modeText.isEmpty ? '' : '${d.modeText} • '}${d.dns1.value}${d.dns2 == null ? '' : ' / ${d.dns2!.value}'}',
+                  textDirection: TextDirection.ltr, textAlign: TextAlign.right, style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 6),
+              const Text(kTotoDnsNote, style: TextStyle(color: kMuted, fontSize: 12, height: 1.5)),
+              for (final x in kDnsPresets)
+                ListTile(
+                  dense: true,
+                  title: Text(x.name),
+                  subtitle: Text('${x.primary} / ${x.secondary}', textDirection: TextDirection.ltr, textAlign: TextAlign.right),
+                  onTap: () => Navigator.pop(c, (x.primary, x.secondary)),
+                ),
+              Row(children: [
+                Expanded(child: TextField(controller: p1, keyboardType: TextInputType.number, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'DNS 1'))),
+                const SizedBox(width: 8),
+                Expanded(child: TextField(controller: p2, keyboardType: TextInputType.number, textDirection: TextDirection.ltr, decoration: const InputDecoration(labelText: 'DNS 2'))),
+              ]),
+              const SizedBox(height: 8),
+              FilledButton(onPressed: () => Navigator.pop(c, (p1.text.trim(), p2.text.trim())), child: const Text('طبّق اليدوي')),
+              if (prev['p'] != null)
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.undo_rounded),
+                  label: Text('ارجع للقديم (${prev['p']} / ${prev['s'] ?? ''})'),
+                  onPressed: () => Navigator.pop(c, ('${prev['p']}', '${prev['s'] ?? ''}')),
+                ),
+            ]),
+          ),
+        );
+      },
+    );
+    if (pick == null) return;
+    final (n1, n2) = pick;
+    if (!isIpv4(n1) || (n2.isNotEmpty && !isIpv4(n2))) {
+      if (mounted) toast(context, 'اكتب عنوان صحيح زي 8.8.8.8');
+      return;
+    }
+    await _run('بغيّر DNS الأكسس…', () async {
+      final ipBefore = d.lanIp?.value ?? '';
+      final html = dev!.pages[d.form.page] ?? '';
+      final btn = d.form.buttons.where((b) => b.type == 'submit' && RegExp(r'save|apply', caseSensitive: false).hasMatch('${b.name} ${b.value}')).firstOrNull?.name;
+      final payload = formPayload(d.form, {...jsResolvedSelects(d.form, html), ...totoDnsChanges(d, n1, n2)}, submit: btn);
+      final why = totoDnsGuard(d.form, html, payload, d.dnsNames, submit: btn);
+      if (why != null) {
+        AppLog.add('TOTO', 'DNS: مش هبعت — $why\n${d.form.describe()}');
+        status = 'مش هقدر أغيّر الـ DNS من التطبيق بأمان: $why';
+        return;
+      }
+      if (!mounted ||
+          !await confirm(context,
+              '«تجريبي» تغيير DNS الأكسس لـ $n1${n2.isEmpty ? '' : ' / $n2'}؟\nهيتبعت فورم LAN Settings بكل قيمه الحالية زي ما هي (العنوان $ipBefore، الـ DHCP، المدى…) والـ DNS بس اللي هيتغيّر. اتأكدت إن مفيش حقل تاني مختلف.\n\n$kTotoDnsNote')) {
+        return;
+      }
+      await Store.p.setString('toto_dns_prev', jsonEncode({'p': d.dns1.value, 's': d.dns2?.value ?? ''}));
+      AppLog.add('TOTO', 'DNS POST ${d.form.action} ${totoMask(payload.entries.map((e) => '${e.key}=${e.value}').join('&'))}');
+      final code = await dev!.submit(d.form, payload, only: 'dns');
+      AppLog.add('TOTO', 'DNS → HTTP $code');
+      if (code >= 400) {
+        status = 'الجهاز رد بـ HTTP $code — ابعتلي السجل';
+        return;
+      }
+      await Future.delayed(const Duration(seconds: 4));
+      dev!.pages.remove(d.form.page);
+      await _read();
+      final a = findTotoDnsForm(dev!.forms, dev!.pages);
+      final ipAfter = a?.lanIp?.value ?? '';
+      AppLog.add('TOTO', 'DNS بعد القراية: ${a?.dns1.value} / ${a?.dns2?.value} ip=$ipAfter');
+      if (ipBefore.isNotEmpty && ipAfter.isNotEmpty && ipAfter != ipBefore) {
+        status = '⚠ عنوان الأكسس اتغيّر ($ipBefore ← $ipAfter)! ابعتلي السجل فورًا';
+      } else if (a != null && a.dns1.value == n1 && (a.dns2 == null || a.dns2!.value == n2)) {
+        status = 'اتغيّر DNS الأكسس ✓ (اتأكدت من الصفحة — والعنوان لسه ${ipAfter.isEmpty ? ipBefore : ipAfter})';
+      } else {
+        status = 'اتبعت، بس الصفحة لسه بتقول ${a?.dns1.value ?? '؟'} — ممكن يحتاج ريستارت أو الجهاز رفض. ابعتلي السجل';
+      }
+    });
+  }
+
+  Future<void> _block(TotoClient c) => _aclEdit(c, true);
+  Future<void> _unblock(TotoClient c) => _aclEdit(c, false);
 
   Widget _wrongSubnetCard() {
     final ip = ipC.text.trim();
-    final p = net?.prefix ?? '192.168.7';
+    final p = TotoStore.homePrefix.isNotEmpty ? TotoStore.homePrefix : (net?.prefix ?? '192.168.7');
+    final mode = TotoStore.opMode;
+    final kind = totoOpModeKind(mode);
+    final modeLine = kind == 'safe'
+        ? '✓ وضع الجهاز «$mode» — يعني بياخد النت بالواي فاي من الراوتر ويبعته تاني، فتغيير عنوانه لعنوان من شبكة البيت آمن ومش هيقطع النت.'
+        : kind == 'risky'
+            ? '⛔ وضع الجهاز «$mode» — متغيّرش عنوانه (النت ممكن يقطع على الأجهزة اللي عليه). ابعتلي صورة صفحة Operation Mode الأول.'
+            : '⚠ الأول افتح «Operation Mode»: الخطوات دي بس لو الوضع Repeater (Range Extender) أو Bridge. لو WISP أو Router متغيّرش عنوانه — كمّل ادخله بالعنوان اليدوي زي ما بتعمل.';
+    final newIp = suggest.isNotEmpty ? suggest.first : '$p.2';
     return Card(
       color: const Color(0xFF2A2210),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('الأكسس بوينت على عنوان $ip والموبايل على شبكة $p — علشان التطبيق يوصله دايمًا: غيّر عنوانه لعنوان من شبكة البيت',
+          Text('الأكسس بوينت على عنوان $ip وشبكة البيت $p.x — علشان التطبيق يوصله من غير عنوان يدوي: غيّر عنوانه لعنوان من شبكة البيت',
               style: const TextStyle(fontWeight: FontWeight.w700, height: 1.6)),
           const SizedBox(height: 8),
-          Text(
-            [
-              'الخطوات (من صفحة الأكسس نفسها، بإيدك — التطبيق مش بيغيّر عنوان الأكسس):',
-              '⚠ الأول افتح «Operation Mode»: الخطوات دي بس لو الوضع Repeater أو Bridge/AP. لو WISP أو Gateway متغيّرش عنوانه (النت هيقطع على الأجهزة اللي عليه) — كمّل ادخله بالعنوان اليدوي زي ما بتعمل.',
-              '1) وصّل الموبايل بالأكسس بعنوان يدوي زي ما بتعمل، وافتح $ip',
-              '2) Network ← LAN',
-              '3) IP Address: ${suggest.isNotEmpty ? suggest.first : '$p.250'}${suggest.length > 1 ? ' (أو ${suggest[1]})' : ''}',
-              '4) Subnet Mask: 255.255.255.0',
-              '5) Default Gateway: $p.1',
-              '6) DHCP Server: Disabled (الراوتر هو اللي يوزّع)',
-              '7) Save / Apply واستنى يعمل ريستارت',
-              '8) رجّع الموبايل على DHCP العادي، واكتب العنوان الجديد هنا أو دوس «دوّر في الشبكة»',
-            ].join('\n'),
-            style: const TextStyle(height: 1.7, fontSize: 13),
-          ),
+          Text(modeLine, style: TextStyle(height: 1.6, fontSize: 13, color: kind == 'risky' ? kBad : null)),
+          if (kind != 'risky') ...[
+            const SizedBox(height: 8),
+            Text(
+              [
+                'الخطوات (من صفحة الأكسس نفسها، بإيدك — التطبيق مش بيغيّر عنوان الأكسس):',
+                '1) وصّل الموبايل بالأكسس بعنوان يدوي زي ما بتعمل، وافتح $ip',
+                '2) Network ← LAN Settings',
+                '3) IP Address: $newIp${suggest.length > 1 ? ' (أو ${suggest[1]})' : ''}',
+                '4) Subnet Mask: 255.255.255.0',
+                '5) لو فيه خانة Default Gateway: $p.1 (في صفحتك مفيش — عادي)',
+                '6) DHCP On/Off: Disabled زي ما هو (الراوتر هو اللي يوزّع)',
+                '7) سيب DNS زي ما هو، ومتلمسش Operation Mode ولا Wireless Repeater',
+                '8) Apply واستنى الجهاز يعمل ريستارت (دقيقة تقريبًا)',
+                '9) رجّع الموبايل على DHCP العادي (اتصل بالواي فاي من غير عنوان يدوي)، وافتح الكارت ده تاني — هيلاقيه لوحده على $newIp',
+              ].join('\n'),
+              style: const TextStyle(height: 1.7, fontSize: 13),
+            ),
+            const SizedBox(height: 6),
+            const Text('لو بعد التغيير مقدرتش توصله: اتصل بالواي فاي بعنوان يدوي من نفس الشبكة الجديدة (مثلًا آخره .200) وافتح العنوان الجديد.',
+                style: TextStyle(fontSize: 12, color: kMuted, height: 1.5)),
+          ],
           if (dhcpInfo.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 6), child: Text(dhcpInfo, style: const TextStyle(fontSize: 12, color: kMuted))),
           if (suggest.isNotEmpty)
-            Text('العناوين المقترحة اتجربت بـ ping ومحدش راد عليها دلوقتي', style: const TextStyle(fontSize: 12, color: kMuted)),
+            const Text('العناوين المقترحة اتجربت بـ ping ومحدش راد عليها دلوقتي', style: TextStyle(fontSize: 12, color: kMuted)),
         ]),
       ),
     );
   }
 
-  Widget _clientTile(TotoClient c, {bool blocked = false}) {
-    final z = widget.hosts.where((h) => h.mac == c.mac).firstOrNull;
+  Widget _clientTile(TotoClient c, {bool blocked = false, TotoAcl? acl}) {
+    final z = widget.hosts.where((h) => normMac(h.mac) == c.mac).firstOrNull;
+    final inList = acl?.has(c.mac) ?? false;
+    // fix19: الشارة حسب الوضع: «مسموح» في وضع Allow، «محظور» في وضع Deny بس
+    if (acl != null) blocked = (acl.mode == 'deny' && inList) || (acl.mode == 'allow' && !inList && acl.entries.isNotEmpty);
+    final allowed = acl?.mode == 'allow' && inList;
     final name = z != null ? widget.labelOf(z) : (c.name.isNotEmpty ? c.name : '(اسم مش معروف)');
     return ListTile(
       leading: Icon(blocked ? Icons.block_rounded : Icons.devices_other_rounded, color: blocked ? kBad : kGold),
-      title: Text(name),
+      title: Row(children: [
+        Flexible(child: Text(name, overflow: TextOverflow.ellipsis)),
+        if (allowed) const Padding(padding: EdgeInsets.only(right: 6), child: Text('مسموح', style: TextStyle(color: Colors.greenAccent, fontSize: 12))),
+        if (blocked) const Padding(padding: EdgeInsets.only(right: 6), child: Text('محظور', style: TextStyle(color: Colors.redAccent, fontSize: 12))),
+      ]),
       subtitle: Text([c.mac, if ((z?.ip ?? c.ip).isNotEmpty) z?.ip ?? c.ip, if (z != null) 'في قايمة الراوتر', if (c.extra.isNotEmpty) c.extra].join(' • '), style: const TextStyle(fontSize: 12)),
       trailing: PopupMenuButton<String>(
         onSelected: (v) => v == 'b' ? _block(c) : _unblock(c),
         itemBuilder: (_) => [
-          if (!blocked) const PopupMenuItem(value: 'b', child: Text('احظره من الأكسس (تجريبي)')),
-          const PopupMenuItem(value: 'u', child: Text('فك الحظر (تجريبي)')),
+          if (!blocked) PopupMenuItem(value: 'b', child: Text(acl?.mode == 'allow' ? 'احظره (شيله من قايمة المسموح) — تجريبي' : 'احظره من الأكسس (تجريبي)')),
+          if (blocked || inList) PopupMenuItem(value: 'u', child: Text(acl?.mode == 'allow' ? 'رجّعه لقايمة المسموح (تجريبي)' : 'فك الحظر (تجريبي)')),
         ],
       ),
     );
@@ -15626,8 +16755,15 @@ class _TotoPageState extends State<TotoPage> {
   @override
   Widget build(BuildContext context) {
     final ip = ipC.text.trim();
-    final wrongNet = reachable == false && (net?.prefix ?? '').isNotEmpty && prefixOf(ip) != net!.prefix;
-    final blocked = _blockedList;
+    final home = TotoStore.homePrefix;
+    final wrongNet = ip.isNotEmpty && (reachable == false && (net?.prefix ?? '').isNotEmpty && prefixOf(ip) != net!.prefix) ||
+        (isIpv4(ip) && home.isNotEmpty && prefixOf(ip) != home);
+    final acl = _acl;
+    final listOnly = [
+      if (acl != null)
+        for (final e in acl.entries)
+          if (!clients.any((c) => c.mac == e.mac)) e,
+    ];
     return Scaffold(
       appBar: AppBar(title: const Text('الأكسس بوينت (TOTOLINK)'), actions: [
         IconButton(tooltip: 'افتح صفحة الجهاز', icon: const Icon(Icons.public_rounded), onPressed: () => _openWeb()),
@@ -15639,9 +16775,9 @@ class _TotoPageState extends State<TotoPage> {
               controller: ipC,
               keyboardType: TextInputType.number,
               textDirection: TextDirection.ltr,
-              decoration: const InputDecoration(labelText: 'عنوان الأكسس'),
+              decoration: const InputDecoration(labelText: 'عنوان الأكسس', hintText: 'اكتب عنوانه (أو سيبه فاضي ودوّر)'),
               onSubmitted: (v) {
-                TotoStore.ip = v.trim();
+                if (isIpv4(v.trim())) TotoStore.ip = v.trim();
                 _check();
               },
             ),
@@ -15684,16 +16820,35 @@ class _TotoPageState extends State<TotoPage> {
           ],
           const SectionTitle('الأجهزة المتوصلة بالأكسس', icon: Icons.wifi_rounded),
           if (clients.isEmpty) const Text('ملقتش جدول أجهزة في صفحات الجهاز (شارك صفحات الجهاز وابعتلي السجل)', style: TextStyle(color: kMuted)),
-          for (final c in clients) Card(child: _clientTile(c)),
-          if (blocked.isNotEmpty) ...[
-            const SectionTitle('محظورين من الأكسس', icon: Icons.block_rounded),
-            for (final c in blocked) Card(child: _clientTile(c, blocked: true)),
+          for (final c in clients) Card(child: _clientTile(c, acl: acl)),
+          if (acl != null) ...[
+            SectionTitle(
+                acl.mode == 'allow'
+                    ? 'قايمة المسموح على الأكسس (${acl.entries.length})'
+                    : acl.mode == 'deny'
+                        ? 'محظورين من الأكسس (${acl.entries.length})'
+                        : 'قايمة الـ MAC على الأكسس (${acl.entries.length})',
+                icon: acl.mode == 'allow' ? Icons.verified_user_rounded : Icons.block_rounded),
+            Text(
+                'وضع التحكم بالـ MAC: ${acl.modeAr}'
+                '${acl.mode == 'off' && acl.entries.isNotEmpty ? ' — القايمة متسجلة بس الفلتر مقفول' : ''}'
+                '${acl.mode == 'allow' ? '\nالحظر هنا = شيل الجهاز من قايمة المسموح (مش هشيل الموبايل ده ولا آخر جهاز، والوضع مش هيتغيّر).' : ''}'
+                '\nملحوظة (تجريبي): الأكسس شغال Repeater، والفلتر ده غالبًا بيأثر بس على الأجهزة المتوصلة بواي فاي الأكسس نفسه — مش على اللي متوصلين بالراوتر مباشرة.',
+                style: const TextStyle(color: kMuted, fontSize: 12, height: 1.5)),
+            for (final c in listOnly) Card(child: _clientTile(c, acl: acl)),
           ],
           const SectionTitle('تحكم (تجريبي)', icon: Icons.tune_rounded),
           Wrap(spacing: 8, runSpacing: 8, children: [
             OutlinedButton.icon(onPressed: busy ? null : _ssid, icon: const Icon(Icons.wifi_rounded), label: const Text('اسم الواي فاي')),
             OutlinedButton.icon(onPressed: busy ? null : _key, icon: const Icon(Icons.key_rounded), label: const Text('باسورد الواي فاي')),
             OutlinedButton.icon(onPressed: busy ? null : _reboot, icon: const Icon(Icons.restart_alt_rounded), label: const Text('ريستارت')),
+            OutlinedButton.icon(onPressed: busy || dev == null ? null : _dns, icon: const Icon(Icons.dns_rounded), label: const Text('DNS الأكسس')),
+            if (widget.router != null)
+              OutlinedButton.icon(
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => RouterDnsPage(router: widget.router!))),
+                icon: const Icon(Icons.dns_outlined),
+                label: const Text('DNS الراوتر (لكل البيت)'),
+              ),
           ]),
           const Padding(
             padding: EdgeInsets.only(top: 8),
