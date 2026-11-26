@@ -3410,52 +3410,72 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     }
   }
 
-  Future<void> voice() async {
+  int _voiceEmpty = 0;
+
+  Map<String, String> _voiceLearned() {
+    try {
+      return (jsonDecode(Store.p.getString('voice_learned') ?? '{}') as Map).map((k, v) => MapEntry('$k', '$v'));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<void> _voiceLearn(String heard, StbChannel ch) async {
+    final k = normAr(heard);
+    if (k.isEmpty) return;
+    final m = _voiceLearned();
+    if (m.length > 200) m.remove(m.keys.first);
+    m[k] = ch.name;
+    await Store.p.setString('voice_learned', jsonEncode(m));
+  }
+
+  Future<void> voice({String? lang}) async {
     if (!connected) {
       toast(context, 'اتصل بالريسيفر الأول');
       return;
     }
-    final en = voiceLang == 'en-US';
+    final useLang = lang ?? voiceLang;
+    final en = useLang == 'en-US';
     final heard = await Native4.voice(
-      lang: voiceLang,
+      lang: useLang,
       prompt: en ? 'Say: open MBC Masr • channel 105 • volume up • mute • previous channel' : 'قول: افتح MBC • قناة 105 • علّي الصوت • اقفل • القناة السابقة',
     );
-    if (heard.isEmpty) return;
+    if (heard.isEmpty) {
+      AppLog.add('STB', 'voice $useLang: مفيش نتيجة من التعرف على الكلام');
+      if (!mounted) return;
+      if (lang == null && en && ++_voiceEmpty >= 2) {
+        _voiceEmpty = 0;
+        setState(() => voiceLang = 'ar-EG');
+        Store.p.setString('stb_voice_lang', voiceLang);
+        toast(context, 'الإنجليزي مردش مرتين، رجّعت الصوت للعربي (ع). تقدر تغيّره من EN/ع');
+      } else {
+        toast(context, 'ماسمعتش حاجة، جرّب تاني');
+      }
+      return;
+    }
+    _voiceEmpty = 0;
+    await _voiceHandle(heard, useLang);
+  }
+
+  Future<void> _voiceHandle(List<String> heard, String useLang) async {
     if (channels.isEmpty) await loadChannels();
-    final c = parseVoiceCommand(heard, channels);
-    AppLog.add('STB', 'voice "${heard.first}" → ${c.kind.name} ${c.describe}');
+    final c = parseVoiceCommand(heard, channels, learned: _voiceLearned());
+    AppLog.add('STB', 'voice $useLang guesses=${heard.map((e) => '"$e"').join(' | ')} → ${c.kind.name} ${c.describe}${c.alts.isEmpty ? '' : ' [${c.alts.map((e) => e.name).join(', ')}]'}');
     if (!mounted) return;
     switch (c.kind) {
       case VoiceKind.none:
-        toast(context, 'مفهمتش «${c.heard}» — جرّب تاني');
+        await _voiceSheet(c, useLang);
       case VoiceKind.recall:
         await _jumpLast();
       case VoiceKind.choose:
-        await showModalBottomSheet<void>(
-          context: context,
-          backgroundColor: kSurface,
-          showDragHandle: true,
-          builder: (sc) => ListView(shrinkWrap: true, padding: const EdgeInsets.only(bottom: 20), children: [
-            SectionTitle('سمعت «${c.heard}» — اختار القناة', icon: Icons.mic_rounded),
-            for (final ch in c.alts)
-              ListTile(
-                leading: const Icon(Icons.tv_rounded, color: kGold),
-                title: Directionality(textDirection: TextDirection.ltr, child: Align(alignment: Alignment.centerLeft, child: Text(ch.name))),
-                trailing: Text('${ch.index + 1}', style: const TextStyle(color: kMuted)),
-                onTap: () {
-                  Navigator.pop(sc);
-                  _zapTo(ch);
-                },
-              ),
-          ]),
-        );
+        await _voiceSheet(c, useLang);
       case VoiceKind.keys:
         if (c.keys.first == K.power && !await confirm(context, 'أقفل/أفتح الريسيفر؟')) return;
         for (final k in c.keys) {
           await key(k);
           await Future.delayed(const Duration(milliseconds: 250));
         }
-        if (mounted) toast(context, '«${c.heard}» ✓');
+        if (mounted) toast(context, 'سمعت: «${c.heard}» ✓');
       case VoiceKind.number:
         for (final k in digitKeys(c.number)) {
           await key(k);
@@ -3465,8 +3485,107 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       case VoiceKind.channel:
         await gm!.zap(c.channel!);
         setState(() => playingId = c.channel!.id);
-        if (mounted) toast(context, c.channel!.name);
+        if (mounted) toast(context, 'سمعت: «${c.heard}» → ${c.channel!.name}');
     }
+  }
+
+  /// v9: شاشة «سمعت»: اللي اتسمع + البدائل + أقرب القنوات + اسمع تاني بالإنجليزي/العربي
+  Future<void> _voiceSheet(VoiceCmd c, String useLang) async {
+    final others = [for (final t in c.texts.skip(1)) if (t.trim().isNotEmpty && normAr(t) != normAr(c.heard)) t];
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (sc) => SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            SectionTitle(c.kind == VoiceKind.none ? 'مفهمتش القناة' : 'سمعت، اختار القناة', icon: Icons.mic_rounded),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+              child: Row(children: [
+                const Text('سمعت: ', style: TextStyle(color: kMuted, fontSize: 13)),
+                Expanded(child: Directionality(textDirection: TextDirection.ltr, child: Text('"${c.heard}"', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)))),
+                Text(useLang == 'en-US' ? 'EN' : 'ع', style: const TextStyle(color: kGold, fontSize: 12)),
+              ]),
+            ),
+            if (others.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Wrap(spacing: 6, runSpacing: 4, children: [
+                  for (final g in others.take(4))
+                    ActionChip(
+                      visualDensity: VisualDensity.compact,
+                      label: Directionality(textDirection: TextDirection.ltr, child: Text(g, style: const TextStyle(fontSize: 12))),
+                      onPressed: () {
+                        Navigator.pop(sc);
+                        _voiceHandle([g, ...c.texts.where((t) => t != g)], useLang);
+                      },
+                    ),
+                ]),
+              ),
+            if (c.alts.isNotEmpty) ...[
+              const Padding(padding: EdgeInsets.fromLTRB(16, 8, 16, 0), child: Text('القنوات الأقرب', style: TextStyle(color: kMuted, fontSize: 12))),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+                child: Directionality(
+                  textDirection: TextDirection.ltr,
+                  child: FilledButton.icon(
+                    onPressed: () {
+                      Navigator.pop(sc);
+                      _voiceLearn(c.heard, c.alts.first);
+                      _zapTo(c.alts.first);
+                    },
+                    icon: const Icon(Icons.tv_rounded),
+                    label: Row(children: [Expanded(child: Text(c.alts.first.name, overflow: TextOverflow.ellipsis)), Text('الأرجح • ${c.alts.first.index + 1}')]),
+                    style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+                  ),
+                ),
+              ),
+              for (final ch in c.alts.skip(1))
+                ListTile(
+                  dense: true,
+                  leading: const Icon(Icons.tv_rounded, color: kGold),
+                  title: Directionality(textDirection: TextDirection.ltr, child: Align(alignment: Alignment.centerLeft, child: Text(ch.name))),
+                  trailing: Text('${ch.index + 1}', style: const TextStyle(color: kMuted)),
+                  onTap: () {
+                    Navigator.pop(sc);
+                    _voiceLearn(c.heard, ch);
+                    _zapTo(ch);
+                  },
+                ),
+            ],
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+              child: Row(children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(sc);
+                      voice(lang: 'en-US');
+                    },
+                    icon: const Icon(Icons.mic_rounded, size: 18),
+                    label: const Text('اسمع تاني بالإنجليزي', style: TextStyle(fontSize: 12)),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(sc);
+                      voice(lang: 'ar-EG');
+                    },
+                    icon: const Icon(Icons.mic_rounded, size: 18),
+                    label: const Text('اسمع تاني بالعربي', style: TextStyle(fontSize: 12)),
+                  ),
+                ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
   }
 
   Future<void> discover() async {
@@ -3747,10 +3866,14 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                 Store.p.setString('stb_voice_lang', voiceLang);
                 toast(context, voiceLang == 'en-US' ? 'الصوت: إنجليزي (للقنوات)' : 'الصوت: عربي (للأوامر)');
               },
+              onLongPress: () async {
+                await Store.p.remove('voice_learned');
+                if (mounted) toast(context, 'مسحت اختياراتك المحفوظة للصوت');
+              },
               style: TextButton.styleFrom(minimumSize: const Size(36, 36), padding: EdgeInsets.zero),
               child: Text(voiceLang == 'en-US' ? 'EN' : 'ع', style: const TextStyle(color: kGold, fontWeight: FontWeight.w800)),
             ),
-          if (on) IconButton(tooltip: 'أمر صوتي (تجريبي)', icon: const Icon(Icons.mic_rounded, color: kGold), onPressed: voice),
+          if (on) IconButton(tooltip: 'أمر صوتي (تجريبي)', icon: const Icon(Icons.mic_rounded, color: kGold), onPressed: () => voice()),
           if (on && view == 0)
             IconButton(
               tooltip: touchpad ? 'زراير' : 'تاتش باد',
@@ -10908,8 +11031,65 @@ double channelScore(String spoken, String channelName) {
   final a1 = normAr(spoken).replaceAll(RegExp(r'\d'), '').replaceAll(' ', ''), c1 = normAr(channelName).replaceAll(RegExp(r'\d'), '').replaceAll(' ', '');
   final lat = arToLatin(spoken).replaceAll(RegExp(r'\d'), '');
   var s = max(_sim(a1, c1), max(_sim(lat.replaceAll(' ', ''), c1.replaceAll(RegExp(r'[^a-z]'), '')), _sim(skeleton(lat), skeleton(channelName.replaceAll(RegExp(r'\d'), '')))));
+  // v9: حروف منطوقة + مطابقة بالنطق
+  final lj = enLettersJoin(lat);
+  final chLat = channelName.replaceAll(RegExp(r'\d'), '').toLowerCase();
+  s = max(s, _sim(lj.replaceAll(' ', ''), chLat.replaceAll(RegExp(r'[^a-z]'), '')));
+  final sc1 = soundCode(lj), sc2 = soundCode(chLat);
+  if (sc1.length >= 3 && sc2.length >= 3) s = max(s, 0.95 * _sim(sc1, sc2));
   if (digitsS.isNotEmpty || digitsC.isNotEmpty) s = digitsS == digitsC ? s + 0.1 : s - 0.25;
   return s;
+}
+
+// v9: أسماء الحروف الإنجليزي زي ما الموبايل بيكتبها ("em bee see" → mbc)
+const Map<String, String> _enLetterNames = {
+  'ay': 'a', 'bee': 'b', 'be': 'b', 'see': 'c', 'sea': 'c', 'dee': 'd', 'eff': 'f', 'gee': 'g', 'aitch': 'h', 'jay': 'j', 'kay': 'k',
+  'el': 'l', 'em': 'm', 'en': 'n', 'oh': 'o', 'pee': 'p', 'cue': 'q', 'queue': 'q', 'are': 'r', 'ess': 's', 'tee': 't', 'tea': 't',
+  'you': 'u', 'vee': 'v', 'ex': 'x', 'why': 'y', 'zed': 'z', 'zee': 'z', 'empty': 'mt', 'abc': 'abc',
+};
+
+/// "em bee see masr" → "mbc masr" (بس لو في حرفين ورا بعض على الأقل)
+String enLettersJoin(String s) {
+  final out = <String>[];
+  final run = <String>[];
+  void flush() {
+    if (run.length >= 2) {
+      out.add(run.join());
+    } else {
+      out.addAll(run.map((l) => l));
+    }
+    run.clear();
+  }
+  for (final w in s.toLowerCase().split(RegExp(r'\s+'))) {
+    if (w.isEmpty) continue;
+    final l = _enLetterNames[w] ?? (w.length == 1 && RegExp('[a-z]').hasMatch(w) ? w : null);
+    if (l != null) {
+      run.add(l);
+    } else {
+      flush();
+      out.add(w);
+    }
+  }
+  flush();
+  return out.join(' ');
+}
+
+/// كود النطق (تقريبي): حروف متشابهة في الصوت بتتجمع، حروف العلة بتتشال
+String soundCode(String s) {
+  var t = s.toLowerCase().replaceAll(RegExp(r'[^a-z]'), '');
+  t = t.replaceAll('ph', 'f').replaceAll('ck', 'k').replaceAll('ch', 's').replaceAll('sh', 's').replaceAll('th', 't').replaceAll('kh', 'k').replaceAll('gh', 'g');
+  t = t.replaceAll(RegExp(r'c(?=[eiy])'), 's');
+  final b = StringBuffer();
+  for (final ch in t.split('')) {
+    if ('aeiouyhw'.contains(ch)) continue;
+    b.write(switch (ch) {
+      'p' || 'f' || 'v' => 'b',
+      'c' || 'q' || 'g' || 't' || 'd' || 'k' => 'k',
+      'z' || 'x' || 'j' => 's',
+      _ => ch,
+    });
+  }
+  return b.toString().replaceAllMapped(RegExp(r'(.)\1+'), (m) => m[1]!);
 }
 
 enum VoiceKind { keys, number, channel, choose, recall, none }
@@ -10921,7 +11101,8 @@ class VoiceCmd {
   final StbChannel? channel;
   final List<StbChannel> alts;
   final String heard;
-  const VoiceCmd(this.kind, {this.keys = const [], this.number = 0, this.channel, this.alts = const [], this.heard = ''});
+  final List<String> texts;
+  const VoiceCmd(this.kind, {this.keys = const [], this.number = 0, this.channel, this.alts = const [], this.heard = '', this.texts = const []});
   String get describe => switch (kind) {
         VoiceKind.keys => 'زرار',
         VoiceKind.number => 'قناة رقم $number',
@@ -10967,20 +11148,21 @@ String _stripNoise(String s) => normAr(s).replaceAll(_noiseWords, ' ').replaceAl
 
 /// يفهم الأمر من اقتراحات التعرف على الكلام. أوامر الأزرار والأرقام: أول اقتراح يتفهم بيكسب.
 /// القنوات (v7): بنجمع أحسن درجة لكل قناة من كل الاقتراحات؛ لو قناة واحدة واضحة تتفتح، لو في قريبين بنعرض أقرب 3.
-VoiceCmd parseVoiceCommand(List<String> texts, List<StbChannel> channels) {
+VoiceCmd parseVoiceCommand(List<String> texts, List<StbChannel> channels, {Map<String, String> learned = const {}}) {
   final cand = <StbChannel, double>{};
   for (final raw in texts) {
     final t = normAr(raw);
     if (t.isEmpty) continue;
     bool has(List<String> w) => w.any((x) => RegExp('(^| )${RegExp.escape(x)}( |\$)').hasMatch(t));
+    bool eq(List<String> w) => w.contains(t); // v9: القفل والخروج لازم الجملة كلها بالظبط
     if (has(['علي الصوت', 'ارفع الصوت', 'على الصوت', 'زود الصوت', 'صوت اعلي', 'volume up', 'louder', 'turn it up'])) return VoiceCmd(VoiceKind.keys, keys: const [K.volUp, K.volUp, K.volUp], heard: raw);
     if (has(['وطي الصوت', 'واطي الصوت', 'قلل الصوت', 'اخفض الصوت', 'نزل الصوت', 'صوت اوطي', 'volume down', 'quieter', 'turn it down'])) return VoiceCmd(VoiceKind.keys, keys: const [K.volDown, K.volDown, K.volDown], heard: raw);
     if (has(['اكتم', 'كتم', 'اسكت', 'mute', 'unmute', 'اقفل الصوت', 'شيل الصوت'])) return VoiceCmd(VoiceKind.keys, keys: const [K.mute], heard: raw);
-    if (has(['اقفل', 'اطفي', 'قفل', 'power', 'power off', 'turn off', 'turn on', 'shut down', 'اقفل الريسيفر', 'اطفي الريسيفر', 'افتح الريسيفر'])) return VoiceCmd(VoiceKind.keys, keys: const [K.power], heard: raw);
+    if (eq(['اقفل', 'اطفي', 'قفل', 'power', 'power off', 'turn off', 'turn on', 'shut down', 'اقفل الريسيفر', 'اطفي الريسيفر', 'افتح الريسيفر'])) return VoiceCmd(VoiceKind.keys, keys: const [K.power], heard: raw);
     if (has(['اللي بعدها', 'القناه اللي بعدها', 'التاليه', 'بعدها', 'next', 'next channel'])) return VoiceCmd(VoiceKind.keys, keys: const [K.chUp], heard: raw);
     // v7: «السابقة» = آخر قناة اتفرجت عليها (مش الرقم اللي قبلها)
     if (has(['اللي قبلها', 'القناه اللي قبلها', 'السابقه', 'القناه السابقه', 'قبلها', 'previous', 'previous channel', 'last channel', 'go back'])) return VoiceCmd(VoiceKind.recall, heard: raw);
-    if (has(['رجوع', 'خروج', 'ارجع', 'اخرج', 'exit', 'back'])) return VoiceCmd(VoiceKind.keys, keys: const [K.exit], heard: raw);
+    if (eq(['رجوع', 'خروج', 'ارجع', 'اخرج', 'exit', 'back'])) return VoiceCmd(VoiceKind.keys, keys: const [K.exit], heard: raw);
     if (has(['القائمه', 'القايمه', 'منيو', 'menu'])) return VoiceCmd(VoiceKind.keys, keys: const [K.menu], heard: raw);
     if (has(['دليل', 'epg', 'guide'])) return VoiceCmd(VoiceKind.keys, keys: const [K.epg], heard: raw);
     // "قناة 105" / "رقم 105" / "105" / "channel 105"
@@ -10995,12 +11177,22 @@ VoiceCmd parseVoiceCommand(List<String> texts, List<StbChannel> channels) {
     final en = parseEnNumber(enWords);
     if (en != null) return VoiceCmd(VoiceKind.number, number: en, heard: raw);
     // اسم قناة
+    final lc = learned[t];
+    if (lc != null) {
+      for (final c in channels) {
+        if (c.name == lc) return VoiceCmd(VoiceKind.channel, channel: c, heard: raw, texts: texts);
+      }
+    }
     var q = t;
     for (final w in _openWords) {
       if (q.startsWith('$w ')) q = q.substring(w.length + 1);
     }
     q = q.replaceFirst(_enPrefix, '');
     if (q.isEmpty || channels.isEmpty) continue;
+    // v9: "dream one" → "dream 1"
+    if (q.contains(' ')) {
+      q = q.replaceAllMapped(RegExp(r'\b(one|two|three|four|five|six|seven|eight|nine)\b'), (m) => '${_enNum[m[1]!]}');
+    }
     final qn = _stripNoise(q);
     for (final c in channels) {
       if (c.radio) continue;
@@ -11017,15 +11209,16 @@ VoiceCmd parseVoiceCommand(List<String> texts, List<StbChannel> channels) {
     }
   }
   if (cand.isNotEmpty) {
-    final l = cand.entries.where((e) => e.value >= 0.45).toList()..sort((a, b) => b.value.compareTo(a.value));
+    // v9: الاختيار المباشر بس لو واثق (0.75+ وفرق واضح)، غير كده شاشة «سمعت» بأقرب 3
+    final l = cand.entries.where((e) => e.value >= 0.30).toList()..sort((a, b) => b.value.compareTo(a.value));
     if (l.isNotEmpty) {
       final top = l.first;
-      final clear = l.length == 1 || top.value - l[1].value >= 0.08 || top.value >= 0.97;
-      if (top.value >= 0.6 && clear) return VoiceCmd(VoiceKind.channel, channel: top.key, heard: texts.first);
-      return VoiceCmd(VoiceKind.choose, alts: [for (final e in l.where((e) => top.value - e.value <= 0.35).take(3)) e.key], heard: texts.first);
+      final clear = l.length == 1 || top.value - l[1].value >= 0.12 || top.value >= 0.97;
+      if (top.value >= 0.75 && clear) return VoiceCmd(VoiceKind.channel, channel: top.key, heard: texts.first, texts: texts);
+      return VoiceCmd(VoiceKind.choose, alts: [for (final e in l.where((e) => top.value - e.value <= 0.4).take(3)) e.key], heard: texts.first, texts: texts);
     }
   }
-  return VoiceCmd(VoiceKind.none, heard: texts.isEmpty ? '' : texts.first);
+  return VoiceCmd(VoiceKind.none, heard: texts.isEmpty ? '' : texts.first, texts: texts);
 }
 
 /// رقم القناة بالزراير: 1 0 5 OK
@@ -14530,6 +14723,25 @@ BwJs? parseBwJs(String js) {
 }
 
 class ZteBwLearn {
+  /// v9: أسماء من سكريبتات الراوتر فيها speed_control / user_flow / upload_speed / download_speed (قراية بس)
+  static final Set<String> tokens = {};
+  static final List<String> lines = [];
+  static final RegExp _tokRe = RegExp(r'[A-Za-z_][A-Za-z0-9_]*(?:speed_control|user_flow|upload_speed|download_speed|SPEED_CONTROL|bandwidth_ctrl|band_width)[A-Za-z0-9_]*', caseSensitive: false);
+
+  static void scan(String path, String body) {
+    for (final m in _tokRe.allMatches(body)) {
+      tokens.add(m[0]!);
+    }
+    if (lines.length >= 40) return;
+    for (final ln in body.split('\n')) {
+      if (lines.length >= 40) break;
+      if (_tokRe.hasMatch(ln)) {
+        final t = ln.trim();
+        lines.add('$path: ${t.length > 220 ? t.substring(0, 220) : t}');
+      }
+    }
+  }
+
   static BwFields? get saved {
     try {
       return BwFields.fromJson(jsonDecode(Store.p.getString('zte_bw_fields') ?? '{}') as Map<String, dynamic>);
@@ -14563,10 +14775,15 @@ class ZteBwLearn {
         if (r.statusCode != 200 || r.bodyBytes.length > 3000000) continue;
         final body = utf8.decode(r.bodyBytes, allowMalformed: true);
         if (RegExp('bandwidth', caseSensitive: false).hasMatch(body)) mentions.add(path);
+        scan(path, body);
         final hit = parseBwJs(body);
         if (hit != null) {
           AppLog.add('BW', 'لقيت أمر الـ Bandwidth في $path: ${hit.fields.describe()}');
           AppLog.add('BW', 'SNIPPET $path:\n${hit.snippet}');
+          AppLog.add('BW', 'أسماء مرتبطة: ${tokens.join(', ')}');
+          for (final l in lines) {
+            AppLog.add('BW', 'LINE $l');
+          }
           await Store.p.setString('zte_bw_fields', jsonEncode(hit.fields.toJson()));
           return hit;
         }
@@ -14686,6 +14903,15 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
     on = bwSwitchOn(curSw) ?? false;
     if (int.tryParse(curUp!.trim()) != null) upC.text = curUp!.trim();
     if (int.tryParse(curDown!.trim()) != null) downC.text = curDown!.trim();
+    if (!readable) {
+      // v9: قراية بس. بنجرّب أسماء القراية اللي ظاهرة في سكريبتات الراوتر ونسجّل الرد (مفيش أي كتابة)
+      final probe = ZteBwLearn.tokens.where((t) => t != x.sw && t != x.up && t != x.down).take(25).toList();
+      AppLog.add('BW', 'PROBE قراية ${probe.length} اسم: ${probe.join(', ')}');
+      for (final k in probe) {
+        final v = await widget.router.getOne(k);
+        AppLog.add('BW', 'PROBE $k = "$v"');
+      }
+    }
     if (!readable && msg.isEmpty) {
       msg = 'الراوتر مرجّعش قيم مفهومة للأسماء اللي لقيتها (${x.describe()}) — فمش هبعت أمر تغيير. ابعتلي السجل.';
     }
