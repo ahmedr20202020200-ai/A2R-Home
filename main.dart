@@ -15403,22 +15403,26 @@ class ZteBwLearn {
   static final RegExp _tokRe = RegExp(r'[A-Za-z0-9_]*(?:speed_control|user_flow|upload_speed|download_speed|width_manual|tc_traffic|userspeedlimit)[A-Za-z0-9_]*', caseSensitive: false);
 
   static int _wins = 0;
+  static bool deepDone = false;
   static final Set<String> _winFiles = {};
 
   /// v12: كل مكان في أي ملف فيه width_manual / tc_traffic: نافذة 700 حرف + أسماء goformId في الملف (قراية بس، أسماء بس)
   static void _deep(String path, String body) {
-    final re = RegExp('width_manual|tc_traffic', caseSensitive: false);
+    final re = RegExp('width_manual|tc_traffic|BAND_WIDTH|bwSwitch|UploadManual|DownloadManual|TRAFFIC_CONTROL', caseSensitive: false);
     final ms = re.allMatches(body).toList();
     if (ms.isEmpty) return;
-    AppLog.add('BW', 'FILE $path فيه ${ms.length} مرة width_manual/tc_traffic (طول الملف ${body.length})');
+    AppLog.add('BW', 'FILE $path فيه ${ms.length} مرة من كلمات الباندويث (طول الملف ${body.length})');
     final gfs = <String>{for (final g in RegExp('goformId["\']?\\s*[:=]\\s*["\']([A-Za-z0-9_]+)["\']').allMatches(body)) g[1]!};
-    AppLog.add('BW', 'GOFORM في $path (${gfs.length}): ${gfs.take(80).join(', ')}');
+    final gl = gfs.toList();
+    for (var k = 0; k < gl.length; k += 30) {
+      AppLog.add('BW', 'GOFORM $path ${k + 1}-${min(k + 30, gl.length)} من ${gl.length}: ${gl.skip(k).take(30).join(', ')}');
+    }
     var lastEnd = -1;
     var n = 0;
     for (final m in ms) {
       if (m.start < lastEnd) continue;
-      if (_wins >= 16 || n >= 8) break;
-      final a = (m.start - 350).clamp(0, body.length), b = (m.start + 350).clamp(0, body.length);
+      if (_wins >= 40 || n >= 16) break;
+      final a = (m.start - 300).clamp(0, body.length), b = (m.start + 400).clamp(0, body.length);
       lastEnd = b;
       n++;
       _wins++;
@@ -15452,6 +15456,9 @@ class ZteBwLearn {
   /// GET بس — مفيش أي أمر بيتبعت للراوتر
   static Future<BwJs?> learn(String host) async {
     final c = http.Client();
+    _wins = 0;
+    _winFiles.clear();
+    deepDone = true;
     try {
       final base = 'http://$host';
       final seen = <String>{};
@@ -15510,6 +15517,7 @@ class ZteBwLearn {
           }
         }
       }
+      AppLog.add('BW', 'FETCHED $fetched ملف: ${seen.take(90).join(' ')}');
       if (readOnly != null) {
         await Store.p.setString('zte_bw_fields2', jsonEncode(readOnly.fields.toJson()));
         AppLog.add('BW', 'هكمّل بقراية بس: ${readOnly.fields.describe()}');
@@ -15583,6 +15591,8 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
       msg = '';
     });
     f = relearn ? null : ZteBwLearn.saved;
+    // v13: لو المحفوظ قراية بس نقلّب تاني مرة في كل جلسة (علشان نسجّل صفحات الراوتر كلها) من غير أي كتابة
+    if (f?.canWrite == false && !ZteBwLearn.deepDone) f = null;
     if (f == null) {
       final hit = await ZteBwLearn.learn(widget.router.host);
       f = hit?.fields;
