@@ -15373,6 +15373,12 @@ BwJs? parseTcJs(String js) {
   return BwJs(const BwFields('', rs, ru, rd, rsw: rs, rup: ru, rdown: rd), win);
 }
 
+/// v17: الأمر والحقول متأكدين منهم من سكريبت الراوتر نفسه: صفحة network/band_width بتبعت BAND_WIDTH_SET
+/// بالحقول التلاتة دي (setBandWidthSettings بيدمج كل الحقول اللي اتبعتتله مع goformId). مفيش تخمين.
+const BwFields kBwProven = BwFields('BAND_WIDTH_SET', 'tc_traffic_enable', 'upload_width_manual', 'download_width_manual',
+    rsw: 'tc_traffic_enable', rup: 'upload_width_manual', rdown: 'download_width_manual');
+const int kBwMin = 256, kBwMax = 1000000;
+
 class BwJs {
   final BwFields fields;
   final String snippet;
@@ -15750,7 +15756,7 @@ String? bwSwitchValue(String current, bool on) {
 }
 
 /// اختصارات: ميجا → kbit
-const List<(String, int)> kBwPresets = [('0.5', 512), ('1', 1024), ('1.5', 1536), ('2', 2048), ('2.5', 2560)];
+const List<(String, int)> kBwPresets = [('0.25', 256), ('0.5', 512), ('1', 1024), ('1.5', 1536), ('2', 2048), ('2.5', 2560)];
 
 class RouterBandwidthPage extends StatefulWidget {
   final ZteRouter router;
@@ -15785,13 +15791,7 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
       loading = true;
       msg = '';
     });
-    f = relearn ? null : ZteBwLearn.saved;
-    // v13: لو المحفوظ قراية بس نقلّب تاني مرة في كل جلسة (علشان نسجّل صفحات الراوتر كلها) من غير أي كتابة
-    if (f?.canWrite == false && !ZteBwLearn.deepDone) f = null;
-    if (f == null) {
-      final hit = await ZteBwLearn.learn(widget.router.host);
-      f = hit?.fields;
-    }
+    f = kBwProven; // v17: مفيش تقليب، الأمر معروف
     if (f == null) {
       msg = 'مقدرتش ألاقي أمر صفحة Bandwidth في صفحات الراوتر. مش هبعت أمر متخمّن. ابعتلي السجل (زرار شارك السجل) وهوصّله بإيدي.';
     } else {
@@ -15844,46 +15844,59 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
     });
   }
 
+  Map<String, dynamic> get _prev => _jsonMap('bw_prev');
+
   Future<void> _apply() async {
-    final x = f;
-    if (x == null || !readable) return;
-    if (!x.canWrite) {
-      toast(context, 'مش لاقي أمر الكتابة في الراوتر، قراية بس');
-      return;
-    }
     final u = int.tryParse(upC.text.trim()), d = int.tryParse(downC.text.trim());
-    if (on && (u == null || d == null || u < 64 || d < 64 || u > 100000 || d > 100000)) {
-      toast(context, 'اكتب رقم صحيح من 64 لـ 100000 كيلوبت في الخانتين');
+    if (on && (u == null || d == null || u < kBwMin || d < kBwMin || u > kBwMax || d > kBwMax)) {
+      toast(context, 'اكتب رقم صحيح من $kBwMin لـ $kBwMax كيلوبت في الخانتين');
       return;
     }
-    final swVal = bwSwitchValue(curSw, on);
+    await _write(on, on ? u! : (int.tryParse(curUp!.trim()) ?? 1565), on ? d! : (int.tryParse(curDown!.trim()) ?? 1565), undo: false);
+  }
+
+  Future<void> _undo() async {
+    final m = _prev;
+    final ps = '${m['s'] ?? ''}', pu = int.tryParse('${m['u'] ?? ''}'), pd = int.tryParse('${m['d'] ?? ''}');
+    final po = bwSwitchOn(ps);
+    if (po == null || pu == null || pd == null) return;
+    await _write(po, pu, pd, undo: true);
+  }
+
+  /// كتابة واحدة بس: BAND_WIDTH_SET بالحقول التلاتة، وبعدها قراية ومقارنة
+  Future<void> _write(bool newOn, int u, int d, {required bool undo}) async {
+    final x = f;
+    if (x == null || !readable || busy) return;
+    final swVal = bwSwitchValue(curSw, newOn);
     if (swVal == null) {
       toast(context, 'مش متأكد من قيمة السويتش ($curSw) — مش هبعت');
       return;
     }
-    if (on && (u! < 512 || d! < 512) && !await confirm(context, 'الرقم أقل من 512 كيلوبت، النت هيبقى بطيء جدًا لكل الأجهزة. متأكد؟')) return;
+    final curOn = bwSwitchOn(curSw) == true;
+    final oldLine = '${curOn ? 'شغّال' : 'مقفول'} • رفع ${curUp!.trim()} / تحميل ${curDown!.trim()}';
+    final newLine = '${newOn ? 'شغّال' : 'مقفول'} • رفع $u / تحميل $d';
+    if (newOn && (u < 512 || d < 512) && !await confirm(context, 'الرقم أقل من 512 كيلوبت، النت هيبقى بطيء جدًا لكل الأجهزة. متأكد؟')) return;
     if (!mounted) return;
-    final what = on ? 'تفعيل حد السرعة: رفع $u / تحميل $d كيلوبت' : 'إيقاف حد السرعة';
-    if (!await confirm(context, '$what\n\nده بيأثر على كل الأجهزة. الأمر «تجريبي»: هقرا القيمة من الراوتر بعد التطبيق وأقولك لو مطابقة.')) return;
+    final head = undo ? 'رجوع للقيم القديمة' : (newOn ? 'تفعيل حد السرعة' : 'إيقاف حد السرعة');
+    if (!await confirm(context, '$head\n\nدلوقتي: $oldLine\nهيبقى: $newLine (kbit)\n\nده بيأثر على كل الأجهزة. الأمر «تجريبي»: هقرا القيمة من الراوتر بعد التطبيق وأقولك لو مطابقة.')) return;
     setState(() => busy = true);
     try {
-      final fields = <String, String>{
-        x.sw: swVal,
-        x.up: '${on ? u : (int.tryParse(curUp!.trim()) ?? 1565)}',
-        x.down: '${on ? d : (int.tryParse(curDown!.trim()) ?? 1565)}',
-      };
+      if (!undo) {
+        await Store.p.setString('bw_prev', jsonEncode({'s': curSw, 'u': curUp!.trim(), 'd': curDown!.trim()}));
+      }
+      final fields = <String, String>{x.sw: swVal, x.up: '$u', x.down: '$d'};
       final res = await widget.router.set(x.goform, fields);
       AppLog.add('BW', 'رد التغيير: ${jsonEncode(res)}');
       await Future.delayed(const Duration(seconds: 2));
       await _read();
-      final ok = bwSwitchOn(curSw) == on && (!on || (int.tryParse(curUp!.trim()) == u && int.tryParse(curDown!.trim()) == d));
-      if (ok && on) {
-        await Store.p.setInt('bw_last', d!);
+      final ok = bwSwitchOn(curSw) == newOn && int.tryParse(curUp!.trim()) == u && int.tryParse(curDown!.trim()) == d;
+      if (ok && newOn && !undo) {
+        await Store.p.setInt('bw_last', d);
         last = d;
       }
       msg = ok
-          ? (on ? 'اتطبق ✓ — الراوتر قال رفع $curUp / تحميل $curDown كيلوبت' : 'اتقفل حد السرعة ✓')
-          : 'الراوتر رد بـ «${res['result'] ?? '?'}» بس القراية مش مطابقة (رفع $curUp / تحميل $curDown، السويتش $curSw) — يمكن الأمر مش مظبوط. ابعتلي السجل.';
+          ? (newOn ? 'اتطبق ✓ — الراوتر قال رفع $curUp / تحميل $curDown كيلوبت' : 'اتقفل حد السرعة ✓ (الراوتر قال رفع $curUp / تحميل $curDown)')
+          : 'الراوتر رد بـ «${res['result'] ?? '?'}» بس القراية مش مطابقة (رفع $curUp / تحميل $curDown، السويتش $curSw). ابعتلي السجل.';
     } catch (e) {
       msg = 'خطأ: $e';
     }
@@ -15962,6 +15975,15 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
                       ]),
                       const SizedBox(height: 12),
                       FilledButton.icon(onPressed: busy ? null : _apply, icon: const Icon(Icons.check_rounded), label: const Text('تطبيق')),
+                      if (_prev.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: OutlinedButton.icon(
+                            onPressed: busy ? null : _undo,
+                            icon: const Icon(Icons.undo_rounded),
+                            label: Text('رجوع للقيم القديمة (${bwSwitchOn('${_prev['s']}') == true ? 'شغّال' : 'مقفول'} • ${_prev['u']} / ${_prev['d']})'),
+                          ),
+                        ),
                     ],
                     if (f == null)
                       Padding(
