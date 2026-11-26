@@ -15796,8 +15796,36 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
       msg = 'مقدرتش ألاقي أمر صفحة Bandwidth في صفحات الراوتر. مش هبعت أمر متخمّن. ابعتلي السجل (زرار شارك السجل) وهوصّله بإيدي.';
     } else {
       await _read();
+      if (!readable && curSw.isEmpty && await _ensureSession()) {
+        msg = '';
+        await _read();
+      }
     }
     if (mounted) setState(() => loading = false);
+  }
+
+  /// v18: قبل أي كتابة نتأكد إن جلسة الراوتر شغالة (loginfo=ok) وإن الراوتر بيدّي RD (علشان AD يتبعت). لو لأ نسجّل دخول مرة واحدة
+  /// بالباسورد المحفوظ (بس لو آخر دخول من التطبيق نجح، علشان الراوتر ميقفلش بسبب باسورد غلط).
+  Future<bool> _ensureSession() async {
+    final r = widget.router;
+    try {
+      if (await r.isLoggedIn() && (await r.getOne('RD')).isNotEmpty) return true;
+    } catch (_) {}
+    if (_spGet(() => Store.p.getBool('router_last_ok')) != true) {
+      AppLog.add('BW', 'الجلسة واقعة ومفيش دخول سابق ناجح محفوظ، مش هعيد الدخول');
+      return false;
+    }
+    final pw = await Store.routerPassword();
+    if (pw == null || pw.isEmpty) return false;
+    try {
+      final res = await r.login(pw, force: schemeFromName(Store.loginScheme)).timeout(const Duration(seconds: 15));
+      AppLog.add('BW', 'الجلسة كانت واقعة، أعدت الدخول: ${res.ok ? 'تمام' : 'فشل (${res.code})'}');
+      if (!res.ok) return false;
+      return (await r.getOne('RD')).isNotEmpty;
+    } catch (e) {
+      AppLog.add('BW', 'إعادة الدخول ✗ $e');
+      return false;
+    }
   }
 
   Future<void> _read() async {
@@ -15880,6 +15908,11 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
     final head = undo ? 'رجوع للقيم القديمة' : (newOn ? 'تفعيل حد السرعة' : 'إيقاف حد السرعة');
     if (!await confirm(context, '$head\n\nدلوقتي: $oldLine\nهيبقى: $newLine (kbit)\n\nده بيأثر على كل الأجهزة. الأمر «تجريبي»: هقرا القيمة من الراوتر بعد التطبيق وأقولك لو مطابقة.')) return;
     setState(() => busy = true);
+    if (!await _ensureSession()) {
+      msg = 'جلسة الراوتر واقعة ومقدرتش أرجّعها، فمبعتش أي تغيير. افتح شاشة الراوتر وسجّل دخول وجرّب تاني.';
+      if (mounted) setState(() => busy = false);
+      return;
+    }
     try {
       if (!undo) {
         await Store.p.setString('bw_prev', jsonEncode({'s': curSw, 'u': curUp!.trim(), 'd': curDown!.trim()}));
@@ -15889,14 +15922,21 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
       AppLog.add('BW', 'رد التغيير: ${jsonEncode(res)}');
       await Future.delayed(const Duration(seconds: 2));
       await _read();
-      final ok = bwSwitchOn(curSw) == newOn && int.tryParse(curUp!.trim()) == u && int.tryParse(curDown!.trim()) == d;
+      bool match() => bwSwitchOn(curSw) == newOn && int.tryParse(curUp!.trim()) == u && int.tryParse(curDown!.trim()) == d;
+      // v18: لو الرد مش success أو القراية فاضية، نعيد الدخول مرة ونقرا تاني (من غير ما نبعت كتابة تانية) ونقول الحالة الفعلية
+      if (!match() && ('${res['result']}' != 'success' || curSw.isEmpty)) {
+        if (await _ensureSession()) await _read();
+      }
+      final ok = match();
       if (ok && newOn && !undo) {
         await Store.p.setInt('bw_last', d);
         last = d;
       }
       msg = ok
           ? (newOn ? 'اتطبق ✓ — الراوتر قال رفع $curUp / تحميل $curDown كيلوبت' : 'اتقفل حد السرعة ✓ (الراوتر قال رفع $curUp / تحميل $curDown)')
-          : 'الراوتر رد بـ «${res['result'] ?? '?'}» بس القراية مش مطابقة (رفع $curUp / تحميل $curDown، السويتش $curSw). ابعتلي السجل.';
+          : (curSw.isEmpty
+              ? 'مقدرتش أقرا من الراوتر بعد التطبيق (رد: ${res['result'] ?? '?'}). مش عارف لو اتطبق. دوس تحديث فوق وشوف الحالة قبل ما تجرب تاني.'
+              : 'الراوتر رد بـ «${res['result'] ?? '?'}» والحالة الفعلية: ${bwSwitchOn(curSw) == true ? 'شغّال' : 'مقفول'} • رفع $curUp / تحميل $curDown. ${'${res['result']}' == 'success' ? 'مش مطابقة للمطلوب، ابعتلي السجل.' : 'التغيير ما اتطبقش، جرّب تاني.'}');
     } catch (e) {
       msg = 'خطأ: $e';
     }
@@ -19767,6 +19807,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
       } catch (_) {}
       if (gen != _gen || !mounted) return;
       AppLog.add('PLAYER', 'خطأ ${ch.name} (محاولة ${attempt + 1}): $e');
+      if (attempt == 0 && e is TimeoutException && url != null) await _diagStream(url!);
       if (attempt == 0 && e is TimeoutException) {
         AppLog.add('PLAYER', 'المهلة خلصت — محاولة تانية أوتوماتيك');
         return _open(retry: true, attempt: 1);
@@ -19777,6 +19818,36 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
         err = m;
         detail = [if (url != null) 'الرابط: ${url!.split('?').first}', 'المحاولات: ${attempt + 1}', 'الخطأ: $e'].join('\n');
       });
+    }
+  }
+
+  /// v18: تشخيص قراية بس بعد المهلة: بنفتح الرابط لمدة 6 ثواني ونسجّل الرد (الحالة، النوع، أول بايتات، حجم اللي وصل). مفيش تغيير على الريسيفر.
+  Future<void> _diagStream(String u) async {
+    final cl = http.Client();
+    try {
+      final req = http.Request('GET', Uri.parse(u))..headers['User-Agent'] = 'A2R Home';
+      final sw = Stopwatch()..start();
+      final resp = await cl.send(req).timeout(const Duration(seconds: 6));
+      final h = resp.headers;
+      AppLog.add('PLAYER', 'DIAG ${u.split('?').first} → ${resp.statusCode} type=${h['content-type'] ?? '-'} len=${h['content-length'] ?? '-'} te=${h['transfer-encoding'] ?? '-'} ranges=${h['accept-ranges'] ?? '-'} بعد ${sw.elapsedMilliseconds}ms');
+      final first = <int>[];
+      var total = 0;
+      try {
+        await for (final chunk in resp.stream.timeout(const Duration(seconds: 6))) {
+          total += chunk.length;
+          if (first.length < 400) first.addAll(chunk.take(400 - first.length));
+          if (total >= 200000 || sw.elapsedMilliseconds > 6000) break;
+        }
+      } on TimeoutException {
+        AppLog.add('PLAYER', 'DIAG مفيش بيانات جديدة لمدة 6 ثواني');
+      }
+      final head = first.take(16).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+      final ts = first.length > 188 * 2 && first[0] == 0x47 && first[188] == 0x47 && first[376] == 0x47;
+      AppLog.add('PLAYER', 'DIAG وصل $total بايت في ${sw.elapsedMilliseconds}ms • أول بايتات: ${head.isEmpty ? '-' : head} • شكل MPEG-TS: ${ts ? 'أيوه' : 'لأ'}');
+    } catch (e) {
+      AppLog.add('PLAYER', 'DIAG ✗ $e');
+    } finally {
+      cl.close();
     }
   }
 
