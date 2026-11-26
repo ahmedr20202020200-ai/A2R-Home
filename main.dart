@@ -15421,7 +15421,7 @@ class ZteBwLearn {
     var n = 0;
     for (final m in ms) {
       if (m.start < lastEnd) continue;
-      if (_wins >= 40 || n >= 16) break;
+      if (_wins >= 12 || n >= 4) break;
       final a = (m.start - 300).clamp(0, body.length), b = (m.start + 400).clamp(0, body.length);
       lastEnd = b;
       n++;
@@ -15430,8 +15430,72 @@ class ZteBwLearn {
     }
   }
 
+  static int _cw = 0;
+  static final Set<String> _exp = {};
+
+  /// v14: كل ده قراية بس: (1) تاجات السكريبت في index.html (2) أسماء ملفات js/html جوه main/config/set (3) مين بينادي على دوال BAND_WIDTH_SET و TRAFFIC_CONTROL_SWITCH_SET
+  static void extra(String path, String body) {
+    if (path.endsWith('index.html') || path.endsWith('.html')) {
+      final tags = RegExp(r'<(?:script|link|iframe)\b[^>]*>', caseSensitive: false).allMatches(body).map((m) => m[0]!).toList();
+      AppLog.add('BW', 'TAGS $path (${tags.length}): ${tags.take(40).map((t) => t.length > 160 ? t.substring(0, 160) : t).join(' | ')}');
+      final dm = RegExp('data-main\\s*=\\s*["\']([^"\']+)["\']').firstMatch(body);
+      if (dm != null) AppLog.add('BW', 'DATA-MAIN $path: ${dm[1]}');
+    }
+    if (path.endsWith('main.js') || path.endsWith('set.js') || path.endsWith('config.js')) {
+      final names = <String>{for (final m in RegExp('["\']([A-Za-z0-9_\\-/.]+\\.(?:js|html?))["\']').allMatches(body)) m[1]!};
+      AppLog.add('BW', 'PATHS $path (${names.length}): ${names.take(120).join(' ')}');
+    }
+    // أسماء الدوال الصغيرة (minified) اللي بتبني الأوامر دي
+    final fnRe = RegExp('function ([A-Za-z0-9_\$]+)\\(\\)\\{function e\\(e,[a-z]\\)\\{(?:return t\\.extend\\(\\{goformId:"(TRAFFIC_CONTROL_SWITCH_SET|BAND_WIDTH_SET)"|var n=\\{\\};return n\\.isTest=[A-Za-z0-9_\$]+,n\\.cmd="tc_traffic_enable,upload_width_manual,download_width_manual")');
+    for (final m in fnRe.allMatches(body)) {
+      final fn = m[1]!;
+      final what = m[2] ?? 'READ_TC';
+      AppLog.add('BW', 'FN $path $fn = $what');
+      for (final e in RegExp('([A-Za-z0-9_\$]+)\\s*:\\s*${RegExp.escape(fn)}\\s*[,}]').allMatches(body)) {
+        _exp.add(e[1]!);
+        AppLog.add('BW', 'EXPORT $path ${e[1]} → $fn ($what)');
+      }
+      final q = RegExp('[:,(=!&|]\\s*${RegExp.escape(fn)}\\s*[,)};:]');
+      var k = 0;
+      for (final u in q.allMatches(body)) {
+        if (_cw >= 30 || k >= 6) break;
+        k++;
+        _cw++;
+        final a = (u.start - 200).clamp(0, body.length), b = (u.end + 300).clamp(0, body.length);
+        AppLog.add('BW', 'CALLER $fn@${u.start} in $path: ${body.substring(a, b).replaceAll('\n', ' ')}');
+      }
+      if (k == 0) AppLog.add('BW', 'CALLER $fn: مفيش استخدام بالشكل المتوقع في $path');
+    }
+    if (!path.endsWith('service.js')) {
+      for (final nm in _exp) {
+        var k = 0;
+        for (final u in RegExp('\\b${RegExp.escape(nm)}\\b').allMatches(body)) {
+          if (_cw >= 40 || k >= 3) break;
+          k++;
+          _cw++;
+          final a = (u.start - 250).clamp(0, body.length), b = (u.end + 400).clamp(0, body.length);
+          AppLog.add('BW', 'USE $nm in $path@${u.start}: ${body.substring(a, b).replaceAll('\n', ' ')}');
+        }
+      }
+    }
+    for (final w in ['TRAFFIC_CONTROL_SWITCH_SET', 'bandwidth']) {
+      if (path.endsWith('service.js') && w == 'bandwidth') continue;
+      var k = 0;
+      for (final u in RegExp(w, caseSensitive: false).allMatches(body)) {
+        if (_cw >= 30 || k >= 4) break;
+        k++;
+        _cw++;
+        final a = (u.start - 250).clamp(0, body.length), b = (u.end + 350).clamp(0, body.length);
+        AppLog.add('BW', 'MENTION $w in $path@${u.start}: ${body.substring(a, b).replaceAll('\n', ' ')}');
+      }
+    }
+  }
+
   static void scan(String path, String body) {
-    if (_winFiles.add(path)) _deep(path, body);
+    if (_winFiles.add(path)) {
+      _deep(path, body);
+      extra(path, body);
+    }
     for (final m in _tokRe.allMatches(body)) {
       tokens.add(m[0]!);
     }
@@ -15457,6 +15521,8 @@ class ZteBwLearn {
   static Future<BwJs?> learn(String host) async {
     final c = http.Client();
     _wins = 0;
+    _cw = 0;
+    _exp.clear();
     _winFiles.clear();
     deepDone = true;
     try {
@@ -15507,6 +15573,14 @@ class ZteBwLearn {
           if (!q.startsWith('/')) q = '/$q';
           if (!seen.contains(q) && !q.contains('..')) queue.add(q);
         }
+        // v14: مسارات js فيها ?v=123
+        for (final s in RegExp('["\']([A-Za-z0-9_\\-/.]+\\.js)\\?[^"\'\\s]*["\']').allMatches(body)) {
+          var q = s[1]!;
+          if (q.startsWith('http')) continue;
+          q = q.replaceFirst(RegExp(r'^\./'), '');
+          if (!q.startsWith('/')) q = '/$q';
+          if (!seen.contains(q) && !q.contains('..')) queue.add(q);
+        }
         for (final re in [pageRe, bandRe]) {
           for (final s in re.allMatches(body)) {
             var q = s[1]!;
@@ -15515,6 +15589,21 @@ class ZteBwLearn {
             if (!q.startsWith('/')) q = '/$q';
             if (!seen.contains(q) && !q.contains('..')) queue.insert(0, q);
           }
+        }
+      }
+      // v14: مسارات شائعة (GET بس، بنسجل الرد)
+      for (final path in const ['/js/app.js', '/js/controllers.js', '/js/ui.js', '/js/util.js', '/js/bandwidth.js', '/html/bandwidth.html', '/tmpl/bandwidth.html', '/tmpl/band_width.html', '/html/band_width.html']) {
+        if (seen.contains(path)) continue;
+        seen.add(path);
+        try {
+          final r = await c.get(Uri.parse('$base$path'), headers: {'Referer': '$base/index.html'}).timeout(const Duration(seconds: 6));
+          AppLog.add('BW', 'PROBE $path → ${r.statusCode} ${r.bodyBytes.length}B');
+          if (r.statusCode == 200 && r.bodyBytes.length < 3000000) {
+            final body = utf8.decode(r.bodyBytes, allowMalformed: true);
+            if (!body.trimLeft().startsWith('<!DOCTYPE') || path.endsWith('.html')) scan(path, body);
+          }
+        } catch (e) {
+          AppLog.add('BW', 'PROBE $path ✗');
         }
       }
       AppLog.add('BW', 'FETCHED $fetched ملف: ${seen.take(90).join(' ')}');
