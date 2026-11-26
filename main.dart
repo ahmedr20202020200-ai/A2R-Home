@@ -3299,6 +3299,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   String msg = '';
   bool busy = false;
   Map<String, StbInfo> found = {};
+  StbSaved? cur;
   List<StbChannel> channels = [];
   String? playingId;
   bool radio = false;
@@ -3626,8 +3627,16 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       Store.receiverIp = ip;
       unawaited(KnownStb.put(ip, i.model)); // v7: علشان صفحة الشبكة تعرضه «رسيفر» مش «أندرويد»
       found.clear();
-      msg = '${i.model} • ${i.ip}';
+      final before = cur;
+      cur = await StbBook.upsert(ip, i.serial, i.model);
+      if (before == null || before.sn != cur!.sn || before.ip != cur!.ip) {
+        channels = []; // قايمة الريسيفر التاني مش بتاعة ده
+        playingId = null;
+      }
+      AppLog.add('STB', 'متصل بـ ${cur!.name} • $ip • S/N ${i.serial} • ${i.model}');
+      msg = '';
       _refreshPlaying();
+      if (view != 0) unawaited(loadChannels());
     } catch (e) {
       msg = 'فشل الاتصال: $e';
       AppLog.add('STB', 'connect fail $e');
@@ -3652,7 +3661,12 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       channels = await gm!.channels(progress: (n) {
         if (mounted) setState(() => msg = 'بحمّل القنوات… $n');
       });
-      msg = '${gm?.info?.model ?? 'الريسيفر'} • ${channels.length} قناة';
+      msg = '${channels.length} قناة';
+      if (channels.isEmpty) {
+        msg = 'القايمة فاضية: ${gm?.listNote ?? ''}';
+        if (mounted) toast(context, 'القنوات فاضية: ${cur?.name ?? 'الريسيفر ده'} مردّش بأسماء قنوات. جرّب الريسيفر التاني من زرار التبديل');
+      }
+      AppLog.add('STB', 'LIST النتيجة: ${channels.length} قناة على ${gm?.host}');
     } catch (e) {
       msg = 'مقدرتش أحمّل القنوات: $e';
     }
@@ -3719,6 +3733,61 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     _playTimer = Timer(const Duration(milliseconds: 2200), () {
       if (mounted && connected) _refreshPlaying();
     });
+  }
+
+  Future<void> _renameCur() async {
+    final t = cur;
+    if (t == null) return;
+    final n = await askText(context, 'اسم الريسيفر ده', initial: t.name, hint: 'مثلا: الصالة');
+    if (n == null || n.trim().isEmpty) return;
+    await StbBook.rename(t, n.trim());
+    cur = StbBook.all.where((x) => x.sn == t.sn && x.ip == t.ip).firstOrNull ?? t;
+    if (mounted) setState(() {});
+  }
+
+  /// v12: تبديل بين الريسيفرات المحفوظة
+  Future<void> _switcher() async {
+    final list = StbBook.all;
+    await showModalBottomSheet(
+      context: context,
+      builder: (c) => SafeArea(
+        child: ListView(shrinkWrap: true, children: [
+          const Padding(padding: EdgeInsets.fromLTRB(16, 12, 16, 4), child: Text('الريسيفرات', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16))),
+          if (list.isEmpty) const Padding(padding: EdgeInsets.all(16), child: Text('مفيش ريسيفر محفوظ لسه. دوّر أو اكتب العنوان.', style: TextStyle(color: kMuted))),
+          for (final r in list)
+            ListTile(
+              leading: Icon(Icons.satellite_alt_rounded, color: connected && gm?.host == r.ip ? kOk : kMuted),
+              title: Text(r.name),
+              subtitle: Directionality(
+                textDirection: TextDirection.ltr,
+                child: Align(alignment: Alignment.centerLeft, child: Text('${r.ip.isEmpty ? 'العنوان اتغير، دوّر عليه' : r.ip}${r.sn.isEmpty ? '' : ' • S/N ${r.sn}'}${r.model.isEmpty ? '' : '\n${r.model}'}')),
+              ),
+              isThreeLine: r.model.isNotEmpty,
+              trailing: connected && gm?.host == r.ip
+                  ? const Text('متصل', style: TextStyle(color: kOk, fontSize: 12))
+                  : IconButton(
+                      icon: const Icon(Icons.delete_outline_rounded, color: kMuted),
+                      tooltip: 'شيل من المحفوظين',
+                      onPressed: () async {
+                        Navigator.pop(c);
+                        await StbBook.remove(r);
+                        if (mounted) setState(() {});
+                      },
+                    ),
+              onTap: () {
+                Navigator.pop(c);
+                if (r.ip.isEmpty) {
+                  discover();
+                } else if (!(connected && gm?.host == r.ip)) {
+                  connect(r.ip);
+                }
+              },
+            ),
+          ListTile(leading: const Icon(Icons.search_rounded), title: const Text('دوّر على ريسيفر جديد'), onTap: () { Navigator.pop(c); discover(); }),
+          ListTile(leading: const Icon(Icons.edit_rounded), title: const Text('عنوان يدوي'), onTap: () { Navigator.pop(c); manual(); }),
+        ]),
+      ),
+    );
   }
 
   Future<void> manual() async {
@@ -3803,8 +3872,8 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                 hint: 'الموبايل والريسيفر لازم يكونوا على نفس الواي فاي.\nاقفل تطبيق G-MScreen على أي موبايل تاني الأول.',
                 action: Wrap(spacing: 8, runSpacing: 8, alignment: WrapAlignment.center, children: [
                   FilledButton.icon(onPressed: busy ? null : discover, icon: const Icon(Icons.search_rounded), label: const Text('دوّر على الريسيفر')),
-                  if (Store.receiverIp != null)
-                    OutlinedButton.icon(onPressed: busy ? null : () => connect(Store.receiverIp!), icon: const Icon(Icons.link_rounded), label: Text('اتصل بـ ${Store.receiverIp}')),
+                  for (final r in StbBook.all)
+                    if (r.ip.isNotEmpty) OutlinedButton.icon(onPressed: busy ? null : () => connect(r.ip), icon: const Icon(Icons.link_rounded), label: Text('اتصل بـ ${r.name} (${r.ip})')),
                 ]),
               )
             : !connected
@@ -3814,7 +3883,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                       Card(
                         child: ListTile(
                           leading: const Icon(Icons.satellite_alt_rounded),
-                          title: Text(e.value.model.isEmpty ? 'ريسيفر' : e.value.model),
+                          title: Text(StbBook.all.where((x) => x.ip == e.key || (e.value.serial.isNotEmpty && x.sn == e.value.serial)).firstOrNull?.name ?? (e.value.model.isEmpty ? 'ريسيفر' : e.value.model)),
                           subtitle: Text('${e.key}${e.value.serial.isEmpty ? '' : ' • S/N ${e.value.serial}'}'),
                           trailing: const Icon(Icons.chevron_left_rounded),
                           onTap: () => connect(e.key),
@@ -3849,11 +3918,17 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
           const SizedBox(width: 10),
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(on ? (gm?.info?.model ?? 'متصل') : 'الريسيفر', style: const TextStyle(fontWeight: FontWeight.w700)),
-              Text(msg.isEmpty ? 'Qmax • بروتوكول G-MScreen' : msg, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, color: kMuted)),
+              Text(on ? 'متصل بـ: ${cur?.name ?? gm?.info?.model ?? ''}' : 'الريسيفر', style: const TextStyle(fontWeight: FontWeight.w700)),
+              if (on)
+                Directionality(
+                  textDirection: TextDirection.ltr,
+                  child: Text('${gm?.host}${(gm?.info?.serial ?? '').isEmpty ? '' : ' • S/N ${gm!.info!.serial}'}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11.5, color: kGold)),
+                ),
+              if (!on || msg.isNotEmpty) Text(msg.isEmpty ? 'Qmax • بروتوكول G-MScreen' : msg, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, color: kMuted)),
             ]),
           ),
           if (busy) const Padding(padding: EdgeInsets.all(8), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
+          IconButton(tooltip: 'بدّل الريسيفر', icon: const Icon(Icons.swap_horiz_rounded, color: kGold), onPressed: busy ? null : _switcher),
           if (on) IconButton(tooltip: 'أمر صوتي (تجريبي)', icon: const Icon(Icons.mic_rounded, color: kGold), onPressed: () => voice()),
           if (on && view == 0)
             IconButton(
@@ -3869,6 +3944,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
             onSelected: (v) {
               if (v == 'find') discover();
               if (v == 'ip') manual();
+              if (v == 'rename') _renameCur();
               if (v == 'info') showInfo();
               if (v == 'reload') loadChannels();
               if (v == 'sort') sortChannels();
@@ -3898,6 +3974,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
             itemBuilder: (c) => [
               const PopupMenuItem(value: 'find', child: ListTile(leading: Icon(Icons.search_rounded), title: Text('دوّر على ريسيفر'))),
               const PopupMenuItem(value: 'ip', child: ListTile(leading: Icon(Icons.edit_rounded), title: Text('عنوان يدوي'))),
+              if (on) const PopupMenuItem(value: 'rename', child: ListTile(leading: Icon(Icons.drive_file_rename_outline_rounded), title: Text('سمّي الريسيفر ده'))),
               if (on) const PopupMenuItem(value: 'info', child: ListTile(leading: Icon(Icons.info_outline_rounded), title: Text('معلومات الريسيفر'))),
               if (on) const PopupMenuItem(value: 'timers', child: ListTile(leading: Icon(Icons.alarm_rounded), title: Text('المؤقتات (تسجيل/تشغيل)'))),
               if (on) const PopupMenuItem(value: 'organize', child: ListTile(leading: Icon(Icons.swap_vert_rounded), title: Text('ترتيب القنوات بالسحب (تجريبي)'))),
@@ -5013,7 +5090,7 @@ class _ChannelOrganizerPageState extends State<ChannelOrganizerPage> {
     final mc = movesCount;
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.radio ? 'ترتيب الراديو' : 'ترتيب القنوات'),
+        title: Text('${widget.radio ? 'ترتيب الراديو' : 'ترتيب القنوات'} • ${StbBook.byIp(widget.gm.host)?.name ?? widget.gm.host}'),
         actions: [
           IconButton(tooltip: 'رتّب أبجدي', icon: const Icon(Icons.sort_by_alpha_rounded), onPressed: busy || plan.isEmpty ? null : _sortSheet),
           IconButton(tooltip: 'استرجع الترتيب من ملف', icon: const Icon(Icons.upload_file_rounded), onPressed: busy || plan.isEmpty ? null : _restoreFromFile),
@@ -7261,6 +7338,60 @@ bool isWeakHostName(String s) {
 }
 
 /// v7: الريسيفرات اللي اتعرفت بالتأكيد (اتصلنا بيها أو أعلنت عن نفسها) — عنوان → موديل
+/// v12: ريسيفرين (أو أكتر) محفوظين بأسماء
+class StbSaved {
+  String name, ip, sn, model;
+  StbSaved(this.name, this.ip, this.sn, this.model);
+  Map<String, dynamic> toJson() => {'n': name, 'ip': ip, 'sn': sn, 'm': model};
+  static StbSaved fromJson(Map m) => StbSaved('${m['n'] ?? ''}', '${m['ip'] ?? ''}', '${m['sn'] ?? ''}', '${m['m'] ?? ''}');
+}
+
+class StbBook {
+  static List<StbSaved> get all {
+    try {
+      final l = (jsonDecode(Store.p.getString('stb_book') ?? '[]') as List).map((e) => StbSaved.fromJson(e as Map)).toList();
+      if (l.isNotEmpty) return l;
+    } catch (_) {}
+    final ip = Store.receiverIp;
+    return ip == null ? [] : [StbSaved('ريسيفر 1', ip, '', '')];
+  }
+
+  static Future<void> _save(List<StbSaved> l) => Store.p.setString('stb_book', jsonEncode([for (final x in l) x.toJson()]));
+  static StbSaved? byIp(String ip) => all.where((x) => x.ip == ip).firstOrNull;
+
+  static Future<StbSaved> upsert(String ip, String sn, String model) async {
+    final l = all;
+    var s = sn.isNotEmpty ? l.where((x) => x.sn == sn).firstOrNull : null;
+    s ??= l.where((x) => x.ip == ip && (x.sn.isEmpty || sn.isEmpty)).firstOrNull;
+    if (s == null) {
+      s = StbSaved('ريسيفر ${l.length + 1}', ip, sn, model);
+      l.add(s);
+    } else {
+      s.ip = ip;
+      if (sn.isNotEmpty) s.sn = sn;
+      if (model.isNotEmpty) s.model = model;
+    }
+    for (final x in l) {
+      if (!identical(x, s) && x.ip == ip) x.ip = ''; // العنوان اتنقل لريسيفر تاني (DHCP)
+    }
+    await _save(l);
+    return s;
+  }
+
+  static Future<void> rename(StbSaved t, String name) async {
+    final l = all;
+    for (final x in l) {
+      if (x.sn == t.sn && x.ip == t.ip) x.name = name;
+    }
+    await _save(l);
+  }
+
+  static Future<void> remove(StbSaved t) async {
+    final l = all..removeWhere((x) => x.sn == t.sn && x.ip == t.ip);
+    await _save(l);
+  }
+}
+
 class KnownStb {
   static Map<String, String> get all {
     try {
@@ -9524,6 +9655,8 @@ List<StbChannel> gmParseChannels(dynamic d, int startIndex) {
     final m = Map<String, dynamic>.from(e);
     final id = '${m['ServiceID'] ?? m['ProgramId'] ?? ''}';
     final name = '${m['ServiceName'] ?? m['Name'] ?? ''}';
+    // v12: الرد الفاضي [{"Command":""}] مش قناة (قبل كده كان بيتعدّ قناة بلا اسم)
+    if (id.trim().isEmpty && name.trim().isEmpty) continue;
     final radio = '${m['Radio'] ?? '0'}' == '1';
     final idx = int.tryParse('${m['ServiceIndex'] ?? ''}') ?? i;
     out.add(StbChannel(id, name.isEmpty ? 'قناة $id' : name, radio, idx, m));
@@ -9714,17 +9847,88 @@ class GmClient extends ChangeNotifier {
     return first(await send(15, {}));
   }
 
+  /// v12: آخر ملاحظة عن تحميل القايمة (بتظهر للمستخدم لو القايمة فاضية)
+  String listNote = '';
+
+  static const List<String> _listVariants = ['default', 'TvState0', 'array', 'xml'];
+
+  Map<String, dynamic> _listFields(String v, int from, int to) {
+    final base = {'FromIndex': '$from', 'ToIndex': '$to'};
+    switch (v) {
+      case 'TvState0':
+        return {...base, 'TvState': '0'};
+      case 'array':
+        return {
+          'array': [
+            {...base, 'TvState': '0'}
+          ]
+        };
+      default:
+        return base;
+    }
+  }
+
+  Future<List<StbChannel>> _listPage(String v, int from, int to, Duration timeout) async {
+    final oldJson = json;
+    if (v == 'xml') json = false;
+    try {
+      final page = await send(0, _listFields(v, from, to), timeout: timeout);
+      final ch = gmParseChannels(page, from);
+      var pv = '';
+      try {
+        pv = jsonEncode(page);
+      } catch (_) {
+        pv = '$page';
+      }
+      AppLog.add('STB', 'LIST $v $from-$to → ${ch.length} قناة • ${pv.length > 400 ? pv.substring(0, 400) : pv}');
+      return ch;
+    } finally {
+      json = oldJson;
+    }
+  }
+
   Future<List<StbChannel>> channels({void Function(int got)? progress}) async {
+    listNote = '';
+    final sn = info?.serial ?? '';
+    AppLog.add('STB', 'LIST الريسيفر $host S/N $sn ${info?.model ?? ''}');
     final st = await state();
     final total = int.tryParse('${st['ChannelNum'] ?? ''}') ?? 0;
-    final out = <StbChannel>[];
-    var from = 0;
+    AppLog.add('STB', 'LIST حالة: ${st.keys.take(12).join(',')} • ChannelNum=${total > 0 ? total : 'مش جاي'}');
     final end = total > 0 ? total - 1 : 4999;
+    // الطريقة اللي نجحت قبل كده للريسيفر ده نجرّبها الأول، وبعدها باقي الطرق (قراية بس)
+    final saved = Store.p.getString('stb_lv_$sn');
+    final order = [if (saved != null && _listVariants.contains(saved)) saved, ..._listVariants.where((v) => v != saved)];
+    String? use;
+    var first = <StbChannel>[];
+    for (final v in order) {
+      try {
+        first = await _listPage(v, 0, min(99, end), Duration(seconds: v == order.first ? 15 : 8));
+      } catch (e) {
+        AppLog.add('STB', 'LIST $v ✗ $e');
+        first = [];
+      }
+      if (first.isNotEmpty) {
+        use = v;
+        break;
+      }
+    }
+    if (use == null) {
+      listNote = 'الريسيفر ($host) رد على كل طرق طلب القايمة برد فاضي';
+      AppLog.add('STB', 'LIST $listNote');
+      return [];
+    }
+    if (use != saved && sn.isNotEmpty) await Store.p.setString('stb_lv_$sn', use);
+    AppLog.add('STB', 'LIST الطريقة اللي نفعت: $use');
+    final out = <StbChannel>[...first];
+    progress?.call(out.length);
+    var from = min(99, end) + 1;
+    var lastFirst = first.first.id;
     while (from <= end) {
       final to = (from + 99).clamp(0, end);
-      final page = await send(0, {'FromIndex': '$from', 'ToIndex': '$to'}, timeout: const Duration(seconds: 20));
-      final ch = gmParseChannels(page, from);
+      final ch = await _listPage(use, from, to, const Duration(seconds: 20));
       if (ch.isEmpty) break;
+      if (ch.first.id == lastFirst && ch.first.name == out.first.name) break; // الريسيفر بيتجاهل المدى ويكرر نفس القايمة
+      lastFirst = ch.first.id;
       out.addAll(ch);
       progress?.call(out.length);
       from = to + 1;
@@ -11549,6 +11753,39 @@ final RegExp _enPrefix = RegExp(r'^((open|play|switch to|go to|watch|tune to|put
 final RegExp _noiseWords = RegExp(r'\b(hd|sd|fhd|uhd|tv|channel)\b');
 String _stripNoise(String s) => normAr(s).replaceAll(_noiseWords, ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
 
+/// v12: كلمات الأرقام (عربي ونطق إنجليزي بالعربي) لو جت بعد اسم: «دريم واحد» → «دريم 1»
+const Map<String, String> _tailNums = {
+  'واحد': '1', 'واحده': '1', 'وان': '1', 'اتنين': '2', 'اثنين': '2', 'تو': '2', 'تلاته': '3', 'ثلاثه': '3', 'ثري': '3', 'تري': '3',
+  'اربعه': '4', 'فور': '4', 'خمسه': '5', 'فايف': '5', 'سته': '6', 'سيكس': '6', 'سبعه': '7', 'تمانيه': '8', 'تسعه': '9',
+};
+String _voiceNumTail(String q) {
+  final w = q.split(' ');
+  if (w.length < 2) return q;
+  return [for (var i = 0; i < w.length; i++) i > 0 && _tailNums.containsKey(w[i]) ? _tailNums[w[i]]! : w[i]].join(' ');
+}
+
+/// v12: أسماء قنوات مشهورة بالعربي → الاسم الإنجليزي (بعد normAr). بتتجرب جنب المطابقة بالنطق ومش بتبدلها
+const Map<String, String> _chAlias = {
+  'اون اي': 'on e', 'اون ايه': 'on e', 'اون سبورت': 'on sport', 'اون دراما': 'on drama', 'الجزيره': 'al jazeera', 'الجزيره مباشر': 'al jazeera mubasher',
+  'ابو ظبي سبورت': 'abu dhabi sports', 'ابوظبي سبورت': 'abu dhabi sports', 'ابو ظبي': 'abu dhabi', 'ام بي سي مصر': 'mbc masr',
+  'ام بي سي مصر 2': 'mbc masr 2', 'ام بي سي اكشن': 'mbc action', 'ام بي سي دراما': 'mbc drama', 'ام بي سي': 'mbc', 'سي بي سي': 'cbc',
+  'سي بي سي دراما': 'cbc drama', 'سي بي سي سفره': 'cbc sofra', 'دي ام سي': 'dmc', 'دريم': 'dream', 'نايل سبورت': 'nile sport',
+  'نيل سبورت': 'nile sport', 'نايل سينما': 'nile cinema', 'نايل دراما': 'nile drama', 'نايل نيوز': 'nile news', 'نايل لايف': 'nile life',
+  'روتانا سينما': 'rotana cinema', 'روتانا دراما': 'rotana drama', 'روتانا كلاسيك': 'rotana classic', 'روتانا مصريه': 'rotana masriya',
+  'روتانا كلب': 'rotana clip', 'الحياه': 'al hayah', 'النهار': 'al nahar', 'صدي البلد': 'sada el balad', 'القاهره والناس': 'al kahera wel nas',
+  'بانوراما دراما': 'panorama drama', 'بانوراما فيلم': 'panorama film', 'تايم سبورت': 'time sport', 'بي ان سبورت': 'bein sports',
+  'سكاي نيوز عربيه': 'sky news arabia', 'العربيه': 'al arabiya', 'العربيه الحدث': 'al hadath', 'سي ان ان': 'cnn', 'بي بي سي عربي': 'bbc arabic',
+  'مكملين': 'mekameleen', 'تن': 'ten', 'الغد': 'al ghad', 'اكسترا نيوز': 'extra news', 'سبيستون': 'spacetoon', 'ماجد': 'majid',
+};
+String _voiceAlias(String q) {
+  var t = ' $q ';
+  final keys = _chAlias.keys.toList()..sort((a, b) => b.length.compareTo(a.length));
+  for (final k in keys) {
+    if (t.contains(' $k ')) t = t.replaceFirst(' $k ', ' ${_chAlias[k]} ');
+  }
+  return t.trim();
+}
+
 /// يفهم الأمر من اقتراحات التعرف على الكلام. أوامر الأزرار والأرقام: أول اقتراح يتفهم بيكسب.
 /// القنوات (v7): بنجمع أحسن درجة لكل قناة من كل الاقتراحات؛ لو قناة واحدة واضحة تتفتح، لو في قريبين بنعرض أقرب 3.
 VoiceCmd parseVoiceCommand(List<String> texts, List<StbChannel> channels, {Map<String, String> learned = const {}}) {
@@ -11596,10 +11833,15 @@ VoiceCmd parseVoiceCommand(List<String> texts, List<StbChannel> channels, {Map<S
     if (q.contains(' ')) {
       q = q.replaceAllMapped(RegExp(r'\b(one|two|three|four|five|six|seven|eight|nine)\b'), (m) => '${_enNum[m[1]!]}');
     }
+    // v12: أرقام بالعربي في آخر الاسم («دريم واحد» → «دريم 1») + أسماء مصرية بالعربي → إنجليزي
+    final qv = <String>{q, _voiceNumTail(q), _voiceAlias(q), _voiceAlias(_voiceNumTail(q))};
     final qn = _stripNoise(q);
     for (final c in channels) {
       if (c.radio) continue;
       var s = channelScore(q, c.name);
+      for (final v in qv) {
+        if (v != q) s = max(s, channelScore(v, c.name) - 0.02);
+      }
       if (qn.isNotEmpty) {
         final cn = _stripNoise(c.name);
         if (cn.isNotEmpty) {
@@ -15160,7 +15402,32 @@ class ZteBwLearn {
   static final List<String> lines = [];
   static final RegExp _tokRe = RegExp(r'[A-Za-z0-9_]*(?:speed_control|user_flow|upload_speed|download_speed|width_manual|tc_traffic|userspeedlimit)[A-Za-z0-9_]*', caseSensitive: false);
 
+  static int _wins = 0;
+  static final Set<String> _winFiles = {};
+
+  /// v12: كل مكان في أي ملف فيه width_manual / tc_traffic: نافذة 700 حرف + أسماء goformId في الملف (قراية بس، أسماء بس)
+  static void _deep(String path, String body) {
+    final re = RegExp('width_manual|tc_traffic', caseSensitive: false);
+    final ms = re.allMatches(body).toList();
+    if (ms.isEmpty) return;
+    AppLog.add('BW', 'FILE $path فيه ${ms.length} مرة width_manual/tc_traffic (طول الملف ${body.length})');
+    final gfs = <String>{for (final g in RegExp('goformId["\']?\\s*[:=]\\s*["\']([A-Za-z0-9_]+)["\']').allMatches(body)) g[1]!};
+    AppLog.add('BW', 'GOFORM في $path (${gfs.length}): ${gfs.take(80).join(', ')}');
+    var lastEnd = -1;
+    var n = 0;
+    for (final m in ms) {
+      if (m.start < lastEnd) continue;
+      if (_wins >= 16 || n >= 8) break;
+      final a = (m.start - 350).clamp(0, body.length), b = (m.start + 350).clamp(0, body.length);
+      lastEnd = b;
+      n++;
+      _wins++;
+      AppLog.add('BW', 'WIN $path @${m.start}: ${body.substring(a, b).replaceAll('\n', ' ')}');
+    }
+  }
+
   static void scan(String path, String body) {
+    if (_winFiles.add(path)) _deep(path, body);
     for (final m in _tokRe.allMatches(body)) {
       tokens.add(m[0]!);
     }
