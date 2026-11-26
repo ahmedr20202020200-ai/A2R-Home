@@ -6937,6 +6937,12 @@ class AppLog extends ChangeNotifier {
   /// أي كلمة سر أو باسورد بتتشال قبل ما تتكتب في السجل.
   static String redact(String s) {
     return s
+        // v16: توكنات الراوتر والكوكيز والأرقام التعريفية مبتتسجلش
+        .replaceAllMapped(RegExp(r'"(RD|LD|AD|stok|token|session\w*|cookie|authorization|imei|imsi|iccid|msisdn|wan_ipaddr|wan_ipv6addr\w*)"\s*:\s*"[^"]*"', caseSensitive: false), (m) => '"${m[1]}":"***"')
+        .replaceAllMapped(RegExp(r'(?<![A-Za-z0-9_])(RD|LD|stok|token|cookie|session\w*)=([^&\s;]*)', caseSensitive: false), (m) => '${m[1]}=***')
+        .replaceAllMapped(RegExp(r'(?<![A-Za-z0-9])([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){2}):[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}(?![0-9A-Za-z])'), (m) => '${m[1]}:**:**:**')
+        .replaceAllMapped(RegExp(r'(?<![A-Za-z0-9])[0-9a-fA-F]{32}(?![A-Za-z0-9])'), (m) => '<hex32>')
+        .replaceAllMapped(RegExp(r'\b(sn|S/N)[= ](\d{4,})\d{4}\b'), (m) => '${m[1]}=…${m[0]!.substring(m[0]!.length - 4)}')
         .replaceAllMapped(
             RegExp(r'(?<![A-Za-z0-9_])(password|passwd|WPAPSK1|AD)=([^&\s]*)',
                 caseSensitive: false),
@@ -15431,6 +15437,7 @@ class ZteBwLearn {
   }
 
   static int _cw = 0;
+  static String? _device;
   static final Map<String, String> _small = {};
   static final Set<String> _exp = {};
 
@@ -15438,15 +15445,21 @@ class ZteBwLearn {
   static void extra(String path, String body) {
     if (path.endsWith('/js/main.js') || path.endsWith('/js/app.js')) {
       _small[path] = body;
-      final lim = path.endsWith('main.js') ? 3000 : 2000;
-      AppLog.add('BW', 'HEAD $path (${body.length}B): ${body.substring(0, min(lim, body.length)).replaceAll('\n', ' ')}');
+      AppLog.add('BW', 'HEAD $path (${body.length}B) محفوظ للتحليل');
+    }
+    if (path.endsWith('config/config.js')) {
+      final dm = RegExp(r'DEVICE\s*:\s*"([^"]+)"').firstMatch(body);
+      if (dm != null) {
+        _device = dm[1];
+        AppLog.add('BW', 'DEVICE ${dm[1]}');
+      }
     }
     if (path.endsWith('index.html')) {
       var k = 0;
       for (final m in RegExp(r'<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)</script>', caseSensitive: false).allMatches(body)) {
         if (k++ >= 4) break;
         final t = m[1]!.trim();
-        AppLog.add('BW', 'INLINE $path#$k (${t.length}B): ${t.substring(0, min(800, t.length)).replaceAll('\n', ' ')}');
+        AppLog.add('BW', 'INLINE $path#$k (${t.length}B) متسجلش');
       }
     }
     if (path.endsWith('index.html') || path.endsWith('.html')) {
@@ -15536,6 +15549,7 @@ class ZteBwLearn {
     final c = http.Client();
     _wins = 0;
     _cw = 0;
+    _device = null;
     _small.clear();
     _exp.clear();
     _winFiles.clear();
@@ -15621,11 +15635,53 @@ class ZteBwLearn {
           AppLog.add('BW', 'PROBE $path ✗');
         }
       }
+      // v16: قايمة صفحات الراوتر (menu) من config/<DEVICE>: ملف إعدادات ثابت، بنقراه ونجيب صفحات الباندويث والتحكم في الترافيك (GET بس)
+      final dev = _device;
+      final menuPaths = ['/js/config/menu.js', if (dev != null) ...['/js/config/$dev/menu.js', '/js/config/$dev/menu_4ggateway.js', '/js/config/$dev/menu_bridge.js', '/js/config/$dev/menu_pppoe.js', '/js/config/$dev/config.js']];
+      final menuBodies = <String>[];
+      for (final path in menuPaths) {
+        if (!seen.add(path)) continue;
+        try {
+          final r = await c.get(Uri.parse('$base$path'), headers: {'Referer': '$base/index.html'}).timeout(const Duration(seconds: 6));
+          AppLog.add('BW', 'MENUFILE $path → ${r.statusCode} ${r.bodyBytes.length}B');
+          if (r.statusCode != 200 || r.bodyBytes.length > 3000000) continue;
+          final body = utf8.decode(r.bodyBytes, allowMalformed: true);
+          if (body.trimLeft().startsWith('<')) continue;
+          menuBodies.add(body);
+          if (path.contains('menu')) AppLog.add('BW', 'MENU $path: ${body.substring(0, min(5000, body.length)).replaceAll('\n', ' ')}');
+          scan(path, body);
+        } catch (_) {
+          AppLog.add('BW', 'MENUFILE $path ✗');
+        }
+      }
+      final kw = RegExp(r'band|traffic|speed|limit|qos|flow|control|tc_|tc[A-Z]', caseSensitive: false);
+      final keys = <String>{};
+      for (final b in menuBodies) {
+        for (final m in RegExp('["\']([A-Za-z0-9_./\\-]{3,60})["\']').allMatches(b)) {
+          final t0 = m[1]!;
+          if (kw.hasMatch(t0)) keys.add(t0.replaceFirst(RegExp(r'^\.?/'), '').replaceFirst(RegExp(r'\.(js|html?)$'), ''));
+        }
+      }
+      AppLog.add('BW', 'MENUKEYS (${keys.length}): ${keys.take(60).join(' ')}');
+      var mt = 0;
+      for (final t in keys) {
+        for (final path in ['/js/$t.js', '/js/${t.replaceFirst(RegExp(r'^tmpl/'), '')}.js', '/tmpl/${t.replaceFirst(RegExp(r'^tmpl/'), '')}.html']) {
+          if (mt >= 45 || !seen.add(path)) continue;
+          mt++;
+          try {
+            final r = await c.get(Uri.parse('$base$path'), headers: {'Referer': '$base/index.html'}).timeout(const Duration(seconds: 6));
+            if (r.statusCode != 200 || r.bodyBytes.length > 3000000) continue;
+            final body = utf8.decode(r.bodyBytes, allowMalformed: true);
+            AppLog.add('BW', 'PAGE $path → 200 ${r.bodyBytes.length}B');
+            if (path.endsWith('.js') && !body.trimLeft().startsWith('<')) scan(path, body);
+          } catch (_) {}
+        }
+      }
       // v15: أسماء موديولات من main.js / app.js (وأي ملف صغير بيتجاب) نجرّبها GET بس، ونسجّل الرد
       var tries = 0;
       final done = <String>{};
       var pending = [for (final e in _small.entries) e.value];
-      for (var round = 0; round < 3 && pending.isNotEmpty && tries < 60; round++) {
+      for (var round = 0; round < 3 && pending.isNotEmpty && tries < 20; round++) {
         final cands = <String>[];
         for (final b in pending) {
           for (final m in RegExp('["\']([A-Za-z0-9_\\-./!]{3,48})["\']').allMatches(b)) {
@@ -15640,7 +15696,7 @@ class ZteBwLearn {
         }
         pending = [];
         for (final path in cands) {
-          if (tries >= 60) break;
+          if (tries >= 20) break;
           tries++;
           seen.add(path);
           try {
