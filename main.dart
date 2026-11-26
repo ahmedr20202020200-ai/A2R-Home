@@ -3308,7 +3308,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   bool ftaOnly = false;
   int view = 0; // 0 ريموت، 1 قنوات، 2 ضبط الطبق
   bool touchpad = Store.p.getBool('stb_touchpad') ?? false;
-  String voiceLang = Store.p.getString('stb_voice_lang') ?? 'en-US'; // v7: القنوات أسماؤها إنجليزي → الإنجليزي هو الأساسي
+  String voiceLang = 'ar-EG'; // v10: رجوع للصوت العربي بس (زي قبل v7)
   Timer? _playTimer;
 
   @override
@@ -3460,6 +3460,12 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   Future<void> _voiceHandle(List<String> heard, String useLang) async {
     if (channels.isEmpty) await loadChannels();
     final c = parseVoiceCommand(heard, channels, learned: _voiceLearned());
+    AppLog.add('STB', 'voice قنوات محمّلة: ${channels.length}');
+    if (channels.isEmpty && (c.kind == VoiceKind.none || c.kind == VoiceKind.choose)) {
+      AppLog.add('STB', 'voice $useLang guesses=${heard.map((e) => '"$e"').join(' | ')} → قايمة القنوات فاضية');
+      if (mounted) toast(context, 'سمعت «${heard.first}» بس قايمة القنوات فاضية: الريسيفر مردّش بيها. اتأكد إنه شغّال وجرّب تاني');
+      return;
+    }
     AppLog.add('STB', 'voice $useLang guesses=${heard.map((e) => '"$e"').join(' | ')} → ${c.kind.name} ${c.describe}${c.alts.isEmpty ? '' : ' [${c.alts.map((e) => e.name).join(', ')}]'}');
     if (!mounted) return;
     switch (c.kind) {
@@ -3507,7 +3513,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               child: Row(children: [
                 const Text('سمعت: ', style: TextStyle(color: kMuted, fontSize: 13)),
                 Expanded(child: Directionality(textDirection: TextDirection.ltr, child: Text('"${c.heard}"', style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)))),
-                Text(useLang == 'en-US' ? 'EN' : 'ع', style: const TextStyle(color: kGold, fontSize: 12)),
+                const SizedBox.shrink(),
               ]),
             ),
             if (others.isNotEmpty)
@@ -3563,21 +3569,10 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                   child: OutlinedButton.icon(
                     onPressed: () {
                       Navigator.pop(sc);
-                      voice(lang: 'en-US');
-                    },
-                    icon: const Icon(Icons.mic_rounded, size: 18),
-                    label: const Text('اسمع تاني بالإنجليزي', style: TextStyle(fontSize: 12)),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () {
-                      Navigator.pop(sc);
                       voice(lang: 'ar-EG');
                     },
                     icon: const Icon(Icons.mic_rounded, size: 18),
-                    label: const Text('اسمع تاني بالعربي', style: TextStyle(fontSize: 12)),
+                    label: const Text('اسمع تاني', style: TextStyle(fontSize: 12)),
                   ),
                 ),
               ]),
@@ -3859,20 +3854,6 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
             ]),
           ),
           if (busy) const Padding(padding: EdgeInsets.all(8), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
-          if (on)
-            TextButton(
-              onPressed: () {
-                setState(() => voiceLang = voiceLang == 'en-US' ? 'ar-EG' : 'en-US');
-                Store.p.setString('stb_voice_lang', voiceLang);
-                toast(context, voiceLang == 'en-US' ? 'الصوت: إنجليزي (للقنوات)' : 'الصوت: عربي (للأوامر)');
-              },
-              onLongPress: () async {
-                await Store.p.remove('voice_learned');
-                if (mounted) toast(context, 'مسحت اختياراتك المحفوظة للصوت');
-              },
-              style: TextButton.styleFrom(minimumSize: const Size(36, 36), padding: EdgeInsets.zero),
-              child: Text(voiceLang == 'en-US' ? 'EN' : 'ع', style: const TextStyle(color: kGold, fontWeight: FontWeight.w800)),
-            ),
           if (on) IconButton(tooltip: 'أمر صوتي (تجريبي)', icon: const Icon(Icons.mic_rounded, color: kGold), onPressed: () => voice()),
           if (on && view == 0)
             IconButton(
@@ -3891,6 +3872,16 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               if (v == 'info') showInfo();
               if (v == 'reload') loadChannels();
               if (v == 'sort') sortChannels();
+              if (v == 'organize' && gm != null) {
+                Navigator.push(context, MaterialPageRoute(builder: (_) => ChannelOrganizerPage(gm: gm!, channels: channels, radio: radio, onChanged: loadChannels)));
+              }
+              if (v == 'export') {
+                if (channels.isEmpty) {
+                  toast(context, 'قايمة القنوات فاضية: مفيش حاجة تتحفظ');
+                } else {
+                  chExportShare(channels, gm?.info);
+                }
+              }
               if (v == 'security' && gm != null) Navigator.push(context, MaterialPageRoute(builder: (_) => ReceiverSecurityPage(gm: gm!)));
               if (v == 'notif') setNotifRemote(!notifRemote);
               if (v == 'timers' && gm != null) {
@@ -3909,6 +3900,8 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
               const PopupMenuItem(value: 'ip', child: ListTile(leading: Icon(Icons.edit_rounded), title: Text('عنوان يدوي'))),
               if (on) const PopupMenuItem(value: 'info', child: ListTile(leading: Icon(Icons.info_outline_rounded), title: Text('معلومات الريسيفر'))),
               if (on) const PopupMenuItem(value: 'timers', child: ListTile(leading: Icon(Icons.alarm_rounded), title: Text('المؤقتات (تسجيل/تشغيل)'))),
+              if (on) const PopupMenuItem(value: 'organize', child: ListTile(leading: Icon(Icons.swap_vert_rounded), title: Text('ترتيب القنوات بالسحب (تجريبي)'))),
+              if (on) const PopupMenuItem(value: 'export', child: ListTile(leading: Icon(Icons.save_alt_rounded), title: Text('احفظ ملف القنوات'))),
               if (on) const PopupMenuItem(value: 'sort', child: ListTile(leading: Icon(Icons.sort_rounded), title: Text('رتّب القنوات (تجريبي)'))),
               if (on) const PopupMenuItem(value: 'security', child: ListTile(leading: Icon(Icons.admin_panel_settings_rounded), title: Text('الأمان والرقابة والمسح (تجريبي)'))),
               if (on) const PopupMenuItem(value: 'reload', child: ListTile(leading: Icon(Icons.refresh_rounded), title: Text('حدّث القنوات'))),
@@ -4560,6 +4553,7 @@ class RemoteControl extends StatefulWidget {
 
 class _RemoteControlState extends State<RemoteControl> {
   bool more = false;
+  bool nums = false;
 
   void Function(int) get onKey => widget.onKey;
 
@@ -4596,95 +4590,504 @@ class _RemoteControlState extends State<RemoteControl> {
               textDirection: TextDirection.ltr,
               child: Column(mainAxisSize: MainAxisSize.min, children: [
                 _row([
-                  _k('', K.power, icon: Icons.power_settings_new_rounded, color: const Color(0xFF8E2B2B), w: 56),
-                  _k('', K.mute, icon: Icons.volume_off_rounded, w: 56),
+                  _k('', K.power, icon: Icons.power_settings_new_rounded, color: const Color(0xFF8E2B2B), w: 66),
+                  _k('', K.mute, icon: Icons.volume_off_rounded, w: 66),
                 ], a: MainAxisAlignment.spaceBetween),
                 _row([
                   // تشغيل/إيقاف مؤقت: ضغطة = Pause، مطولة = Play (تجريبي)
-                  RemoteKey(icon: Icons.play_arrow_rounded, onTap: () => onKey(K.pause), onLong: () => onKey(K.play), size: 30, width: 60),
+                  RemoteKey(icon: Icons.play_arrow_rounded, onTap: () => onKey(K.pause), onLong: () => onKey(K.play), size: 38, width: 64),
                   // USB: ضغطة = USB، مطولة = Stop (تجريبي)
-                  RemoteKey(label: 'USB/■', onTap: () => onKey(K.usb), onLong: () => onKey(K.stop), size: 30, width: 60, fs: 9),
-                  _k('', K.record, icon: Icons.fiber_manual_record_rounded, fg: kBad, h: 30, w: 60),
-                  _k('INFO', K.info, h: 30, w: 60, fs: 9),
+                  RemoteKey(label: 'USB/■', onTap: () => onKey(K.usb), onLong: () => onKey(K.stop), size: 38, width: 64, fs: 9),
+                  _k('', K.record, icon: Icons.fiber_manual_record_rounded, fg: kBad, h: 38, w: 64),
+                  _k('INFO', K.info, h: 38, w: 64, fs: 9),
                 ]),
                 _row([
-                  _k('', K.prev, icon: Icons.skip_previous_rounded, color: const Color(0xFFD64545), fg: Colors.white, h: 30, w: 60),
-                  _k('', K.next, icon: Icons.skip_next_rounded, color: const Color(0xFF3FAE5A), fg: Colors.white, h: 30, w: 60),
-                  _k('', K.rew, icon: Icons.fast_rewind_rounded, color: const Color(0xFFE2B33C), fg: Colors.white, h: 30, w: 60),
-                  _k('', K.ff, icon: Icons.fast_forward_rounded, color: const Color(0xFF3F7FD6), fg: Colors.white, h: 30, w: 60),
+                  _k('', K.prev, icon: Icons.skip_previous_rounded, color: const Color(0xFFD64545), fg: Colors.white, h: 38, w: 64),
+                  _k('', K.next, icon: Icons.skip_next_rounded, color: const Color(0xFF3FAE5A), fg: Colors.white, h: 38, w: 64),
+                  _k('', K.rew, icon: Icons.fast_rewind_rounded, color: const Color(0xFFE2B33C), fg: Colors.white, h: 38, w: 64),
+                  _k('', K.ff, icon: Icons.fast_forward_rounded, color: const Color(0xFF3F7FD6), fg: Colors.white, h: 38, w: 64),
                 ]),
                 _row([
-                  _k('FAV', K.fav, fg: kGold, h: 28, w: 52, fs: 9),
-                  _k('SAT', K.sat, h: 28, w: 52, fs: 9),
+                  _k('FAV', K.fav, fg: kGold, h: 36, w: 62, fs: 9),
+                  _k('SAT', K.sat, h: 36, w: 62, fs: 9),
                 ], a: MainAxisAlignment.spaceBetween),
-                DPad(onKey: onKey, size: 156),
+                DPad(onKey: onKey, size: 190),
                 _row([
-                  _k('MENU', K.menu, h: 28, w: 52, fs: 8),
-                  _k('EXIT', K.exit, h: 28, w: 52, fs: 8),
+                  _k('MENU', K.menu, h: 36, w: 62, fs: 8),
+                  _k('EXIT', K.exit, h: 36, w: 62, fs: 8),
                 ], a: MainAxisAlignment.spaceBetween),
                 _row([
                   _tall(
-                    RemoteKey(label: 'SUBTITLE', onTap: () => onKey(K.subtitle), color: dark, size: 30, width: 56, fs: 7),
-                    RemoteKey(label: 'TXT', onTap: () => onKey(K.teletext), color: dark, size: 30, width: 56, fs: 9),
+                    RemoteKey(label: 'SUBTITLE', onTap: () => onKey(K.subtitle), color: dark, size: 38, width: 66, fs: 7),
+                    RemoteKey(label: 'TXT', onTap: () => onKey(K.teletext), color: dark, size: 38, width: 66, fs: 9),
                   ),
                   Column(mainAxisSize: MainAxisSize.min, children: [
                     // RECALL: ضغطة = قايمة «آخر القنوات» على شاشة الريسيفر، مطولة = القايمة جوه التطبيق (تجريبي)
-                    RemoteKey(label: 'RECALL', onTap: () => onKey(K.recall), onLong: widget.onRecallLong, size: 38, width: 74, fs: 9),
-                    _k('AUDIO', K.audio, h: 30, w: 74, fs: 9),
+                    RemoteKey(label: 'RECALL', onTap: () => onKey(K.recall), onLong: widget.onRecallLong, size: 46, width: 84, fs: 9),
+                    _k('AUDIO', K.audio, h: 38, w: 84, fs: 9),
                   ]),
                   _tall(
-                    RemoteKey(icon: Icons.add_rounded, onTap: () => onKey(K.pageUp), color: dark, size: 30, width: 50, repeat: true),
-                    RemoteKey(icon: Icons.remove_rounded, onTap: () => onKey(K.pageDown), color: dark, size: 30, width: 50, repeat: true),
+                    RemoteKey(icon: Icons.add_rounded, onTap: () => onKey(K.pageUp), color: dark, size: 38, width: 62, repeat: true),
+                    RemoteKey(icon: Icons.remove_rounded, onTap: () => onKey(K.pageDown), color: dark, size: 38, width: 62, repeat: true),
                   ),
                 ]),
-                for (final r in const [
-                  [1, 2, 3],
-                  [4, 5, 6],
-                  [7, 8, 9],
-                ])
-                  _row([for (final n in r) _k('$n', K.digit(n), h: 30, w: 80, fs: 14)]),
-                _row([
-                  _k('EPG', K.epg, h: 30, w: 80, fs: 10),
-                  _k('0', K.digit(0), h: 30, w: 80, fs: 14),
-                  _k('TV/RADIO', K.tvRadio, h: 30, w: 80, fs: 8),
-                ]),
-                GestureDetector(
-                  onTap: () => setState(() => more = !more),
-                  child: Container(
-                    margin: const EdgeInsets.only(top: 6),
-                    height: 24,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(borderRadius: BorderRadius.circular(12), border: Border.all(color: kLine)),
-                    child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                      Icon(more ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded, size: 16, color: kMuted),
-                      const Text(' MORE', style: TextStyle(color: kMuted, fontSize: 11)),
-                    ]),
-                  ),
+                if (nums) ...[
+                  for (final r in const [
+                    [1, 2, 3],
+                    [4, 5, 6],
+                    [7, 8, 9],
+                  ])
+                    _row([for (final n in r) _k('$n', K.digit(n), h: 38, w: 80, fs: 14)]),
+                  _row([
+                    _k('EPG', K.epg, h: 38, w: 80, fs: 10),
+                    _k('0', K.digit(0), h: 38, w: 80, fs: 14),
+                    _k('TV/RADIO', K.tvRadio, h: 38, w: 80, fs: 8),
+                  ]),
+                ],
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Row(children: [
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: () => setState(() => nums = !nums),
+                        child: Container(
+                          height: 30,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(borderRadius: BorderRadius.circular(15), border: Border.all(color: nums ? kGold : kLine)),
+                          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                            Icon(nums ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded, size: 20, color: nums ? kGold : kMuted),
+                            Text(' 123', style: TextStyle(color: nums ? kGold : kMuted, fontSize: 13, fontWeight: FontWeight.w700)),
+                          ]),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: GestureDetector(
+                        onTap: () => setState(() => more = !more),
+                        child: Container(
+                          height: 30,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(borderRadius: BorderRadius.circular(15), border: Border.all(color: more ? kGold : kLine)),
+                          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                            Icon(more ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded, size: 20, color: more ? kGold : kMuted),
+                            Text(' MORE', style: TextStyle(color: more ? kGold : kMuted, fontSize: 13, fontWeight: FontWeight.w700)),
+                          ]),
+                        ),
+                      ),
+                    ),
+                  ]),
                 ),
                 if (more)
                   Wrap(alignment: WrapAlignment.center, children: [
-                    _k('VOL−', K.volDown, h: 28, w: 56, fs: 9, repeat: true),
-                    _k('VOL+', K.volUp, h: 28, w: 56, fs: 9, repeat: true),
-                    _k('CH−', K.chDown, h: 28, w: 56, fs: 9),
-                    _k('CH+', K.chUp, h: 28, w: 56, fs: 9),
-                    _k('SLEEP', K.sleep, h: 28, w: 56, fs: 8),
-                    _k('TIMER', K.timer, h: 28, w: 56, fs: 8),
-                    _k('RES', K.resolution, h: 28, w: 56, fs: 9),
-                    _k('F1', K.f1, h: 28, w: 56, fs: 9),
-                    _k('F2', K.f2, h: 28, w: 56, fs: 9),
-                    _k('LIVE', K.pauseLive, h: 28, w: 56, fs: 9),
-                    _k('FIND', K.find, h: 28, w: 56, fs: 9),
-                    _k('HOME', K.home, h: 28, w: 56, fs: 9),
-                    _k('', K.red, color: const Color(0xFFD64545), h: 24, w: 56),
-                    _k('', K.green, color: const Color(0xFF3FAE5A), h: 24, w: 56),
-                    _k('', K.yellow, color: const Color(0xFFE2B33C), h: 24, w: 56),
-                    _k('', K.blue, color: const Color(0xFF3F7FD6), h: 24, w: 56),
+                    _k('VOL−', K.volDown, h: 36, w: 66, fs: 9, repeat: true),
+                    _k('VOL+', K.volUp, h: 36, w: 66, fs: 9, repeat: true),
+                    _k('CH−', K.chDown, h: 36, w: 66, fs: 9),
+                    _k('CH+', K.chUp, h: 36, w: 66, fs: 9),
+                    _k('SLEEP', K.sleep, h: 36, w: 66, fs: 8),
+                    _k('TIMER', K.timer, h: 36, w: 66, fs: 8),
+                    _k('RES', K.resolution, h: 36, w: 66, fs: 9),
+                    _k('F1', K.f1, h: 36, w: 66, fs: 9),
+                    _k('F2', K.f2, h: 36, w: 66, fs: 9),
+                    _k('LIVE', K.pauseLive, h: 36, w: 66, fs: 9),
+                    _k('FIND', K.find, h: 36, w: 66, fs: 9),
+                    _k('HOME', K.home, h: 36, w: 66, fs: 9),
+                    _k('', K.red, color: const Color(0xFFD64545), h: 30, w: 66),
+                    _k('', K.green, color: const Color(0xFF3FAE5A), h: 30, w: 66),
+                    _k('', K.yellow, color: const Color(0xFFE2B33C), h: 30, w: 66),
+                    _k('', K.blue, color: const Color(0xFF3F7FD6), h: 30, w: 66),
                   ]),
               ]),
             ),
           ),
         ),
       ),
+    );
+  }
+}
+
+
+// ---------------- v11: حفظ القنوات + ترتيبها ----------------
+String chBackupName(StbInfo? i, String ext) {
+  final n = DateTime.now();
+  String two(int v) => v.toString().padLeft(2, '0');
+  final model = (i?.model ?? 'receiver').replaceAll(RegExp(r'[^A-Za-z0-9]+'), '_');
+  return 'a2r-channels-$model-${n.year}${two(n.month)}${two(n.day)}-${two(n.hour)}${two(n.minute)}.$ext';
+}
+
+String chJson(List<StbChannel> list, StbInfo? i) => const JsonEncoder.withIndent('  ').convert({
+      'app': 'A2R Home',
+      'saved': DateTime.now().toIso8601String(),
+      'model': i?.model ?? '',
+      'serial': i?.serial ?? '',
+      'count': list.length,
+      'channels': [
+        for (var k = 0; k < list.length; k++) {'pos': k + 1, 'id': list[k].id, 'name': list[k].name, 'radio': list[k].radio, 'index': list[k].index, 'raw': list[k].raw}
+      ],
+    });
+
+String chCsv(List<StbChannel> list) {
+  String q(String s) => '"${s.replaceAll('"', '""')}"';
+  final b = StringBuffer('\uFEFFpos,id,name,type,hd,scrambled,locked\n');
+  for (var k = 0; k < list.length; k++) {
+    final c = list[k];
+    b.writeln('${k + 1},${q(c.id)},${q(c.name)},${c.radio ? 'radio' : 'tv'},${c.hd ? 1 : 0},${c.scrambled ? 1 : 0},${c.locked ? 1 : 0}');
+  }
+  return b.toString();
+}
+
+/// يكتب JSON + CSV في مجلد التطبيق. بيرجّع المسارات
+Future<List<File>> chWriteFiles(List<StbChannel> list, StbInfo? i, {bool temp = false}) async {
+  final dir = temp ? await getTemporaryDirectory() : await getApplicationDocumentsDirectory();
+  final j = File('${dir.path}/${chBackupName(i, 'json')}');
+  final c = File('${dir.path}/${chBackupName(i, 'csv')}');
+  await j.writeAsString(chJson(list, i));
+  await c.writeAsString(chCsv(list));
+  return [j, c];
+}
+
+Future<void> chExportShare(List<StbChannel> list, StbInfo? i) async {
+  final fs = await chWriteFiles(list, i, temp: true);
+  AppLog.add('STB', 'ملف القنوات اتحفظ: ${list.length} قناة (${fs.map((f) => f.path.split('/').last).join(', ')})');
+  await SharePlus.instance.share(ShareParams(files: [for (final f in fs) XFile(f.path)], text: 'A2R Home: ${list.length} قناة'));
+}
+
+/// مفتاح الترتيب الأبجدي: أرقام الأول، وبعدين إنجليزي/عربي حسب الاختيار. العربي بيتطبّع (أ إ آ = ا، ة = ه، ى = ي)
+(int, String) chSortKey(String name, bool arabicFirst) {
+  final n = _stripNoise(name);
+  final s = n.isEmpty ? name.toLowerCase() : n;
+  final f = s.isEmpty ? '' : s[0];
+  int g;
+  if (RegExp(r'[0-9]').hasMatch(f)) {
+    g = 0;
+  } else if (RegExp('[\u0600-\u06FF]').hasMatch(f)) {
+    g = arabicFirst ? 1 : 2;
+  } else {
+    g = arabicFirst ? 2 : 1;
+  }
+  return (g, s);
+}
+
+List<StbChannel> chSorted(List<StbChannel> l, {required bool arabicFirst}) {
+  final idx = {for (var i = 0; i < l.length; i++) l[i].id: i};
+  final out = [...l];
+  out.sort((a, b) {
+    final ka = chSortKey(a.name, arabicFirst), kb = chSortKey(b.name, arabicFirst);
+    final c = ka.$1 != kb.$1 ? ka.$1.compareTo(kb.$1) : ka.$2.compareTo(kb.$2);
+    return c != 0 ? c : idx[a.id]!.compareTo(idx[b.id]!);
+  });
+  return out;
+}
+
+/// الحركات المطلوبة: لكل مكان i لو القناة اللي فيه مش اللي في الخطة، انقل قناة الخطة لمكان القناة الحالية (دايماً لفوق)
+List<(StbChannel, StbChannel)> chPlanMoves(List<StbChannel> orig, List<StbChannel> plan) {
+  final cur = [...orig];
+  final moves = <(StbChannel, StbChannel)>[];
+  for (var i = 0; i < plan.length && i < cur.length; i++) {
+    if (cur[i].id == plan[i].id) continue;
+    final j = cur.indexWhere((c) => c.id == plan[i].id);
+    if (j < 0) continue;
+    moves.add((plan[i], cur[i]));
+    final c = cur.removeAt(j);
+    cur.insert(i, c);
+  }
+  return moves;
+}
+
+class ChannelOrganizerPage extends StatefulWidget {
+  final GmClient gm;
+  final List<StbChannel> channels;
+  final bool radio;
+  final Future<void> Function() onChanged;
+  const ChannelOrganizerPage({super.key, required this.gm, required this.channels, required this.radio, required this.onChanged});
+  @override
+  State<ChannelOrganizerPage> createState() => _ChannelOrganizerPageState();
+}
+
+class _ChannelOrganizerPageState extends State<ChannelOrganizerPage> {
+  late List<StbChannel> orig, plan;
+  bool busy = false, cancel = false;
+  String progress = '';
+
+  @override
+  void initState() {
+    super.initState();
+    orig = widget.channels.where((c) => c.radio == widget.radio).toList();
+    plan = [...orig];
+  }
+
+  int get movesCount => chPlanMoves(orig, plan).length;
+
+  void _moveTo(int from, int to) {
+    setState(() {
+      final c = plan.removeAt(from);
+      plan.insert(to.clamp(0, plan.length), c);
+    });
+  }
+
+  Future<void> _askNumber(int i) async {
+    final c = plan[i];
+    final ctrl = TextEditingController();
+    final v = await showDialog<int>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: Text('انقل «${c.name}»'),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('دلوقتي في المكان ${i + 1}', style: const TextStyle(color: kMuted, fontSize: 12)),
+          const SizedBox(height: 10),
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: TextField(controller: ctrl, autofocus: true, keyboardType: TextInputType.number, decoration: InputDecoration(labelText: 'المكان الجديد (1 إلى ${plan.length})', border: const OutlineInputBorder(), isDense: true)),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(d, int.tryParse(ctrl.text.trim())), child: const Text('انقل')),
+        ],
+      ),
+    );
+    if (v == null || !mounted) return;
+    if (v < 1 || v > plan.length) {
+      toast(context, 'اكتب رقم من 1 لـ ${plan.length}');
+      return;
+    }
+    _moveTo(i, v - 1);
+  }
+
+  Future<void> _sortSheet() async {
+    final r = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      builder: (c) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const SectionTitle('رتّب أبجدي', icon: Icons.sort_by_alpha_rounded),
+          ListTile(leading: const Icon(Icons.sort_by_alpha_rounded, color: kGold), title: const Text('A إلى Z (إنجليزي الأول، بعدين العربي)'), subtitle: const Text('بالتطبيق: حركات قناة قناة، فيه شريط تقدم', style: TextStyle(fontSize: 11)), onTap: () => Navigator.pop(c, 'en')),
+          ListTile(leading: const Icon(Icons.sort_by_alpha_rounded, color: kGold), title: const Text('أ إلى ي (العربي الأول، بعدين الإنجليزي)'), onTap: () => Navigator.pop(c, 'ar')),
+          ListTile(leading: const Icon(Icons.memory_rounded, color: kGold), title: const Text('ترتيب الريسيفر نفسه'), subtitle: const Text('الأنواع اللي الريسيفر بيرجّعها', style: TextStyle(fontSize: 11)), onTap: () => Navigator.pop(c, 'rx')),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+    if (r == null || !mounted) return;
+    if (r == 'rx') {
+      await _receiverSort();
+    } else {
+      setState(() => plan = chSorted(plan, arabicFirst: r == 'ar'));
+      toast(context, 'الخطة اتغيرت. راجعها ودوس «تطبيق»');
+    }
+  }
+
+  Future<void> _receiverSort() async {
+    try {
+      final (types, cur) = await widget.gm.sortTypes();
+      if (types.isEmpty) {
+        if (mounted) toast(context, 'الريسيفر مرجّعش أنواع ترتيب');
+        return;
+      }
+      if (!mounted) return;
+      final i = await showModalBottomSheet<int>(
+        context: context,
+        backgroundColor: kSurface,
+        showDragHandle: true,
+        builder: (c) => ListView(shrinkWrap: true, children: [
+          SectionTitle(widget.radio ? 'ترتيب الريسيفر: الراديو' : 'ترتيب الريسيفر: التلفزيون', icon: Icons.memory_rounded),
+          for (var k = 0; k < types.length; k++) ListTile(title: Text(types[k]), trailing: k == cur ? const Icon(Icons.check_rounded) : null, onTap: () => Navigator.pop(c, k)),
+        ]),
+      );
+      if (i == null || !mounted) return;
+      if (!await confirm(context, 'الترتيب هيتغير على الريسيفر نفسه (${types[i]}). هحفظ نسخة احتياطي قبلها. تكمل؟')) return;
+      await chWriteFiles(orig, widget.gm.info);
+      await widget.gm.sortBy(i, widget.radio);
+      await Future.delayed(const Duration(milliseconds: 900));
+      await widget.onChanged();
+      if (!mounted) return;
+      final fresh = (await widget.gm.channels()).where((c) => c.radio == widget.radio).toList();
+      setState(() {
+        orig = fresh;
+        plan = [...fresh];
+      });
+      toast(context, 'اتبعت. القايمة اتحدّثت من الريسيفر');
+    } catch (e) {
+      if (mounted) toast(context, 'خطأ: $e');
+    }
+  }
+
+  Future<void> _restoreFromFile() async {
+    try {
+      final r = await FilePicker.pickFile(type: FileType.any);
+      if (r == null) return;
+      final j = jsonDecode(utf8.decode(await r.readAsBytes(), allowMalformed: true));
+      final list = (j['channels'] as List).map((e) => '${(e as Map)['id']}').toList();
+      final byId = {for (final c in plan) c.id: c};
+      final ordered = <StbChannel>[for (final id in list) if (byId.remove(id) != null) plan.firstWhere((c) => c.id == id)];
+      final rest = plan.where((c) => byId.containsKey(c.id)).toList();
+      if (ordered.isEmpty) {
+        if (mounted) toast(context, 'الملف مفيهوش قنوات موجودة على الريسيفر');
+        return;
+      }
+      setState(() => plan = [...ordered, ...rest]);
+      if (mounted) toast(context, 'رجّعت ترتيب ${ordered.length} قناة في الخطة (الأسماء والأقفال مبترجعش). ${rest.isEmpty ? '' : '${rest.length} قناة مش في الملف اتحطت في الآخر. '}دوس «تطبيق»');
+    } catch (e) {
+      if (mounted) toast(context, 'الملف مش مفهوم: $e');
+    }
+  }
+
+  List<String> _ids(List<StbChannel> l) => [for (final c in l) c.id];
+
+  Future<List<StbChannel>> _fresh() async {
+    await Future.delayed(const Duration(milliseconds: 900));
+    return (await widget.gm.channels()).where((c) => c.radio == widget.radio).toList();
+  }
+
+  Future<void> _apply() async {
+    final moves = chPlanMoves(orig, plan);
+    if (moves.isEmpty) return;
+    if (!await confirm(context, 'هبعت ${moves.length} حركة للريسيفر وهيتغير ترتيب القنوات عليه نفسه. هحفظ نسخة احتياطي الأول، وأول حركة هتتجرب لوحدها وأتأكد منها. تكمل؟')) return;
+    setState(() {
+      busy = true;
+      cancel = false;
+      progress = 'بحفظ نسخة احتياطي…';
+    });
+    final sim = [...orig];
+    void simMove((StbChannel, StbChannel) m) {
+      final from = sim.indexWhere((c) => c.id == m.$1.id), to = sim.indexWhere((c) => c.id == m.$2.id);
+      final c = sim.removeAt(from);
+      sim.insert(to, c);
+    }
+
+    try {
+      final f = await chWriteFiles(orig, widget.gm.info);
+      AppLog.add('STB', 'ترتيب: نسخة احتياطي ${f.first.path}');
+      // أول حركة لوحدها
+      setState(() => progress = 'بجرّب أول حركة…');
+      await widget.gm.moveChannel(moves.first.$1, moves.first.$2);
+      simMove(moves.first);
+      var got = await _fresh();
+      if (!listEquals(_ids(got), _ids(sim))) {
+        AppLog.add('STB', 'ترتيب: أول حركة مطابقتش. المتوقع ${_ids(sim).take(15).join(',')} | اللي حصل ${_ids(got).take(15).join(',')}');
+        orig = got;
+        plan = [...got];
+        msg('وقفت: أول حركة ما اتطبقتش زي المتوقع (الريسيفر ينقل بطريقة تانية أو مردّش). مفيش حركات تانية اتبعتت. ابعتلي السجل. القايمة اتحدّثت من الريسيفر.');
+        await widget.onChanged();
+        setState(() => busy = false);
+        return;
+      }
+      for (var k = 1; k < moves.length; k++) {
+        if (cancel) break;
+        setState(() => progress = 'حركة ${k + 1} من ${moves.length}');
+        await widget.gm.moveChannel(moves[k].$1, moves[k].$2);
+        simMove(moves[k]);
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+      got = await _fresh();
+      final ok = listEquals(_ids(got), _ids(sim));
+      AppLog.add('STB', 'ترتيب: خلص ${cancel ? '(اتوقف)' : ''} مطابق=$ok');
+      orig = got;
+      plan = [...got];
+      await widget.onChanged();
+      msg(cancel
+          ? 'وقفت بإيدك. اللي اتبعت اتطبق، والباقي لأ. القايمة دي من الريسيفر.'
+          : ok
+              ? 'تم ✓ الترتيب على الريسيفر مطابق للخطة'
+              : 'خلصت بس الترتيب اللي رجع من الريسيفر مش مطابق للخطة بالظبط. القايمة دي من الريسيفر. النسخة الاحتياطي اتحفظت.');
+    } catch (e) {
+      AppLog.add('STB', 'ترتيب ✗ $e');
+      msg('خطأ وقفني: $e');
+      try {
+        final got = await _fresh();
+        orig = got;
+        plan = [...got];
+      } catch (_) {}
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  void msg(String m) {
+    if (mounted) toast(context, m);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final origPos = {for (var i = 0; i < orig.length; i++) orig[i].id: i};
+    final mc = movesCount;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.radio ? 'ترتيب الراديو' : 'ترتيب القنوات'),
+        actions: [
+          IconButton(tooltip: 'رتّب أبجدي', icon: const Icon(Icons.sort_by_alpha_rounded), onPressed: busy || plan.isEmpty ? null : _sortSheet),
+          IconButton(tooltip: 'استرجع الترتيب من ملف', icon: const Icon(Icons.upload_file_rounded), onPressed: busy || plan.isEmpty ? null : _restoreFromFile),
+          IconButton(tooltip: 'احفظ ملف القنوات', icon: const Icon(Icons.save_alt_rounded), onPressed: busy || orig.isEmpty ? null : () => chExportShare(orig, widget.gm.info)),
+        ],
+      ),
+      body: orig.isEmpty
+          ? const Center(child: Padding(padding: EdgeInsets.all(24), child: Text('قايمة القنوات فاضية. الريسيفر مردّش بقنوات. اتأكد إنه شغّال واضغط «حدّث القنوات» الأول.', textAlign: TextAlign.center)))
+          : Column(children: [
+              Container(
+                margin: const EdgeInsets.all(10),
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: kSurface2, borderRadius: BorderRadius.circular(12)),
+                child: const Row(children: [
+                  Icon(Icons.info_outline_rounded, size: 18, color: kGold),
+                  SizedBox(width: 8),
+                  Expanded(child: Text('امسك القناة مطوّلاً واسحبها، أو اضغط عليها واكتب رقم المكان. التغيير مبيتبعتش للريسيفر غير لما تدوس «تطبيق». «تجريبي»', style: TextStyle(fontSize: 12))),
+                ]),
+              ),
+              Expanded(
+                child: ReorderableListView.builder(
+                  buildDefaultDragHandles: !busy,
+                  itemCount: plan.length,
+                  onReorder: (a, b) {
+                    if (busy) return;
+                    _moveTo(a, b > a ? b - 1 : b);
+                  },
+                  itemBuilder: (c, i) {
+                    final ch = plan[i];
+                    final was = origPos[ch.id] ?? i;
+                    return Padding(
+                      key: ValueKey(ch.id),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                      child: Material(
+                        color: kSurface,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: BorderSide(color: was != i ? kGold.withValues(alpha: 0.6) : kLine)),
+                        clipBehavior: Clip.antiAlias,
+                        child: ListTile(
+                        dense: true,
+                        onTap: busy ? null : () => _askNumber(i),
+                        leading: Directionality(textDirection: TextDirection.ltr, child: SizedBox(width: 34, child: Text('${i + 1}', style: const TextStyle(color: kGold, fontWeight: FontWeight.w800)))),
+                        title: Directionality(textDirection: TextDirection.ltr, child: Align(alignment: Alignment.centerLeft, child: Text(ch.name, overflow: TextOverflow.ellipsis))),
+                        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                          if (was != i) Text('كان ${was + 1}', style: const TextStyle(color: kMuted, fontSize: 11)),
+                          const SizedBox(width: 6),
+                          const Icon(Icons.drag_handle_rounded, color: kMuted),
+                        ]),
+                      ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              if (busy)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                  child: Row(children: [
+                    const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                    const SizedBox(width: 10),
+                    Expanded(child: Text(progress, style: const TextStyle(fontSize: 12))),
+                    TextButton(onPressed: () => setState(() => cancel = true), child: const Text('وقّف')),
+                  ]),
+                ),
+              SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(children: [
+                    Expanded(child: OutlinedButton(onPressed: busy || mc == 0 ? null : () => setState(() => plan = [...orig]), child: const Text('تراجع عن الكل'))),
+                    const SizedBox(width: 10),
+                    Expanded(child: FilledButton.icon(onPressed: busy || mc == 0 ? null : _apply, icon: const Icon(Icons.check_rounded), label: Text(mc == 0 ? 'تطبيق' : 'تطبيق ($mc حركة)'))),
+                  ]),
+                ),
+              ),
+            ]),
     );
   }
 }
@@ -14682,16 +15085,44 @@ Map<String, dynamic> _jsonMap(String key) {
 // فالتطبيق بيقراها من جافاسكريبت/صفحات الراوتر نفسها (GET بس)، وبيقرا القيمة الحالية الأول، ومش بيبعت أي أمر
 // إلا لو القراية رجّعت أرقام. بعد التطبيق بيقرا تاني ويقارن. «تجريبي».
 class BwFields {
-  final String goform, sw, up, down;
-  const BwFields(this.goform, this.sw, this.up, this.down);
-  Map<String, dynamic> toJson() => {'g': goform, 's': sw, 'u': up, 'd': down};
+  final String goform, sw, up, down, rsw, rup, rdown;
+  const BwFields(this.goform, this.sw, this.up, this.down, {this.rsw = '', this.rup = '', this.rdown = ''});
+  Map<String, dynamic> toJson() => {'g': goform, 's': sw, 'u': up, 'd': down, 'rs': rsw, 'ru': rup, 'rd': rdown};
   static BwFields? fromJson(Map<String, dynamic> j) {
     final g = '${j['g'] ?? ''}', s = '${j['s'] ?? ''}', u = '${j['u'] ?? ''}', d = '${j['d'] ?? ''}';
-    if (g.isEmpty || s.isEmpty || u.isEmpty || d.isEmpty) return null;
-    return BwFields(g, s, u, d);
+    if (s.isEmpty || u.isEmpty || d.isEmpty) return null;
+    return BwFields(g, s, u, d, rsw: '${j['rs'] ?? ''}', rup: '${j['ru'] ?? ''}', rdown: '${j['rd'] ?? ''}');
   }
 
-  String describe() => '$goform{$sw,$up,$down}';
+  String get readSw => rsw.isEmpty ? sw : rsw;
+  String get readUp => rup.isEmpty ? up : rup;
+  String get readDown => rdown.isEmpty ? down : rdown;
+  bool get canWrite => goform.isNotEmpty;
+  String describe() => '${goform.isEmpty ? 'قراية بس' : goform}{$sw,$up,$down} قراية:{$readSw,$readUp,$readDown}';
+}
+
+/// v10: صفحة Bandwidth في الراوتر بتقرا tc_traffic_enable / upload_width_manual / download_width_manual (اسماء من سكريبت الراوتر نفسه).
+/// أمر الكتابة بنلاقيه بس لو في نفس الأوبجكت اللي فيه goformId حقول upload/download width. غير كده قراية بس.
+BwJs? parseTcJs(String js) {
+  const rs = 'tc_traffic_enable', ru = 'upload_width_manual', rd = 'download_width_manual';
+  if (!js.contains(ru) || !js.contains(rd) || !js.contains(rs)) return null;
+  for (final m in RegExp('goformId["\']?\\s*[:=]\\s*["\']([A-Za-z0-9_]+)["\']').allMatches(js)) {
+    final g = m[1]!, gu = g.toUpperCase();
+    if (gu.startsWith('SPEED_CONTROL') || gu.startsWith('USER_FLOW')) continue;
+    final a = js.lastIndexOf('{', m.start), b = js.indexOf('}', m.end);
+    if (a < 0 || b < 0 || b - a > 1500) continue;
+    final obj = js.substring(a, b + 1);
+    final keys = {for (final k in RegExp('["\']?([A-Za-z][A-Za-z0-9_]*)["\']?\\s*:').allMatches(obj)) k[1]!};
+    final up = keys.where((k) => k.toLowerCase().contains('upload') && k.toLowerCase().contains('width')).firstOrNull;
+    final down = keys.where((k) => k.toLowerCase().contains('download') && k.toLowerCase().contains('width')).firstOrNull;
+    final sw = keys.where((k) => k.toLowerCase().contains('tc') && (k.toLowerCase().contains('enable') || k.toLowerCase().contains('traffic'))).firstOrNull;
+    if (up != null && down != null && sw != null) {
+      return BwJs(BwFields(g, sw, up, down, rsw: rs, rup: ru, rdown: rd), obj);
+    }
+  }
+  final i = js.indexOf(ru);
+  final win = js.substring((i - 300).clamp(0, js.length), (i + 900).clamp(0, js.length));
+  return BwJs(const BwFields('', rs, ru, rd, rsw: rs, rup: ru, rdown: rd), win);
 }
 
 class BwJs {
@@ -14705,6 +15136,7 @@ BwJs? parseBwJs(String js) {
   for (final m in RegExp('goformId["\']?\\s*[:=]\\s*["\']([A-Za-z0-9_]+)["\']').allMatches(js)) {
     final g = m[1]!, gl = g.toLowerCase();
     final named = gl.contains('band') || gl.contains('bw') || gl.contains('speed') || gl.contains('qos') || gl.contains('limit');
+    if (gl.contains('speed_control') || gl.contains('user_flow')) continue; // v10: دول لكل جهاز لوحده مش للصفحة دي
     if (!named || gl.contains('lock') || gl.contains('lte') || gl.contains('select') || gl.contains('wifi_band')) continue;
     final from = (m.start - 1200).clamp(0, js.length), to = (m.end + 1200).clamp(0, js.length);
     final snip = js.substring(from, to);
@@ -14726,7 +15158,7 @@ class ZteBwLearn {
   /// v9: أسماء من سكريبتات الراوتر فيها speed_control / user_flow / upload_speed / download_speed (قراية بس)
   static final Set<String> tokens = {};
   static final List<String> lines = [];
-  static final RegExp _tokRe = RegExp(r'[A-Za-z_][A-Za-z0-9_]*(?:speed_control|user_flow|upload_speed|download_speed|SPEED_CONTROL|bandwidth_ctrl|band_width)[A-Za-z0-9_]*', caseSensitive: false);
+  static final RegExp _tokRe = RegExp(r'[A-Za-z0-9_]*(?:speed_control|user_flow|upload_speed|download_speed|width_manual|tc_traffic|userspeedlimit)[A-Za-z0-9_]*', caseSensitive: false);
 
   static void scan(String path, String body) {
     for (final m in _tokRe.allMatches(body)) {
@@ -14744,7 +15176,7 @@ class ZteBwLearn {
 
   static BwFields? get saved {
     try {
-      return BwFields.fromJson(jsonDecode(Store.p.getString('zte_bw_fields') ?? '{}') as Map<String, dynamic>);
+      return BwFields.fromJson(jsonDecode(Store.p.getString('zte_bw_fields2') ?? '{}') as Map<String, dynamic>);
     } catch (_) {
       return null;
     }
@@ -14762,6 +15194,7 @@ class ZteBwLearn {
       final pageRe = RegExp('["\']((?:\\./|/)?(?:tmpl|html|template|pages?|views?)/[A-Za-z0-9_\\-/.]*\\.html?)["\']');
       final bandRe = RegExp('["\']((?:\\./|/)?[A-Za-z0-9_\\-/.]*band[A-Za-z0-9_\\-/.]*\\.(?:js|html?))["\']', caseSensitive: false);
       final mentions = <String>[];
+      BwJs? readOnly;
       while (queue.isNotEmpty && fetched < 70) {
         final path = queue.removeAt(0);
         if (!seen.add(path)) continue;
@@ -14776,15 +15209,20 @@ class ZteBwLearn {
         final body = utf8.decode(r.bodyBytes, allowMalformed: true);
         if (RegExp('bandwidth', caseSensitive: false).hasMatch(body)) mentions.add(path);
         scan(path, body);
-        final hit = parseBwJs(body);
-        if (hit != null) {
+        final hit = parseTcJs(body) ?? parseBwJs(body);
+        if (hit != null && !hit.fields.canWrite && body.contains('width_manual')) {
+          // قراية بس: نكمّل نقلّب في باقي الملفات على أمر الكتابة، ونفتكر دي لو ملقيناش
+          readOnly ??= hit;
+          AppLog.add('BW', 'لقيت أسماء القراية في $path بس مش لاقي أمر الكتابة هنا: ${hit.fields.describe()}');
+          AppLog.add('BW', 'SNIPPET $path:\n${hit.snippet}');
+        } else if (hit != null) {
           AppLog.add('BW', 'لقيت أمر الـ Bandwidth في $path: ${hit.fields.describe()}');
           AppLog.add('BW', 'SNIPPET $path:\n${hit.snippet}');
           AppLog.add('BW', 'أسماء مرتبطة: ${tokens.join(', ')}');
           for (final l in lines) {
             AppLog.add('BW', 'LINE $l');
           }
-          await Store.p.setString('zte_bw_fields', jsonEncode(hit.fields.toJson()));
+          await Store.p.setString('zte_bw_fields2', jsonEncode(hit.fields.toJson()));
           return hit;
         }
         for (final s in linkRe.allMatches(body)) {
@@ -14804,6 +15242,14 @@ class ZteBwLearn {
             if (!seen.contains(q) && !q.contains('..')) queue.insert(0, q);
           }
         }
+      }
+      if (readOnly != null) {
+        await Store.p.setString('zte_bw_fields2', jsonEncode(readOnly.fields.toJson()));
+        AppLog.add('BW', 'هكمّل بقراية بس: ${readOnly.fields.describe()}');
+        for (final l in lines) {
+          AppLog.add('BW', 'LINE $l');
+        }
+        return readOnly;
       }
       AppLog.add('BW', 'ملقتش أمر الـ Bandwidth في $fetched ملف. ملفات فيها كلمة bandwidth: ${mentions.isEmpty ? 'ولا واحد' : mentions.join(', ')}');
       return null;
@@ -14886,20 +15332,21 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
     final x = f!;
     Map<String, dynamic> raw = {};
     try {
-      raw = await widget.router.get([x.sw, x.up, x.down]);
-      if ('${raw[x.up] ?? ''}'.isEmpty && '${raw[x.down] ?? ''}'.isEmpty) {
-        for (final k in [x.sw, x.up, x.down]) {
+      raw = await widget.router.get([x.readSw, x.readUp, x.readDown]);
+      if ('${raw[x.readUp] ?? ''}'.isEmpty && '${raw[x.readDown] ?? ''}'.isEmpty) {
+        for (final k in [x.readSw, x.readUp, x.readDown]) {
           raw[k] = await widget.router.getOne(k);
         }
       }
     } catch (e) {
       msg = 'مقدرتش أقرا الإعداد من الراوتر: $e';
     }
-    curSw = '${raw[x.sw] ?? ''}';
-    curUp = '${raw[x.up] ?? ''}';
-    curDown = '${raw[x.down] ?? ''}';
+    curSw = '${raw[x.readSw] ?? ''}';
+    curUp = '${raw[x.readUp] ?? ''}';
+    curDown = '${raw[x.readDown] ?? ''}';
     AppLog.add('BW', 'قراية: ${x.describe()} → sw=$curSw up=$curUp down=$curDown');
-    readable = int.tryParse(curUp!.trim()) != null && int.tryParse(curDown!.trim()) != null && bwSwitchOn(curSw) != null;
+    readable = bwSwitchOn(curSw) != null && ((int.tryParse(curUp!.trim()) != null && int.tryParse(curDown!.trim()) != null) || bwSwitchOn(curSw) == false);
+    if (readable && !x.canWrite && msg.isEmpty) msg = 'قراية بس: لسه مش لاقي أمر الكتابة في الراوتر، فمش هبعت أي تغيير.';
     on = bwSwitchOn(curSw) ?? false;
     if (int.tryParse(curUp!.trim()) != null) upC.text = curUp!.trim();
     if (int.tryParse(curDown!.trim()) != null) downC.text = curDown!.trim();
@@ -14928,6 +15375,10 @@ class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
   Future<void> _apply() async {
     final x = f;
     if (x == null || !readable) return;
+    if (!x.canWrite) {
+      toast(context, 'مش لاقي أمر الكتابة في الراوتر، قراية بس');
+      return;
+    }
     final u = int.tryParse(upC.text.trim()), d = int.tryParse(downC.text.trim());
     if (on && (u == null || d == null || u < 64 || d < 64 || u > 100000 || d > 100000)) {
       toast(context, 'اكتب رقم صحيح من 64 لـ 100000 كيلوبت في الخانتين');
