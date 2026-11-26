@@ -15431,10 +15431,24 @@ class ZteBwLearn {
   }
 
   static int _cw = 0;
+  static final Map<String, String> _small = {};
   static final Set<String> _exp = {};
 
   /// v14: كل ده قراية بس: (1) تاجات السكريبت في index.html (2) أسماء ملفات js/html جوه main/config/set (3) مين بينادي على دوال BAND_WIDTH_SET و TRAFFIC_CONTROL_SWITCH_SET
   static void extra(String path, String body) {
+    if (path.endsWith('/js/main.js') || path.endsWith('/js/app.js')) {
+      _small[path] = body;
+      final lim = path.endsWith('main.js') ? 3000 : 2000;
+      AppLog.add('BW', 'HEAD $path (${body.length}B): ${body.substring(0, min(lim, body.length)).replaceAll('\n', ' ')}');
+    }
+    if (path.endsWith('index.html')) {
+      var k = 0;
+      for (final m in RegExp(r'<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)</script>', caseSensitive: false).allMatches(body)) {
+        if (k++ >= 4) break;
+        final t = m[1]!.trim();
+        AppLog.add('BW', 'INLINE $path#$k (${t.length}B): ${t.substring(0, min(800, t.length)).replaceAll('\n', ' ')}');
+      }
+    }
     if (path.endsWith('index.html') || path.endsWith('.html')) {
       final tags = RegExp(r'<(?:script|link|iframe)\b[^>]*>', caseSensitive: false).allMatches(body).map((m) => m[0]!).toList();
       AppLog.add('BW', 'TAGS $path (${tags.length}): ${tags.take(40).map((t) => t.length > 160 ? t.substring(0, 160) : t).join(' | ')}');
@@ -15522,6 +15536,7 @@ class ZteBwLearn {
     final c = http.Client();
     _wins = 0;
     _cw = 0;
+    _small.clear();
     _exp.clear();
     _winFiles.clear();
     deepDone = true;
@@ -15606,6 +15621,41 @@ class ZteBwLearn {
           AppLog.add('BW', 'PROBE $path ✗');
         }
       }
+      // v15: أسماء موديولات من main.js / app.js (وأي ملف صغير بيتجاب) نجرّبها GET بس، ونسجّل الرد
+      var tries = 0;
+      final done = <String>{};
+      var pending = [for (final e in _small.entries) e.value];
+      for (var round = 0; round < 3 && pending.isNotEmpty && tries < 60; round++) {
+        final cands = <String>[];
+        for (final b in pending) {
+          for (final m in RegExp('["\']([A-Za-z0-9_\\-./!]{3,48})["\']').allMatches(b)) {
+            var t = m[1]!;
+            if (t.startsWith('text!') || t.startsWith('http') || RegExp(r'\.(css|png|jpg|gif|ico|html?|json)$').hasMatch(t)) continue;
+            t = t.replaceFirst(RegExp(r'^\.?/'), '').replaceFirst(RegExp(r'\.js$'), '');
+            if (t.isEmpty || t.contains('..')) continue;
+            for (final p in ['/js/$t.js', '/$t.js']) {
+              if (!seen.contains(p) && done.add(p)) cands.add(p);
+            }
+          }
+        }
+        pending = [];
+        for (final path in cands) {
+          if (tries >= 60) break;
+          tries++;
+          seen.add(path);
+          try {
+            final r = await c.get(Uri.parse('$base$path'), headers: {'Referer': '$base/index.html'}).timeout(const Duration(seconds: 6));
+            if (r.statusCode == 200 && r.bodyBytes.length < 3000000) {
+              final body = utf8.decode(r.bodyBytes, allowMalformed: true);
+              if (body.trimLeft().startsWith('<')) continue;
+              AppLog.add('BW', 'PROBE2 $path → 200 ${r.bodyBytes.length}B');
+              scan(path, body);
+              if (body.length < 20000) pending.add(body);
+            }
+          } catch (_) {}
+        }
+      }
+      AppLog.add('BW', 'PROBE2 جرّبت $tries مسار');
       AppLog.add('BW', 'FETCHED $fetched ملف: ${seen.take(90).join(' ')}');
       if (readOnly != null) {
         await Store.p.setString('zte_bw_fields2', jsonEncode(readOnly.fields.toJson()));
