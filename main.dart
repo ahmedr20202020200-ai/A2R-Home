@@ -591,6 +591,8 @@ class _LogPageState extends State<LogPage> {
 // ---------------- الشبكة ----------------
 class NetworkPage extends StatefulWidget {
   const NetworkPage({super.key});
+  /// v7: للصور التجريبية بس (اختبارات) — لو اتملا، الصفحة بتعرضه من غير ما تكلم الشبكة
+  static ({List<LanHost> hosts, List<RouterStation> stations, String myIp, String gw, Map<String, dynamic> st})? demo;
   @override
   State<NetworkPage> createState() => _NetworkPageState();
 }
@@ -603,6 +605,14 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
   final Map<String, LanHost> hosts = {}; // key = ip
   List<String> blockedMacs = [];
   ZteAcl? acl; // fix19
+  // v7: آخر قايمة من الراوتر + الـ MACs المشتركة (الأكسس) + الريسيفرات اللي أعلنت عن نفسها
+  Set<String> routerIps = {};
+  bool routerListOk = false;
+  Set<String> shared = {};
+  Map<String, String> announced = {};
+  String filter = 'all';
+  int lastUpdate = 0;
+  String totoMsg = '';
   bool scanning = false;
   double progress = 0;
   Timer? auto;
@@ -625,6 +635,25 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
   }
 
   Future<void> _start() async {
+    final d = NetworkPage.demo;
+    if (d != null) {
+      net = PhoneNet()
+        ..ip = d.myIp
+        ..gateway = d.gw
+        ..ssid = 'AhmedA2R-4G';
+      router = ZteRouter(d.gw);
+      routerMsg = 'متصل بالراوتر (${d.gw}) — base64Md5';
+      st = d.st;
+      routerListOk = d.stations.isNotEmpty;
+      routerIps = {for (final s in d.stations) s.ip};
+      shared = sharedMacsOf(d.stations, apIp: TotoStore.ip, apSelfMacs: TotoStore.selfMacs);
+      for (final h in d.hosts) {
+        hosts[h.ip] = h;
+      }
+      lastUpdate = DateTime.now().millisecondsSinceEpoch;
+      if (mounted) setState(() {});
+      return;
+    }
     net = await readPhoneNet();
     if (mounted) setState(() {});
     await _autoLogin();
@@ -787,6 +816,13 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
         st = await router!.status();
         unawaited(NetLog.sample(st, source: 'app'));
         final list = await router!.stations();
+        // v7: الأكسس (قراية بس، كل 4 دقايق على الأكتر) علشان نعرف مين عليه
+        if (TotoStore.ip.isNotEmpty) {
+          totoMsg = (await totoQuickRead().catchError((e) => '$e')) ?? '';
+        }
+        routerListOk = list.isNotEmpty;
+        routerIps = {for (final s in list) if (s.ip.isNotEmpty) s.ip};
+        shared = sharedMacsOf(list, apIp: TotoStore.ip, apSelfMacs: TotoStore.selfMacs);
         try {
           final a = await router!.readAcl();
           acl = a;
@@ -795,21 +831,25 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
         unawaited(DeviceWatch.update({for (final s in list) s.mac.isNotEmpty ? s.mac : s.ip}));
         unawaited(NewDevAlert.check(list));
         for (final s in list) {
-          final key = s.ip.isEmpty ? s.mac : s.ip;
-          final h = hosts.putIfAbsent(key, () => LanHost(key, source: 'router'));
+          if (s.ip.isEmpty) continue; // v7: من غير عنوان = مش متصل فعلًا (كان بيعمل جهاز تاني بالـ MAC)
+          final h = hosts.putIfAbsent(s.ip, () => LanHost(s.ip, source: 'router'));
           h.mac = s.mac;
+          h.miss = 0;
           if (!isBadHostName(s.hostname)) {
             h.name = s.hostname;
             h.nameSrc = 'router';
-            unawaited(NameCache.put(s.mac.isNotEmpty ? s.mac : s.ip, s.hostname, 'router'));
-          } else if (isBadHostName(h.name)) {
+            unawaited(NameCache.put(devKeyOf(s.mac, s.ip, shared), s.hostname, 'router'));
+          } else if (isBadHostName(h.name) || h.nameSrc == 'router') {
             h.name = '';
+            h.nameSrc = '';
           }
           h.wifi = s.wifi;
           h.connectTime = s.connectTime;
-          h.vendor = Oui.vendorOf(s.mac);
+          // MAC الأكسس مش بيقول الجهاز إيه — منعرضش شركته على الأجهزة اللي وراه
+          h.vendor = shared.contains(normMac(s.mac)) ? '' : Oui.vendorOf(s.mac);
           if (h.source == 'scan') h.source = 'both';
         }
+        if (routerListOk) pruneHostsV7(hosts, routerIps: routerIps, keep: {if (net?.ip != null) net!.ip!});
       } catch (e) {
         AppLog.add('ROUTER', 'refresh error $e');
         routerMsg = 'خطأ مع الراوتر: $e';
@@ -837,7 +877,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     _checkNew(before);
     // v4: سجل الأجهزة + الباقة + المواعيد
     try {
-      await DeviceHistory.update([for (final h in hosts.values) (key: h.mac.isNotEmpty ? h.mac : h.ip, name: (Store.deviceNames[h.mac] ?? (isBadHostName(h.name) ? '' : h.name)), ip: h.ip)]);
+      await DeviceHistory.update([for (final h in hosts.values) (key: _key(h), name: _nameInfo(h).guess ? '' : label(h), ip: h.ip)]);
       if (router != null) {
         final total = (int.tryParse('${st['monthly_tx_bytes'] ?? ''}') ?? 0) + (int.tryParse('${st['monthly_rx_bytes'] ?? ''}') ?? 0);
         await Quota.sample(total);
@@ -849,6 +889,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     } catch (e) {
       AppLog.add('ROUTER', 'v4 refresh $e');
     }
+    lastUpdate = DateTime.now().millisecondsSinceEpoch;
     if (mounted) setState(() {});
   }
 
@@ -864,6 +905,16 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       scanning = true;
       progress = 0;
     });
+    // v7: الريسيفرات بتعلن عن نفسها (سماع بس، من غير ما نكلمها) — علشان متتعرضش «أندرويد»
+    unawaited(discoverReceivers(wait: const Duration(seconds: 5)).then((m) {
+      announced = {for (final e in m.entries) e.key: e.value.model};
+      for (final e in announced.entries) {
+        if (e.value.isNotEmpty && e.value != 'ريسيفر؟') unawaited(KnownStb.put(e.key, e.value));
+      }
+      if (mounted) setState(() {});
+    }).catchError((e) {
+      AppLog.add('LAN', 'stb discover ✗ $e');
+    }));
     final res = await scanLan(prefix, onProgress: (p) {
       if (mounted) setState(() => progress = p);
     }, onFound: (h) {
@@ -884,6 +935,12 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
         t.nameSrc = h.nameSrc.isEmpty ? 'netbios' : h.nameSrc;
       }
     }
+    // v7: شيل اللي مبقاش موجود (كان بيفضل للأبد → نفس الجهاز مرتين لما عنوانه يتغير)
+    final gone = pruneHostsV7(hosts,
+        scanIps: {for (final h in res) h.ip},
+        routerIps: routerListOk && router != null ? routerIps : null,
+        keep: {if (net?.ip != null) net!.ip!, if (net?.gateway != null) net!.gateway!});
+    if (gone.isNotEmpty) AppLog.add('LAN', 'اتشالوا (مبقوش موجودين): ${gone.join(' ')}');
     if (mounted) setState(() => scanning = false);
   }
 
@@ -903,15 +960,43 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     if (fresh.isNotEmpty) Store.addKnown(keys);
   }
 
-  String label(LanHost h) {
+  String label(LanHost h) => _nameInfo(h).name;
+
+  /// v7: مفتاح الجهاز — الـ MAC لو بتاعه لوحده، العنوان لو الـ MAC مشترك (MAC الأكسس)
+  String _key(LanHost h) => devKeyOf(h.mac, h.ip, shared);
+  bool _sharedMac(LanHost h) => h.mac.isNotEmpty && shared.contains(normMac(h.mac));
+  String? _stbName(LanHost h) => receiverLabelFor(h.ip, h.openPorts, known: KnownStb.all, announced: announced, savedIp: Store.receiverIp);
+
+  /// v7: الاسم بالترتيب: اسمك ← الراوتر/الأكسس/الموبايل نفسه ← ريسيفر (متأكدين) ← اسم الراوتر (DHCP) ←
+  /// اسم من جدول الأكسس ← ويندوز/mDNS/DNS ← المحفوظ ← تخمين (بيتكتب جنبه «تخمين»)
+  ({String name, String src, bool guess}) _nameInfo(LanHost h) {
     final names = Store.deviceNames;
-    final custom = names[h.mac] ?? names[h.ip];
-    if (custom != null && custom.trim().isNotEmpty) return custom;
-    if (!isBadHostName(h.name)) return h.name;
-    final c = NameCache.of(h.mac.isNotEmpty ? h.mac : h.ip);
-    if (c != null) return c.name;
-    final isMe = h.ip == net?.ip, isGw = h.ip == (router?.host ?? net?.gateway);
-    return fallbackDeviceName(guessDeviceType(h.name, h.vendor, h.openPorts, isGateway: isGw, isMe: isMe), h.vendor);
+    final k = _key(h);
+    final custom = names[k] ?? names[h.ip];
+    if (custom != null && custom.trim().isNotEmpty) return (name: custom, src: 'custom', guess: false);
+    final r = _route(h);
+    if (r == 'me') return (name: 'الموبايل ده', src: '', guess: false);
+    if (r == 'gw') return (name: 'الراوتر ZTE', src: '', guess: false);
+    if (r == 'apSelf') return (name: 'الأكسس TOTOLINK', src: '', guess: false);
+    final stb = _stbName(h);
+    if (stb != null) return (name: stb, src: 'stb', guess: false);
+    if (!isBadHostName(h.name) && !isWeakHostName(h.name)) return (name: h.name, src: h.nameSrc, guess: false);
+    final m = h.mac.isEmpty ? '' : normMac(h.mac);
+    if (m.isNotEmpty && !_sharedMac(h)) {
+      final t = TotoStore.clientNames[m];
+      if (t != null && totoGoodName(t)) return (name: t, src: 'toto', guess: false);
+    }
+    final c = NameCache.of(k);
+    if (c != null && !isWeakHostName(c.name)) return (name: c.name, src: 'cache', guess: false);
+    if (isWeakHostName(h.name)) return (name: 'جهاز أندرويد (تخمين)', src: '', guess: true);
+    final f = fallbackDeviceName(_type(h), h.vendor);
+    return (name: f == '(اسم مش معروف)' ? 'جهاز (اسم مش معروف)' : '$f (تخمين)', src: '', guess: true);
+  }
+
+  String _type(LanHost h) {
+    final r = _route(h);
+    if (_stbName(h) != null) return 'ريسيفر';
+    return guessDeviceType(isWeakHostName(h.name) ? 'android' : h.name, h.vendor, h.openPorts, isGateway: r == 'gw', isMe: r == 'me');
   }
 
   int ipNum(String ip) {
@@ -919,43 +1004,111 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     return p.length == 4 ? (int.tryParse(p[3]) ?? 999) : 999;
   }
 
+  /// v7: المجموعة: direct (مباشر + الراوتر + الموبايل) / ap (الأكسس وكل اللي عليه) / unknown
+  String _group(String route) => switch (route) {
+        'direct' || 'gw' || 'me' => 'direct',
+        'ap' || 'apMac' || 'apGuess' || 'apSelf' => 'ap',
+        _ => 'unknown',
+      };
+
+  bool _blocked(LanHost h) => h.mac.isNotEmpty && blockedMacs.contains(normMac(h.mac));
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
-    final list = hosts.values.toList()..sort((a, b) => ipNum(a.ip).compareTo(ipNum(b.ip)));
+    final all = hosts.values.toList()..sort((a, b) => ipNum(a.ip).compareTo(ipNum(b.ip)));
+    final routes = {for (final h in all) h.ip: _route(h)};
+    final groups = <String, List<LanHost>>{'direct': [], 'ap': [], 'unknown': []};
+    for (final h in all) {
+      groups[_group(routes[h.ip]!)]!.add(h);
+    }
+    bool pass(LanHost h) => switch (filter) {
+          'direct' => _group(routes[h.ip]!) == 'direct',
+          'ap' => _group(routes[h.ip]!) == 'ap',
+          'new' => h.isNew,
+          'blocked' => _blocked(h),
+          _ => true,
+        };
+    final read = TotoStore.lastRead;
+    final apLine = TotoStore.ip.isEmpty
+        ? 'الأكسس: العنوان لسه متكتبش — دوس هنا'
+        : 'الأكسس ${TotoStore.ip} • ${read == 0 ? 'جدوله لسه متقراش' : 'جدوله فيه ${TotoStore.macs.length} جهاز (اتقرا ${hhmm(read)})'}${totoMsg.isEmpty ? '' : '\n$totoMsg'}';
+    Widget section(String key, String title, IconData icon) {
+      final l = groups[key]!.where(pass).toList();
+      if (l.isEmpty) return const SizedBox.shrink();
+      return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 4),
+          child: Row(children: [
+            Icon(icon, size: 18, color: kGold),
+            const SizedBox(width: 6),
+            Expanded(child: Text('$title (${l.length})', style: const TextStyle(fontWeight: FontWeight.w700))),
+            if (key == 'ap')
+              TextButton(onPressed: _openToto, child: const Text('صفحة الأكسس')),
+          ]),
+        ),
+        for (final h in l) _hostTile(h, routes[h.ip]!),
+      ]);
+    }
+
+    final nDirect = groups['direct']!.length, nAp = groups['ap']!.length;
     return RefreshIndicator(
       onRefresh: refresh,
       child: ListView(children: [
         _infoCard(),
-        Card(
-          child: ListTile(
-            leading: const Icon(Icons.wifi_tethering_rounded, color: kGold),
-            title: const Text('الأكسس بوينت (TOTOLINK)'),
-            subtitle: Text('${TotoStore.ip.isEmpty ? 'العنوان لسه متحددش — دوس وهدوّر عليه' : TotoStore.ip}${TotoStore.macs.isEmpty ? '' : ' • ${TotoStore.macs.length} جهاز عليه'}', style: const TextStyle(fontSize: 12)),
-            trailing: const Icon(Icons.chevron_left_rounded),
-            onTap: () async {
-              await Navigator.push(context, MaterialPageRoute(builder: (_) => TotoPage(router: router, hosts: hosts.values.toList(), labelOf: label)));
-              if (mounted) setState(() {});
-            },
-          ),
-        ),
         _routerCard(),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-          child: Row(children: [
-            Text('الأجهزة (${list.length})', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-            const Spacer(),
-            if (scanning) SizedBox(width: 80, child: LinearProgressIndicator(value: progress)),
-            IconButton(icon: const Icon(Icons.radar), tooltip: 'افحص الشبكة', onPressed: scanning ? null : () => refresh()),
-          ]),
-        ),
-        if (router == null)
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 12),
-            child: Text('أندرويد 10+ مش بيدّي الـ MAC بتاع الأجهزة التانية — الـ MAC والحظر محتاجين دخول الراوتر.',
-                style: TextStyle(fontSize: 12, color: Colors.amberAccent)),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Expanded(
+                  child: Text('الأجهزة (${all.length})', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                ),
+                if (scanning) SizedBox(width: 70, child: LinearProgressIndicator(value: progress)),
+                IconButton(icon: const Icon(Icons.radar), tooltip: 'افحص الشبكة', onPressed: scanning ? null : () => refresh()),
+              ]),
+              Text(
+                  router == null
+                      ? 'من غير دخول الراوتر مش هعرف مين مباشر ومين على الأكسس، ولا الـ MAC (أندرويد 10+ مش بيدّيه)'
+                      : '$nDirect مباشر على الراوتر • $nAp عن طريق الأكسس${lastUpdate == 0 ? '' : ' • آخر تحديث ${hhmm(lastUpdate)}'}',
+                  style: TextStyle(fontSize: 12, color: router == null ? Colors.amberAccent : kMuted)),
+              const SizedBox(height: 4),
+              InkWell(
+                onTap: _openToto,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(children: [
+                    const Icon(Icons.wifi_tethering_rounded, size: 16, color: kGold),
+                    const SizedBox(width: 6),
+                    Expanded(child: Text(apLine, style: const TextStyle(fontSize: 12))),
+                    const Icon(Icons.chevron_left_rounded, size: 18),
+                  ]),
+                ),
+              ),
+              const SizedBox(height: 4),
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(children: [
+                  for (final f in const [('all', 'الكل'), ('direct', 'مباشر'), ('ap', 'الأكسس'), ('new', 'جديد'), ('blocked', 'محظور')])
+                    Padding(
+                      padding: const EdgeInsetsDirectional.only(end: 6),
+                      child: ChoiceChip(
+                        label: Text(f.$2),
+                        selected: filter == f.$1,
+                        onSelected: (_) => setState(() => filter = f.$1),
+                      ),
+                    ),
+                ]),
+              ),
+            ]),
           ),
-        for (final h in list) _hostTile(h),
+        ),
+        section('direct', 'مباشر على الراوتر', Icons.router),
+        section('ap', 'عن طريق الأكسس (TOTOLINK)', Icons.wifi_tethering_rounded),
+        section('unknown', 'مش معروف متوصل منين', Icons.help_outline_rounded),
+        if (all.where(pass).isEmpty)
+          const Padding(padding: EdgeInsets.all(24), child: Center(child: Text('مفيش أجهزة هنا', style: TextStyle(color: kMuted)))),
         const SizedBox(height: 80),
       ]),
     );
@@ -1216,35 +1369,46 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     }
   }
 
-  Widget _hostTile(LanHost h) {
-    final isMe = h.ip == net?.ip, isGw = h.ip == (router?.host ?? net?.gateway);
-    final type = guessDeviceType(h.name, h.vendor, h.openPorts, isGateway: isGw, isMe: isMe);
-    final blocked = h.mac.isNotEmpty && blockedMacs.contains(normMac(h.mac));
-    final allowed = !blocked && h.mac.isNotEmpty && (acl?.activeAllowed.contains(normMac(h.mac)) ?? false);
-    final route = _route(h);
-    final sub = [
+  Widget _hostTile(LanHost h, [String? routeArg]) {
+    final route = routeArg ?? _route(h);
+    final isMe = route == 'me';
+    final type = _type(h);
+    final blocked = _blocked(h);
+    final allowed = !blocked && h.mac.isNotEmpty && !_sharedMac(h) && (acl?.activeAllowed.contains(normMac(h.mac)) ?? false);
+    final ni = _nameInfo(h);
+    final sharedMac = _sharedMac(h);
+    // \u2066…\u2069 = اتجاه شمال→يمين للعنوان والـ MAC (من غيره بيتقلب في العربي)
+    final line1 = [
+      '\u2066${h.ip}\u2069',
+      if (h.mac.isNotEmpty) (sharedMac && route != 'apSelf') ? 'MAC الأكسس (مش بتاع الجهاز)' : '\u2066${h.mac}\u2069',
+    ].join(' • ');
+    final line2 = [
       type,
-      if (h.mac.isNotEmpty) h.mac,
-      if (h.vendor.isNotEmpty) h.vendor,
-      if (h.vendor.isEmpty && isRandomMac(h.mac)) 'MAC عشوائي',
-      if (h.nameSrc.isNotEmpty && !Store.deviceNames.containsKey(h.mac)) 'الاسم ${kNameSrcAr[h.nameSrc] ?? h.nameSrc}',
-      if (h.source != 'scan') (h.wifi ? 'واي فاي' : 'كابل'),
-      if (h.source != 'scan' || route != 'direct') kRouteAr[route] ?? '',
+      if (route == 'apGuess') 'غالبًا عن طريق الأكسس',
+      if (route == 'ap' || route == 'apMac') 'على الأكسس',
+      if (h.vendor.isNotEmpty) h.vendor.split(RegExp(r'[,(]')).first.trim(),
+      if (h.vendor.isEmpty && !sharedMac && isRandomMac(h.mac)) 'MAC عشوائي',
+      if (h.source != 'scan' && route == 'direct') (h.wifi ? 'واي فاي' : 'كابل'),
       if (h.connectTime.isNotEmpty) 'متصل من ${_dur(h.connectTime)}',
+      if (!ni.guess && ni.src.isNotEmpty && ni.src != 'custom') 'الاسم ${kNameSrcAr[ni.src] ?? ni.src}',
     ].join(' • ');
     return Card(
       child: ListTile(
         leading: CircleAvatar(
           backgroundColor: blocked ? Colors.red.shade900 : (h.isNew ? Colors.green.shade800 : const Color(0xFF2A2E35)),
-          child: Icon(_icon(type), color: kGold),
+          child: Icon(route == 'apSelf' ? Icons.wifi_tethering_rounded : _icon(type), color: kGold),
         ),
         title: Row(children: [
-          Flexible(child: Text(label(h), overflow: TextOverflow.ellipsis)),
+          Flexible(
+            child: Text(ni.name,
+                overflow: TextOverflow.ellipsis,
+                style: ni.guess ? const TextStyle(color: kMuted, fontStyle: FontStyle.italic) : null),
+          ),
           if (h.isNew) const Padding(padding: EdgeInsets.only(right: 6), child: Text('جديد', style: TextStyle(color: Colors.greenAccent, fontSize: 12))),
           if (blocked) const Padding(padding: EdgeInsets.only(right: 6), child: Text('محظور', style: TextStyle(color: Colors.redAccent, fontSize: 12))),
           if (allowed) const Padding(padding: EdgeInsets.only(right: 6), child: Text('مسموح', style: TextStyle(color: Colors.greenAccent, fontSize: 12))),
         ]),
-        subtitle: Text('${h.ip}\n$sub', style: const TextStyle(fontSize: 12)),
+        subtitle: Text('$line1\n$line2', style: const TextStyle(fontSize: 12)),
         isThreeLine: true,
         onTap: () => _hostSheet(h, blocked, isMe),
       ),
@@ -1286,7 +1450,17 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
     return m;
   }
 
-  String _route(LanHost h) => routeOf(ip: h.ip, mac: h.mac, apIp: TotoStore.ip, apClientMacs: TotoStore.macs.map(normMac).toSet(), macIps: _macIps);
+  String _route(LanHost h) => routeOfV7(
+        ip: h.ip,
+        mac: h.mac,
+        inRouterList: routerIps.contains(h.ip),
+        routerListOk: router != null && routerListOk,
+        apIp: TotoStore.ip,
+        apClientMacs: TotoStore.macs.map(normMac).toSet(),
+        shared: shared,
+        gwIp: router?.host ?? net?.gateway ?? '',
+        myIp: net?.ip ?? '',
+      );
 
   Future<void> _openToto() async {
     await Navigator.push(context, MaterialPageRoute(builder: (_) => TotoPage(router: router, hosts: hosts.values.toList(), labelOf: label)));
@@ -1297,8 +1471,12 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
   Future<void> _blockFlow(LanHost h, bool blocked) async {
     final route = _route(h);
     if (!blocked && route != 'direct') {
-      final msg = route == 'ap'
-          ? '«${label(h)}» متوصل بالأكسس (TOTOLINK) مش بالراوتر مباشرة — الحظر من الراوتر مش هيأثر عليه. احظره من صفحة الأكسس.'
+      if (route == 'gw' || route == 'me' || route == 'unknown') {
+        toast(context, route == 'unknown' ? 'سجّل دخول الراوتر الأول' : 'مينفعش تحظر ${label(h)}');
+        return;
+      }
+      final msg = route == 'ap' || route == 'apGuess'
+          ? '«${label(h)}» ${route == 'ap' ? 'متوصل' : 'غالبًا متوصل'} بالأكسس (TOTOLINK) مش بالراوتر مباشرة — الحظر من الراوتر مش هيأثر عليه. احظره من صفحة الأكسس.'
           : route == 'apSelf'
               ? 'ده الأكسس نفسه — لو اتحظر هيقطع النت عن كل الأجهزة اللي عليه. مش هحظره.'
               : 'الراوتر شايف «${label(h)}» بـ MAC الأكسس نفسه (نفس الـ MAC على أكتر من عنوان). لو حظرته من الراوتر هتقطع النت عن كل اللي على الأكسس. احظره من صفحة الأكسس.';
@@ -1378,15 +1556,16 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
       context: context,
       builder: (c) => SafeArea(
         child: Wrap(children: [
-          ListTile(title: Text(label(h)), subtitle: Text('${h.ip}  ${h.mac}', textDirection: TextDirection.ltr)),
+          ListTile(title: Text(label(h)), subtitle: Text('${h.ip}  ${h.mac}\n${kRouteAr[_route(h)] ?? ''}')),
           ListTile(
             leading: const Icon(Icons.edit),
             title: const Text('سمّي الجهاز'),
             onTap: () async {
               Navigator.pop(c);
-              final n = await askText(context, 'اسم الجهاز', initial: label(h));
+              final ni = _nameInfo(h);
+              final n = await askText(context, _sharedMac(h) ? 'اسم الجهاز (هيتحفظ على العنوان ${h.ip} — الجهاز ده ورا الأكسس)' : 'اسم الجهاز', initial: ni.guess ? '' : ni.name);
               if (n != null) {
-                await Store.setDeviceName(h.mac.isNotEmpty ? h.mac : h.ip, n);
+                await Store.setDeviceName(_key(h), n);
                 setState(() {});
               }
             },
@@ -1395,7 +1574,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
             ListTile(
               leading: Icon(blocked ? Icons.lock_open : Icons.block, color: blocked ? Colors.green : Colors.redAccent),
               title: Text(blocked ? 'فك الحظر' : 'احظر من الواي فاي'),
-              subtitle: Text(_route(h) == 'direct' ? 'مباشر على الراوتر — فلتر MAC في الراوتر (القايمة السودا)' : 'عن طريق الأكسس — الحظر من صفحة الأكسس'),
+              subtitle: Text(_route(h) == 'direct' ? 'مباشر على الراوتر — فلتر MAC في الراوتر (القايمة السودا)' : (kRouteAr[_route(h)] ?? '') + ' — الحظر من صفحة الأكسس'),
               onTap: () async {
                 Navigator.pop(c);
                 await _blockFlow(h, blocked);
@@ -3300,6 +3479,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       final i = await c.connect();
       gm = c;
       Store.receiverIp = ip;
+      unawaited(KnownStb.put(ip, i.model)); // v7: علشان صفحة الشبكة تعرضه «رسيفر» مش «أندرويد»
       found.clear();
       msg = '${i.model} • ${i.ip}';
       _refreshPlaying();
@@ -6323,10 +6503,174 @@ List<RouterStation> parseStations(Map<String, dynamic> j) {
       if (e.key.toLowerCase().contains('station')) read(e.value, !e.key.contains('lan'));
     }
   }
-  // شيل التكرار (نفس الـ MAC)
+  // v7: شيل التكرار بـ (MAC + العنوان) مش بالـ MAC لوحده — الأكسس (Repeater) ممكن يخلّي
+  // كذا جهاز وراه يظهروا بنفس الـ MAC بعناوين مختلفة؛ قبل كده كان بيتساب أول واحد بس والباقي بيختفي
   final seen = <String>{};
-  return out.where((s) => seen.add(s.mac.isEmpty ? s.ip : s.mac)).toList();
+  return out.where((s) => seen.add('${s.mac}|${s.ip}')).toList();
 }
+
+// ======== v7: الشبكة — جهاز واحد لكل جهاز حقيقي، طريق الاتصال، الأسماء ========
+
+/// MACs «مشتركة»: مش بتاعة جهاز واحد (MAC الأكسس اللي الأجهزة اللي وراه بتظهر بيه)
+/// = MAC عليه أكتر من عنوان في قايمة الراوتر، أو MAC الأكسس نفسه (من صفحته أو من عنوانه)
+Set<String> sharedMacsOf(List<RouterStation> list, {String apIp = '', Set<String> apSelfMacs = const {}}) {
+  final ips = <String, Set<String>>{};
+  for (final s in list) {
+    if (s.mac.isEmpty) continue;
+    ips.putIfAbsent(normMac(s.mac), () => <String>{}).add(s.ip);
+  }
+  return {
+    for (final e in ips.entries)
+      if (e.value.length >= 2 || apSelfMacs.contains(e.key) || (apIp.isNotEmpty && e.value.contains(apIp))) e.key,
+    ...apSelfMacs.map(normMac),
+  };
+}
+
+/// مفتاح الجهاز (للاسم اللي بتسميه + الكاش + السجل): الـ MAC لو بتاعه لوحده، وإلا العنوان
+String devKeyOf(String mac, String ip, Set<String> shared) {
+  final m = mac.isEmpty ? '' : normMac(mac);
+  if (m.length == 17 && !shared.contains(m)) return m;
+  return ip.isEmpty ? m : 'ip:$ip';
+}
+
+/// v7: الجهاز ده متوصل إزاي؟
+/// direct = مباشر على الراوتر • ap = على الأكسس (الأكسس قال إن الـ MAC ده عليه)
+/// apMac = الراوتر شايفه بـ MAC الأكسس • apGuess = مش في قايمة الراوتر خالص وهو شغال → غالبًا عن طريق الأكسس
+/// apSelf = الأكسس نفسه • gw = الراوتر • me = الموبايل ده • unknown = مفيش دخول للراوتر ومش عارفين
+String routeOfV7({
+  required String ip,
+  required String mac,
+  required bool inRouterList,
+  required bool routerListOk,
+  required String apIp,
+  required Set<String> apClientMacs,
+  required Set<String> shared,
+  String gwIp = '',
+  String myIp = '',
+}) {
+  if (ip.isNotEmpty && ip == myIp) return 'me';
+  if (ip.isNotEmpty && ip == gwIp) return 'gw';
+  if (apIp.isNotEmpty && ip == apIp) return 'apSelf';
+  final m = mac.isEmpty ? '' : normMac(mac);
+  if (m.length == 17 && apClientMacs.contains(m)) return 'ap';
+  if (m.length == 17 && shared.contains(m)) return 'apMac';
+  if (inRouterList) return 'direct';
+  if (routerListOk) return 'apGuess';
+  return 'unknown';
+}
+
+/// v7: يشيل الأجهزة اللي مبقتش موجودة (كانت بتفضل في القايمة للأبد → نفس الجهاز يظهر مرتين لما عنوانه يتغير
+/// أو لما يتنقل بين الأكسس والراوتر بـ MAC عشوائي مختلف لكل شبكة)
+/// [routerIps] = العناوين اللي الراوتر رجّعها دلوقتي (null = الراوتر مش متاح المرة دي — منشيلش حاجة بسببه)
+/// [scanIps] = العناوين اللي الفحص لقاها دلوقتي (null = مفيش فحص المرة دي)
+/// بيرجّع العناوين اللي اتشالت
+List<String> pruneHostsV7(Map<String, LanHost> hosts, {Set<String>? routerIps, Set<String>? scanIps, Set<String> keep = const {}}) {
+  final gone = <String>[];
+  for (final e in hosts.entries.toList()) {
+    final h = e.value;
+    if (keep.contains(h.ip)) continue;
+    final inR = routerIps?.contains(h.ip);
+    final inS = scanIps?.contains(h.ip);
+    if (inS == true) h.miss = 0;
+    if (inR == true || inS == true) continue;
+    // مش في الراوتر (اتقرا) والفحص يا إما مقالش حاجة يا إما ملقاهوش
+    final routerSaysGone = inR == false;
+    final scanSaysGone = inS == false;
+    if (h.source == 'router' && routerSaysGone) {
+      gone.add(e.key);
+    } else if (h.source == 'scan' && scanSaysGone) {
+      // الموبايلات النايمة ساعات مبتردش على الفحص — بنستنى فحصين
+      if (++h.miss >= 2) gone.add(e.key);
+    } else if (h.source == 'both') {
+      if (routerSaysGone && scanSaysGone) {
+        gone.add(e.key);
+      } else if (routerSaysGone) {
+        h.source = 'scan'; // الراوتر مبقاش شايفه — هيتشال لو الفحص الجاي ملقاهوش
+      } else if (scanSaysGone) {
+        h.source = 'router';
+      }
+    }
+  }
+  for (final k in gone) {
+    hosts.remove(k);
+  }
+  // نفس الـ MAC (بتاع جهاز واحد) على عنوانين: سيب اللي الراوتر شايفه دلوقتي
+  if (routerIps != null) {
+    final byMac = <String, List<LanHost>>{};
+    for (final h in hosts.values) {
+      if (h.mac.isNotEmpty) byMac.putIfAbsent(normMac(h.mac), () => []).add(h);
+    }
+    for (final l in byMac.values) {
+      if (l.length < 2) continue;
+      final live = l.where((h) => routerIps.contains(h.ip)).toList();
+      if (live.length == l.length) continue; // كلهم في الراوتر = MAC مشترك (الأكسس) — دول أجهزة مختلفة
+      for (final h in l) {
+        if (!routerIps.contains(h.ip) && !keep.contains(h.ip)) {
+          hosts.remove(h.ip);
+          gone.add(h.ip);
+        }
+      }
+    }
+  }
+  return gone;
+}
+
+/// اسم «ضعيف»: الراوتر/الجهاز بيبعته بس مش بيقول الجهاز إيه (android-1a2b3c… / Galaxy-xxxx العشوائي)
+bool isWeakHostName(String s) {
+  final t = s.trim().toLowerCase();
+  return RegExp(r'^android[-_][0-9a-f]{6,}$').hasMatch(t) || RegExp(r'^[0-9a-f]{12,}$').hasMatch(t);
+}
+
+/// v7: الريسيفرات اللي اتعرفت بالتأكيد (اتصلنا بيها أو أعلنت عن نفسها) — عنوان → موديل
+class KnownStb {
+  static Map<String, String> get all {
+    try {
+      return Map<String, String>.from(jsonDecode(Store.p.getString('stb_known') ?? '{}') as Map);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static Future<void> put(String ip, String model) async {
+    if (!isIpv4(ip)) return;
+    final m = all;
+    // عنوان واحد = ريسيفر واحد: لو موديل تاني كان على نفس العنوان يتشال
+    m[ip] = model.trim();
+    await Store.p.setString('stb_known', jsonEncode(m));
+  }
+
+  static String? modelAt(String ip) => all[ip];
+}
+
+/// v7: الجهاز ده ريسيفر؟ (عنوان ريسيفر اتعرف، أو بورت G-MScreen 20000 مفتوح، أو أعلن عن نفسه دلوقتي)
+/// بيرجّع الاسم اللي يتعرض أو null
+String? receiverLabelFor(String ip, Set<int> ports, {Map<String, String> known = const {}, Map<String, String> announced = const {}, String? savedIp}) {
+  String nice(String model) {
+    final m = model.trim();
+    if (m.isEmpty || m == 'ريسيفر؟') return 'رسيفر Qmax';
+    return m.toLowerCase().contains('qmax') ? 'رسيفر $m' : 'رسيفر Qmax $m';
+  }
+
+  if (announced.containsKey(ip)) return nice(announced[ip]!);
+  if (known.containsKey(ip)) return nice(known[ip]!);
+  if (savedIp != null && savedIp == ip) return nice('');
+  if (ports.contains(kStbPort)) return nice('');
+  return null;
+}
+
+/// v7: اسم من جدول الأكسس ينفع يتعرض؟ (مش وضع الواي فاي «11b/g/n» ولا سرعة ولا رقم)
+bool totoGoodName(String n) {
+  final t = n.trim();
+  if (t.isEmpty || isBadHostName(t)) return false;
+  if (RegExp(r'^(802\.)?11[a-z/+]*$|^\d|mbps|kbps|^(yes|no|on|off|none|open|wpa.*|wep|aes|tkip)$', caseSensitive: false).hasMatch(t)) return false;
+  return true;
+}
+
+/// v7: MACs الأكسس نفسه من صفحة الحالة (MAC Address / BSSID)
+Set<String> totoSelfMacsFrom(List<MapEntry<String, String>> pairs) => {
+      for (final p in pairs)
+        if (RegExp(r'mac|bssid', caseSensitive: false).hasMatch(p.key) && kMacRe.hasMatch(p.value)) normMac(kMacRe.firstMatch(p.value)![0]!),
+    };
 
 /// قايمة الحظر: "aa:bb;cc:dd" → List
 List<String> splitList(String? s) => (s ?? '')
@@ -6793,9 +7137,17 @@ class ZteRouter {
     var list = parseStations(j);
     if (list.isEmpty) {
       list = parseStations(await get(['station_list']).catchError((_) => <String, dynamic>{}));
+      // v7: أجهزة الكابل — على راوتره multi_data بيرجّعها فاضية، فنقراها لوحدها كمان
+      final lan = parseStations({'lan_station_list': await get(['lan_station_list']).then((m) => m['lan_station_list']).catchError((_) => '')});
+      final have = {for (final s in list) '${s.mac}|${s.ip}'};
+      list = [...list, ...lan.where((s) => !have.contains('${s.mac}|${s.ip}'))];
     }
+    lastStationsOk = j.isNotEmpty || list.isNotEmpty;
     return list;
   }
+
+  /// v7: آخر قراية لقايمة الأجهزة نجحت (حتى لو فاضية)؟
+  bool lastStationsOk = false;
 
   // ---- الحظر (فلتر MAC بتاع الواي فاي) ----
   // fix19: بنقرا وضع الفلتر (ACL_mode) والقايمتين، وبنفسّرهم حسب الوضع:
@@ -7029,6 +7381,8 @@ class LanHost {
   int? pingMs;
   /// الاسم جه منين: router / netbios / mdns / dns / cache
   String nameSrc = '';
+  /// v7: كام فحص ورا بعض ملقاش الجهاز (بيتشال بعد 2)
+  int miss = 0;
   LanHost(this.ip, {this.name = '', this.mac = '', this.vendor = '', this.source = 'scan'});
 }
 
@@ -13866,6 +14220,8 @@ const Map<String, String> kNameSrcAr = {
   'mdns': 'من mDNS',
   'dns': 'من DNS الراوتر',
   'cache': 'محفوظ من قبل',
+  'toto': 'من الأكسس',
+  'stb': 'ريسيفر (اتأكدت)',
   'custom': 'اسمك',
 };
 
@@ -16188,6 +16544,10 @@ const kRouteAr = {
   'ap': 'عن طريق الأكسس',
   'apMac': 'عن طريق الأكسس (بـ MAC الأكسس)',
   'apSelf': 'الأكسس نفسه',
+  'apGuess': 'غالبًا عن طريق الأكسس (الراوتر مش شايفه مباشر)',
+  'gw': 'الراوتر',
+  'me': 'الموبايل ده',
+  'unknown': 'سجّل دخول الراوتر علشان أعرف متوصل منين',
 };
 
 class TotoStore {
@@ -16206,6 +16566,80 @@ class TotoStore {
   /// fix18: آخر وضع تشغيل اتقرا من صفحة Operation Mode (قراية بس)
   static String get opMode => Store.p.getString('toto_opmode') ?? '';
   static set opMode(String v) => Store.p.setString('toto_opmode', v);
+  /// v7: MAC الأكسس نفسه (من صفحة الحالة) — علشان نعرف الأجهزة اللي الراوتر شايفها بيه
+  static Set<String> get selfMacs => (Store.p.getStringList('toto_self_macs') ?? []).toSet();
+  static set selfMacs(Set<String> v) => Store.p.setStringList('toto_self_macs', v.toList());
+  /// v7: الصفحات اللي فيها جدول الأجهزة (من آخر قراية كاملة)
+  static List<String> get clientPages => Store.p.getStringList('toto_client_pages') ?? const ['/wlstatbl.htm'];
+  static set clientPages(List<String> v) => Store.p.setStringList('toto_client_pages', v);
+  /// v7: آخر مرة اتقرت قايمة الأجهزة من الأكسس (ms)
+  static int get lastRead => Store.p.getInt('toto_last_read') ?? 0;
+  static set lastRead(int v) => Store.p.setInt('toto_last_read', v);
+  static int get lastFail => Store.p.getInt('toto_last_fail') ?? 0;
+  static set lastFail(int v) => Store.p.setInt('toto_last_fail', v);
+  /// v7: أسماء الأجهزة اللي الأكسس بيعرضها (MAC → اسم) لو جدوله فيه أسماء
+  static Map<String, String> get clientNames {
+    try {
+      return Map<String, String>.from(jsonDecode(Store.p.getString('toto_client_names') ?? '{}') as Map);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  static set clientNames(Map<String, String> v) => Store.p.setString('toto_client_names', jsonEncode(v));
+}
+
+/// v7: قراية سريعة (GET بس) لجدول الأجهزة من الأكسس — من غير ما تفتح صفحته.
+/// محاولة دخول واحدة بالباسورد المحفوظ؛ لو فشلت مش هنحاول تاني قبل 30 دقيقة (علشان الجهاز ميقفلش الدخول).
+/// بيرجّع null لو تمام أو سبب لو متقراش.
+Future<String?> totoQuickRead({bool force = false}) async {
+  final ip = TotoStore.ip;
+  if (!isIpv4(ip)) return 'عنوان الأكسس لسه متكتبش';
+  final pw = await TotoStore.pass();
+  if (pw == null) return 'باسورد الأكسس مش محفوظ — ادخل صفحة الأكسس مرة';
+  final now = DateTime.now().millisecondsSinceEpoch;
+  if (!force && now - TotoStore.lastFail < 30 * 60000) return 'آخر دخول للأكسس فشل — هجرب تاني بعد شوية';
+  if (!force && now - TotoStore.lastRead < 4 * 60000) return null; // اتقرا من قريب
+  final d = TotoDevice(ip);
+  try {
+    final err = await d.login(TotoStore.user, pw).timeout(const Duration(seconds: 15));
+    if (err != null) {
+      TotoStore.lastFail = now;
+      AppLog.add('TOTO', 'quick login ✗ $err');
+      return err;
+    }
+    final cl = <String, TotoClient>{};
+    for (final p in {...TotoStore.clientPages, '/wlstatbl.htm'}) {
+      if (!totoPageSafe(p)) continue;
+      try {
+        final r = await d.get(p);
+        if (r.status != 200 || detectLogin(r.status, null, r.body, p).kind != 'none') continue;
+        for (final c in clientsFromRows(tableRows(r.body), p)) {
+          cl.putIfAbsent(c.mac, () => c);
+        }
+      } catch (e) {
+        AppLog.add('TOTO', 'quick GET $p ✗ $e');
+      }
+    }
+    try {
+      final r = await d.get('/status.htm');
+      if (r.status == 200) {
+        final self = totoSelfMacsFrom(statusPairs(r.body));
+        if (self.isNotEmpty) TotoStore.selfMacs = self;
+      }
+    } catch (_) {}
+    final self = TotoStore.selfMacs;
+    TotoStore.macs = {for (final c in cl.values) if (!self.contains(c.mac)) c.mac};
+    TotoStore.clientNames = {for (final c in cl.values) if (totoGoodName(c.name)) c.mac: c.name};
+    TotoStore.lastRead = now;
+    AppLog.add('TOTO', 'quick read: ${TotoStore.macs.length} جهاز على الأكسس • MAC الأكسس=${self.join(',')}');
+    return null;
+  } catch (e) {
+    AppLog.add('TOTO', 'quick read ✗ $e');
+    return 'الأكسس مردّش: $e';
+  } finally {
+    d.close();
+  }
 }
 
 /// fix18: يقرا الاختيار المعلَّم في صفحة Operation Mode (radio checked) والكلام اللي جنبه.
@@ -16956,8 +17390,15 @@ class _TotoPageState extends State<TotoPage> {
     }
     final seen = <String>{};
     info = [for (final e in inf) if (seen.add(e.key)) e];
-    clients = cl.values.toList();
+    // v7: MAC الأكسس نفسه + صفحات جدول الأجهزة + الأسماء — علشان صفحة الشبكة تقراهم لوحدها بعد كده
+    final self = totoSelfMacsFrom(inf);
+    if (self.isNotEmpty) TotoStore.selfMacs = self;
+    clients = cl.values.where((c) => !TotoStore.selfMacs.contains(c.mac)).toList();
     TotoStore.macs = {for (final c in clients) c.mac};
+    TotoStore.clientPages = {for (final c in cl.values) c.page}.where((p) => p.isNotEmpty && totoPageSafe(p)).toList();
+    TotoStore.clientNames = {for (final c in clients) if (totoGoodName(c.name)) c.mac: c.name};
+    TotoStore.lastRead = DateTime.now().millisecondsSinceEpoch;
+    TotoStore.lastFail = 0;
     status = 'اتقرا ${d.pages.length} صفحة • ${clients.length} جهاز على الأكسس • ${d.forms.length} فورم';
     AppLog.add('TOTO', status);
   }
