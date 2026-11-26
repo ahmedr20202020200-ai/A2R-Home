@@ -1256,6 +1256,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
                 PopupMenuItem(value: 'wifi_off', child: Text('قفل الواي فاي (تجريبي)')),
                 PopupMenuItem(value: 'wifi_on', child: Text('فتح الواي فاي (تجريبي)')),
                 PopupMenuItem(value: 'dns', child: Text('DNS الراوتر (تجريبي)')),
+                PopupMenuItem(value: 'bw', child: Text('حد السرعة Bandwidth (تجريبي)')),
                 PopupMenuItem(value: 'acl', child: Text('ابعتلي حالة الحظر (للسجل)')),
                 PopupMenuItem(value: 'signal', child: Text('سجل الإشارة + الانقطاعات')),
                 PopupMenuItem(value: 'place', child: Text('مكان الراوتر (أحسن إشارة)')),
@@ -1296,6 +1297,7 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
                 if (acl != null) Text('فلتر الـ MAC (واي فاي الراوتر): ${acl!.kindAr}${acl!.black.isEmpty ? '' : ' • في القايمة السودا ${acl!.black.length}'}', style: const TextStyle(fontSize: 12, color: kMuted)),
                 Wrap(spacing: 8, runSpacing: 4, children: [
                   OutlinedButton.icon(onPressed: () => _routerAction('dns'), icon: const Icon(Icons.dns_rounded, size: 18), label: const Text('DNS الراوتر')),
+                  OutlinedButton.icon(onPressed: () => _routerAction('bw'), icon: const Icon(Icons.speed_rounded, size: 18), label: const Text('حد السرعة')),
                   OutlinedButton.icon(onPressed: _openToto, icon: const Icon(Icons.wifi_tethering_rounded, size: 18), label: const Text('DNS/حظر الأكسس')),
                   OutlinedButton.icon(onPressed: () => _routerAction('acl'), icon: const Icon(Icons.bug_report_rounded, size: 18), label: const Text('ابعتلي حالة الحظر')),
                 ]),
@@ -1349,6 +1351,8 @@ class _NetworkPageState extends State<NetworkPage> with AutomaticKeepAliveClient
           if (mounted) toast(context, 'رد الراوتر: ${res['result']}');
         case 'dns':
           await Navigator.push(context, MaterialPageRoute(builder: (_) => RouterDnsPage(router: r)));
+        case 'bw':
+          await Navigator.push(context, MaterialPageRoute(builder: (_) => RouterBandwidthPage(router: r)));
         case 'acl':
           await _aclDump(r);
         case 'signal':
@@ -14480,6 +14484,351 @@ Map<String, dynamic> _jsonMap(String key) {
   }
 }
 
+// ---------------- حد السرعة (Bandwidth Settings) ----------------
+// صفحة الراوتر: Bandwidth Switch + Upload + Download بالـ kbit. أسماء الأمر والحقول مش موثقة في أي مكان،
+// فالتطبيق بيقراها من جافاسكريبت/صفحات الراوتر نفسها (GET بس)، وبيقرا القيمة الحالية الأول، ومش بيبعت أي أمر
+// إلا لو القراية رجّعت أرقام. بعد التطبيق بيقرا تاني ويقارن. «تجريبي».
+class BwFields {
+  final String goform, sw, up, down;
+  const BwFields(this.goform, this.sw, this.up, this.down);
+  Map<String, dynamic> toJson() => {'g': goform, 's': sw, 'u': up, 'd': down};
+  static BwFields? fromJson(Map<String, dynamic> j) {
+    final g = '${j['g'] ?? ''}', s = '${j['s'] ?? ''}', u = '${j['u'] ?? ''}', d = '${j['d'] ?? ''}';
+    if (g.isEmpty || s.isEmpty || u.isEmpty || d.isEmpty) return null;
+    return BwFields(g, s, u, d);
+  }
+
+  String describe() => '$goform{$sw,$up,$down}';
+}
+
+class BwJs {
+  final BwFields fields;
+  final String snippet;
+  BwJs(this.fields, this.snippet);
+}
+
+/// يدوّر في نص جافاسكريبت على أمر صفحة Bandwidth Settings (اسم الأمر فيه band/bw/speed/qos/limit + حقول upload/download/switch جنبه)
+BwJs? parseBwJs(String js) {
+  for (final m in RegExp('goformId["\']?\\s*[:=]\\s*["\']([A-Za-z0-9_]+)["\']').allMatches(js)) {
+    final g = m[1]!, gl = g.toLowerCase();
+    final named = gl.contains('band') || gl.contains('bw') || gl.contains('speed') || gl.contains('qos') || gl.contains('limit');
+    if (!named || gl.contains('lock') || gl.contains('lte') || gl.contains('select') || gl.contains('wifi_band')) continue;
+    final from = (m.start - 1200).clamp(0, js.length), to = (m.end + 1200).clamp(0, js.length);
+    final snip = js.substring(from, to);
+    final keys = <String>{
+      for (final k in RegExp('["\']?([A-Za-z][A-Za-z0-9_]*)["\']?\\s*:').allMatches(snip)) k[1]!,
+    }..removeWhere((k) => const {'goformid', 'istest', 'ad', 'url', 'type', 'data', 'success', 'error', 'cmd'}.contains(k.toLowerCase()));
+    bool isUp(String k) => RegExp(r'upload|uplink|(^|_)(up|ul)(_|$)', caseSensitive: false).hasMatch(k) && !k.toLowerCase().contains('down');
+    bool isDown(String k) => RegExp(r'download|downlink|(^|_)(down|dl)(_|$)', caseSensitive: false).hasMatch(k);
+    final up = keys.where(isUp).firstOrNull, down = keys.where(isDown).firstOrNull;
+    final sws = keys.where((k) => !isUp(k) && !isDown(k) && RegExp(r'switch|enable|status|flag|mode', caseSensitive: false).hasMatch(k)).toList();
+    final sw = sws.where((k) => RegExp(r'band|bw', caseSensitive: false).hasMatch(k)).firstOrNull ?? sws.firstOrNull;
+    if (up == null || down == null || sw == null) continue;
+    return BwJs(BwFields(g, sw, up, down), snip);
+  }
+  return null;
+}
+
+class ZteBwLearn {
+  static BwFields? get saved {
+    try {
+      return BwFields.fromJson(jsonDecode(Store.p.getString('zte_bw_fields') ?? '{}') as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// GET بس — مفيش أي أمر بيتبعت للراوتر
+  static Future<BwJs?> learn(String host) async {
+    final c = http.Client();
+    try {
+      final base = 'http://$host';
+      final seen = <String>{};
+      final queue = <String>['/index.html', '/js/service.js', '/js/main.js', '/js/set.js', '/js/config/config.js'];
+      var fetched = 0;
+      final linkRe = RegExp('(?:src|href)\\s*=\\s*["\']([^"\']+\\.js)["\']|["\']((?:\\./)?js/[A-Za-z0-9_\\-/.]+?)(?:\\.js)?["\']');
+      final pageRe = RegExp('["\']((?:\\./|/)?(?:tmpl|html|template|pages?|views?)/[A-Za-z0-9_\\-/.]*\\.html?)["\']');
+      final bandRe = RegExp('["\']((?:\\./|/)?[A-Za-z0-9_\\-/.]*band[A-Za-z0-9_\\-/.]*\\.(?:js|html?))["\']', caseSensitive: false);
+      final mentions = <String>[];
+      while (queue.isNotEmpty && fetched < 70) {
+        final path = queue.removeAt(0);
+        if (!seen.add(path)) continue;
+        http.Response r;
+        try {
+          r = await c.get(Uri.parse('$base$path'), headers: {'Referer': '$base/index.html'}).timeout(const Duration(seconds: 6));
+        } catch (_) {
+          continue;
+        }
+        fetched++;
+        if (r.statusCode != 200 || r.bodyBytes.length > 3000000) continue;
+        final body = utf8.decode(r.bodyBytes, allowMalformed: true);
+        if (RegExp('bandwidth', caseSensitive: false).hasMatch(body)) mentions.add(path);
+        final hit = parseBwJs(body);
+        if (hit != null) {
+          AppLog.add('BW', 'لقيت أمر الـ Bandwidth في $path: ${hit.fields.describe()}');
+          AppLog.add('BW', 'SNIPPET $path:\n${hit.snippet}');
+          await Store.p.setString('zte_bw_fields', jsonEncode(hit.fields.toJson()));
+          return hit;
+        }
+        for (final s in linkRe.allMatches(body)) {
+          var q = s[1] ?? s[2]!;
+          if (q.startsWith('http')) continue;
+          if (!q.endsWith('.js')) q = '$q.js';
+          q = q.replaceFirst(RegExp(r'^\./'), '');
+          if (!q.startsWith('/')) q = '/$q';
+          if (!seen.contains(q) && !q.contains('..')) queue.add(q);
+        }
+        for (final re in [pageRe, bandRe]) {
+          for (final s in re.allMatches(body)) {
+            var q = s[1]!;
+            if (q.startsWith('http')) continue;
+            q = q.replaceFirst(RegExp(r'^\./'), '');
+            if (!q.startsWith('/')) q = '/$q';
+            if (!seen.contains(q) && !q.contains('..')) queue.insert(0, q);
+          }
+        }
+      }
+      AppLog.add('BW', 'ملقتش أمر الـ Bandwidth في $fetched ملف. ملفات فيها كلمة bandwidth: ${mentions.isEmpty ? 'ولا واحد' : mentions.join(', ')}');
+      return null;
+    } finally {
+      c.close();
+    }
+  }
+}
+
+/// قيمة السويتش زي ما الراوتر قالها: true=شغّال، false=مقفول، null=مش مفهومة
+bool? bwSwitchOn(String v) {
+  final s = v.trim().toLowerCase();
+  if (const {'1', 'on', 'true', 'enable', 'enabled', 'yes'}.contains(s)) return true;
+  if (const {'0', 'off', 'false', 'disable', 'disabled', 'no'}.contains(s)) return false;
+  return null;
+}
+
+/// القيمة اللي نبعتها للسويتش بنفس «لغة» القيمة الحالية (1/0 أو on/off ...). null = مش متأكد → مش هنبعت
+String? bwSwitchValue(String current, bool on) {
+  final s = current.trim().toLowerCase();
+  const pairs = [
+    ['1', '0'], ['on', 'off'], ['true', 'false'], ['enable', 'disable'], ['enabled', 'disabled'], ['yes', 'no'],
+  ];
+  for (final p in pairs) {
+    if (p.contains(s)) return on ? p[0] : p[1];
+  }
+  return null;
+}
+
+/// اختصارات: ميجا → kbit
+const List<(String, int)> kBwPresets = [('0.5', 512), ('1', 1024), ('1.5', 1536), ('2', 2048), ('2.5', 2560)];
+
+class RouterBandwidthPage extends StatefulWidget {
+  final ZteRouter router;
+  const RouterBandwidthPage({super.key, required this.router});
+  @override
+  State<RouterBandwidthPage> createState() => _RouterBandwidthPageState();
+}
+
+class _RouterBandwidthPageState extends State<RouterBandwidthPage> {
+  BwFields? f;
+  bool loading = true, busy = false, on = false, readable = false;
+  String msg = '', curSw = '';
+  String? curUp, curDown;
+  int? last = _spGet(() => Store.p.getInt('bw_last'));
+  final upC = TextEditingController(), downC = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    upC.dispose();
+    downC.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load({bool relearn = false}) async {
+    setState(() {
+      loading = true;
+      msg = '';
+    });
+    f = relearn ? null : ZteBwLearn.saved;
+    if (f == null) {
+      final hit = await ZteBwLearn.learn(widget.router.host);
+      f = hit?.fields;
+    }
+    if (f == null) {
+      msg = 'مقدرتش ألاقي أمر صفحة Bandwidth في صفحات الراوتر. مش هبعت أمر متخمّن. ابعتلي السجل (زرار شارك السجل) وهوصّله بإيدي.';
+    } else {
+      await _read();
+    }
+    if (mounted) setState(() => loading = false);
+  }
+
+  Future<void> _read() async {
+    final x = f!;
+    Map<String, dynamic> raw = {};
+    try {
+      raw = await widget.router.get([x.sw, x.up, x.down]);
+      if ('${raw[x.up] ?? ''}'.isEmpty && '${raw[x.down] ?? ''}'.isEmpty) {
+        for (final k in [x.sw, x.up, x.down]) {
+          raw[k] = await widget.router.getOne(k);
+        }
+      }
+    } catch (e) {
+      msg = 'مقدرتش أقرا الإعداد من الراوتر: $e';
+    }
+    curSw = '${raw[x.sw] ?? ''}';
+    curUp = '${raw[x.up] ?? ''}';
+    curDown = '${raw[x.down] ?? ''}';
+    AppLog.add('BW', 'قراية: ${x.describe()} → sw=$curSw up=$curUp down=$curDown');
+    readable = int.tryParse(curUp!.trim()) != null && int.tryParse(curDown!.trim()) != null && bwSwitchOn(curSw) != null;
+    on = bwSwitchOn(curSw) ?? false;
+    if (int.tryParse(curUp!.trim()) != null) upC.text = curUp!.trim();
+    if (int.tryParse(curDown!.trim()) != null) downC.text = curDown!.trim();
+    if (!readable && msg.isEmpty) {
+      msg = 'الراوتر مرجّعش قيم مفهومة للأسماء اللي لقيتها (${x.describe()}) — فمش هبعت أمر تغيير. ابعتلي السجل.';
+    }
+  }
+
+  void _preset(int v) {
+    setState(() {
+      on = true;
+      upC.text = '$v';
+      downC.text = '$v';
+    });
+  }
+
+  Future<void> _apply() async {
+    final x = f;
+    if (x == null || !readable) return;
+    final u = int.tryParse(upC.text.trim()), d = int.tryParse(downC.text.trim());
+    if (on && (u == null || d == null || u < 64 || d < 64 || u > 100000 || d > 100000)) {
+      toast(context, 'اكتب رقم صحيح من 64 لـ 100000 كيلوبت في الخانتين');
+      return;
+    }
+    final swVal = bwSwitchValue(curSw, on);
+    if (swVal == null) {
+      toast(context, 'مش متأكد من قيمة السويتش ($curSw) — مش هبعت');
+      return;
+    }
+    if (on && (u! < 512 || d! < 512) && !await confirm(context, 'الرقم أقل من 512 كيلوبت، النت هيبقى بطيء جدًا لكل الأجهزة. متأكد؟')) return;
+    if (!mounted) return;
+    final what = on ? 'تفعيل حد السرعة: رفع $u / تحميل $d كيلوبت' : 'إيقاف حد السرعة';
+    if (!await confirm(context, '$what\n\nده بيأثر على كل الأجهزة. الأمر «تجريبي»: هقرا القيمة من الراوتر بعد التطبيق وأقولك لو مطابقة.')) return;
+    setState(() => busy = true);
+    try {
+      final fields = <String, String>{
+        x.sw: swVal,
+        x.up: '${on ? u : (int.tryParse(curUp!.trim()) ?? 1565)}',
+        x.down: '${on ? d : (int.tryParse(curDown!.trim()) ?? 1565)}',
+      };
+      final res = await widget.router.set(x.goform, fields);
+      AppLog.add('BW', 'رد التغيير: ${jsonEncode(res)}');
+      await Future.delayed(const Duration(seconds: 2));
+      await _read();
+      final ok = bwSwitchOn(curSw) == on && (!on || (int.tryParse(curUp!.trim()) == u && int.tryParse(curDown!.trim()) == d));
+      if (ok && on) {
+        await Store.p.setInt('bw_last', d!);
+        last = d;
+      }
+      msg = ok
+          ? (on ? 'اتطبق ✓ — الراوتر قال رفع $curUp / تحميل $curDown كيلوبت' : 'اتقفل حد السرعة ✓')
+          : 'الراوتر رد بـ «${res['result'] ?? '?'}» بس القراية مش مطابقة (رفع $curUp / تحميل $curDown، السويتش $curSw) — يمكن الأمر مش مظبوط. ابعتلي السجل.';
+    } catch (e) {
+      msg = 'خطأ: $e';
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final curLine = !readable
+        ? 'الراوتر: مش مقروء'
+        : 'الراوتر دلوقتي: ${bwSwitchOn(curSw) == true ? 'شغّال' : 'مقفول'} • رفع ${curUp!.trim()} / تحميل ${curDown!.trim()} kbit';
+    return Scaffold(
+      appBar: AppBar(title: const Text('حد سرعة الراوتر (تجريبي)'), actions: [
+        IconButton(icon: const Icon(Icons.refresh_rounded), onPressed: loading || busy ? null : () => _load(relearn: f == null)),
+      ]),
+      body: loading
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(padding: const EdgeInsets.all(12), children: [
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const SectionTitle('حد سرعة الراوتر (Bandwidth)', icon: Icons.speed_rounded),
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(color: kSurface2, borderRadius: BorderRadius.circular(12)),
+                      child: Row(children: [
+                        const Icon(Icons.router_rounded, color: kGold, size: 20),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(curLine, style: const TextStyle(fontSize: 12.5))),
+                      ]),
+                    ),
+                    if (msg.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(msg, style: const TextStyle(color: kGold, fontSize: 12.5))),
+                    if (busy) const Padding(padding: EdgeInsets.only(top: 8), child: LinearProgressIndicator()),
+                    if (f != null && readable) ...[
+                      SwitchListTile(contentPadding: EdgeInsets.zero, value: on, onChanged: busy ? null : (v) => setState(() => on = v), title: const Text('تفعيل حد السرعة')),
+                      Directionality(
+                        textDirection: TextDirection.ltr,
+                        child: Row(children: [
+                          Expanded(
+                            child: TextField(
+                              enabled: on && !busy,
+                              controller: upC,
+                              keyboardType: TextInputType.number,
+                              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                              decoration: const InputDecoration(labelText: 'Upload', suffixText: 'kbit', border: OutlineInputBorder(), isDense: true),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: TextField(
+                              enabled: on && !busy,
+                              controller: downC,
+                              keyboardType: TextInputType.number,
+                              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                              decoration: const InputDecoration(labelText: 'Download', suffixText: 'kbit', border: OutlineInputBorder(), isDense: true),
+                            ),
+                          ),
+                        ]),
+                      ),
+                      const SizedBox(height: 10),
+                      Text('اختصارات: ميجا • كيلوبت (بتكتب الرقم في الخانتين وتقدر تعدّله)${last == null ? '' : '. آخر رقم اتطبّق: $last'}', style: const TextStyle(color: kMuted, fontSize: 12)),
+                      const SizedBox(height: 6),
+                      Wrap(spacing: 8, runSpacing: 6, children: [
+                        for (final p in kBwPresets)
+                          ActionChip(
+                            label: Directionality(textDirection: TextDirection.ltr, child: Text('${p.$1} • ${p.$2}')),
+                            onPressed: busy ? null : () => _preset(p.$2),
+                          ),
+                        if (last != null)
+                          ActionChip(
+                            avatar: const Icon(Icons.history_rounded, size: 16),
+                            label: Text('$last'),
+                            onPressed: busy ? null : () => _preset(last!),
+                          ),
+                      ]),
+                      const SizedBox(height: 12),
+                      FilledButton.icon(onPressed: busy ? null : _apply, icon: const Icon(Icons.check_rounded), label: const Text('تطبيق')),
+                    ],
+                    if (f == null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: OutlinedButton.icon(onPressed: () => _load(relearn: true), icon: const Icon(Icons.search_rounded), label: const Text('دوّر تاني في صفحات الراوتر')),
+                      ),
+                    const SizedBox(height: 8),
+                    const Text('تجريبي • بيقرا القيمة من الراوتر الأول وبيتأكد منها بعد التطبيق • الرقم اللي بتطبقه بيتحفظ • الوحدة kbit (1024 = حوالي 1 ميجابت/ث)', style: TextStyle(color: kMuted, fontSize: 11)),
+                  ]),
+                ),
+              ),
+            ]),
+    );
+  }
+}
+
 // ---------------- DNS الراوتر ----------------
 // الدليل: مكتبة zte-cpe-rs (اتجربت على ZTE MF289F) وسكريبت Miononno المشهور لراوترات ZTE:
 //   goformId=ROUTER_DNS_SETTING  dns_mode=manual|auto  prefer_dns_manual  standby_dns_manual  (+AD)
@@ -18018,6 +18367,12 @@ class _TotoPageState extends State<TotoPage> {
                 onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => RouterDnsPage(router: widget.router!))),
                 icon: const Icon(Icons.dns_outlined),
                 label: const Text('DNS الراوتر (لكل البيت)'),
+              ),
+            if (widget.router != null)
+              OutlinedButton.icon(
+                onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => RouterBandwidthPage(router: widget.router!))),
+                icon: const Icon(Icons.speed_rounded),
+                label: const Text('حد السرعة (تجريبي)'),
               ),
           ]),
           const Padding(
