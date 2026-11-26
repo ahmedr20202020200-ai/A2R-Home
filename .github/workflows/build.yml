@@ -1243,6 +1243,163 @@ jobs:
               print(f); print(s[-200:])
           PY2
 
+      # v7: توقيع ثابت — كل نسخة بنفس التوقيع، فالتحديث بيتثبت فوق القديم ومن غير «تطبيق جديد مجهول» كل مرة.
+      # المفتاح بيتعمل من «جملة سر» واحدة في Secrets باسم A2R_SIGN_SECRET (مفيش ملف مفتاح في الريبو خالص).
+      - name: Signing key (ثابت من A2R_SIGN_SECRET)
+        env:
+          A2R_SIGN_SECRET: ${{ secrets.A2R_SIGN_SECRET }}
+        run: |
+          if [ ${#A2R_SIGN_SECRET} -lt 12 ]; then
+            echo "::warning title=التوقيع::مفيش Secret اسمه A2R_SIGN_SECRET (أو أقصر من 12 حرف) — النسخة دي متوقعة بمفتاح مؤقت وهتتطلب مسح التطبيق القديم"
+            echo "### ⚠️ التوقيع: مفتاح مؤقت (ضيف Secret اسمه A2R_SIGN_SECRET علشان التوقيع يثبت)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          KS_DIR="$RUNNER_TEMP/a2rks"
+          mkdir -p "$KS_DIR"
+          chmod 700 "$KS_DIR"
+          cat > "$KS_DIR/a2r_sign.py" <<'PYSIGN'
+          #!/usr/bin/env python3
+          # A2R Home: deterministic signing key from ONE secret phrase (GitHub secret A2R_SIGN_SECRET).
+          # Same phrase -> same RSA key + same certificate on every build -> APK signature never changes.
+          # Pure Python (no pip). Writes key.pem + cert.pem; the workflow packs them into a .p12 with openssl.
+          import hashlib, hmac, sys, os
+
+          def drbg(seed):
+              c = 0
+              while True:
+                  yield hashlib.sha256(seed + c.to_bytes(8, 'big')).digest()
+                  c += 1
+
+          class Rnd:
+              def __init__(self, seed):
+                  self.g = drbg(seed); self.buf = b''
+              def bytes(self, n):
+                  while len(self.buf) < n:
+                      self.buf += next(self.g)
+                  out, self.buf = self.buf[:n], self.buf[n:]
+                  return out
+              def int_below(self, n):
+                  k = (n.bit_length() + 7) // 8 + 8
+                  return int.from_bytes(self.bytes(k), 'big') % n
+
+          SMALL = [p for p in range(3, 2000, 2) if all(p % d for d in range(3, int(p ** 0.5) + 1, 2))]
+
+          def is_probable_prime(n, r):
+              if n < 2: return False
+              for p in SMALL:
+                  if n % p == 0: return n == p
+              d, s = n - 1, 0
+              while d % 2 == 0: d //= 2; s += 1
+              for _ in range(48):
+                  a = 2 + r.int_below(n - 3)
+                  x = pow(a, d, n)
+                  if x in (1, n - 1): continue
+                  for _ in range(s - 1):
+                      x = pow(x, 2, n)
+                      if x == n - 1: break
+                  else:
+                      return False
+              return True
+
+          def gen_prime(r, bits, e):
+              while True:
+                  c = int.from_bytes(r.bytes(bits // 8), 'big') | (3 << (bits - 2)) | 1
+                  if (c - 1) % e == 0: continue
+                  if is_probable_prime(c, r): return c
+
+          def der_len(n):
+              if n < 0x80: return bytes([n])
+              b = n.to_bytes((n.bit_length() + 7) // 8, 'big'); return bytes([0x80 | len(b)]) + b
+          def tlv(tag, body): return bytes([tag]) + der_len(len(body)) + body
+          def dint(v):
+              b = v.to_bytes(max(1, (v.bit_length() + 8) // 8), 'big'); return tlv(0x02, b)
+          def seq(*xs): return tlv(0x30, b''.join(xs))
+          def oid(s):
+              p = [int(x) for x in s.split('.')]; out = bytes([40 * p[0] + p[1]])
+              for v in p[2:]:
+                  enc = [v & 0x7f]; v >>= 7
+                  while v: enc.append(0x80 | (v & 0x7f)); v >>= 7
+                  out += bytes(reversed(enc))
+              return tlv(0x06, out)
+          def utf8(s): return tlv(0x0c, s.encode())
+          def gtime(s): return tlv(0x18, s.encode())
+          def pem(label, der):
+              import base64
+              b = base64.b64encode(der).decode()
+              return f'-----BEGIN {label}-----\n' + '\n'.join(b[i:i + 64] for i in range(0, len(b), 64)) + f'\n-----END {label}-----\n'
+
+          def build(secret):
+              seed = hmac.new(secret.encode(), b'a2r-home-apk-signing-v1', hashlib.sha256).digest()
+              r = Rnd(seed); e = 65537
+              while True:
+                  p = gen_prime(r, 1024, e); q = gen_prime(r, 1024, e)
+                  if p == q: continue
+                  if p < q: p, q = q, p
+                  n = p * q
+                  if n.bit_length() == 2048: break
+              d = pow(e, -1, (p - 1) * (q - 1))
+              key = seq(dint(0), dint(n), dint(e), dint(d), dint(p), dint(q), dint(d % (p - 1)), dint(d % (q - 1)), dint(pow(q, -1, p)))
+              sha256rsa = seq(oid('1.2.840.113549.1.1.11'), tlv(0x05, b''))
+              name = seq(tlv(0x31, seq(oid('2.5.4.3'), utf8('A2R Home'))), tlv(0x31, seq(oid('2.5.4.10'), utf8('A2R'))))
+              spki = seq(seq(oid('1.2.840.113549.1.1.1'), tlv(0x05, b'')), tlv(0x03, b'\x00' + seq(dint(n), dint(e))))
+              tbs = seq(tlv(0xa0, dint(2)), dint(1), sha256rsa, name,
+                        seq(gtime('20260101000000Z'), gtime('20760101000000Z')), name, spki)
+              h = hashlib.sha256(tbs).digest()
+              di = seq(seq(oid('2.16.840.1.101.3.4.2.1'), tlv(0x05, b'')), tlv(0x04, h))
+              k = 256
+              em = b'\x00\x01' + b'\xff' * (k - len(di) - 3) + b'\x00' + di
+              sig = pow(int.from_bytes(em, 'big'), d, n).to_bytes(k, 'big')
+              cert = seq(tbs, sha256rsa, tlv(0x03, b'\x00' + sig))
+              return pem('RSA PRIVATE KEY', key), pem('CERTIFICATE', cert), hashlib.sha256(cert).hexdigest()
+
+          if __name__ == '__main__':
+              secret = os.environ.get('A2R_SIGN_SECRET', '')
+              if len(secret) < 12:
+                  print('secret too short'); sys.exit(2)
+              out = sys.argv[1] if len(sys.argv) > 1 else '.'
+              k, c, fp = build(secret)
+              open(os.path.join(out, 'key.pem'), 'w').write(k)
+              open(os.path.join(out, 'cert.pem'), 'w').write(c)
+              print('cert sha256:', fp)
+          PYSIGN
+          python3 "$KS_DIR/a2r_sign.py" "$KS_DIR"
+          PW=$(printf '%s' "$A2R_SIGN_SECRET:a2r-home-store" | sha256sum | cut -c1-32)
+          echo "::add-mask::$PW"
+          openssl pkcs12 -export -inkey "$KS_DIR/key.pem" -in "$KS_DIR/cert.pem" -name a2r -passout "pass:$PW" \
+            -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 -out "$KS_DIR/a2r.p12"
+          rm -f "$KS_DIR/key.pem" "$KS_DIR/a2r_sign.py"
+          FP=$(openssl x509 -in "$KS_DIR/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+          echo "A2R_KS=$KS_DIR/a2r.p12" >> "$GITHUB_ENV"
+          echo "A2R_KS_PW=$PW" >> "$GITHUB_ENV"
+          echo "A2R_CERT_FP=$FP" >> "$GITHUB_ENV"
+          python3 - <<'PYGR'
+          import glob, re
+          f = glob.glob('android/app/build.gradle.kts')
+          assert f, 'build.gradle.kts not found'
+          f = f[0]
+          s = open(f, encoding='utf-8').read()
+          cfg = (
+              '    signingConfigs {\n'
+              '        create("a2r") {\n'
+              '            storeFile = file(System.getenv("A2R_KS"))\n'
+              '            storeType = "pkcs12"\n'
+              '            storePassword = System.getenv("A2R_KS_PW")\n'
+              '            keyAlias = "a2r"\n'
+              '            keyPassword = System.getenv("A2R_KS_PW")\n'
+              '            enableV1Signing = true\n'
+              '            enableV2Signing = true\n'
+              '        }\n'
+              '    }\n\n')
+          assert s.count('    buildTypes {') == 1, 'buildTypes block not found'
+          s = s.replace('    buildTypes {', cfg + '    buildTypes {', 1)
+          s, n = re.subn(r'signingConfig\s*=\s*signingConfigs\.getByName\("debug"\)', 'signingConfig = signingConfigs.getByName("a2r")', s)
+          assert n == 1, 'release signingConfig line not found'
+          open(f, 'w', encoding='utf-8').write(s)
+          print(s)
+          PYGR
+          echo "### 🔏 التوقيع ثابت — بصمة الشهادة: \`$FP\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "(لازم البصمة دي تفضل هي هي في كل نسخة)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Install dependencies
         run: |
           rm -f analysis_options.yaml
@@ -1263,6 +1420,18 @@ jobs:
             exit 1
           fi
           cp build/app/outputs/flutter-apk/app-release.apk A2R-Home.apk
+          # v7: اتأكد من توقيع الـ APK الفعلي
+          AS=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)apksigner
+          if [ -x "$AS" ]; then
+            GOT=$("$AS" verify --print-certs A2R-Home.apk | grep -m1 'SHA-256 digest' | awk '{print $NF}')
+            echo "APK cert SHA-256: $GOT"
+            WANT=$(echo "${A2R_CERT_FP:-}" | tr -d ':' | tr 'A-F' 'a-f')
+            if [ -n "$WANT" ] && [ "$GOT" != "$WANT" ]; then
+              echo "::error title=التوقيع::الـ APK متوقع بمفتاح غير المتوقع ($GOT)"
+              exit 1
+            fi
+            echo "- توقيع الـ APK: \`$GOT\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload APK (Artifacts)
         uses: actions/upload-artifact@v4
