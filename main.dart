@@ -3304,6 +3304,8 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   bool ftaOnly = false;
   int view = 0; // 0 ريموت، 1 قنوات، 2 ضبط الطبق
   bool touchpad = Store.p.getBool('stb_touchpad') ?? false;
+  String voiceLang = Store.p.getString('stb_voice_lang') ?? 'en-US'; // v7: القنوات أسماؤها إنجليزي → الإنجليزي هو الأساسي
+  Timer? _playTimer;
 
   @override
   bool get wantKeepAlive => true;
@@ -3409,7 +3411,11 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
       toast(context, 'اتصل بالريسيفر الأول');
       return;
     }
-    final heard = await Native4.voice(prompt: 'قول: افتح MBC • قناة 105 • علّي الصوت • اقفل');
+    final en = voiceLang == 'en-US';
+    final heard = await Native4.voice(
+      lang: voiceLang,
+      prompt: en ? 'Say: open MBC Masr • channel 105 • volume up • mute • previous channel' : 'قول: افتح MBC • قناة 105 • علّي الصوت • اقفل • القناة السابقة',
+    );
     if (heard.isEmpty) return;
     if (channels.isEmpty) await loadChannels();
     final c = parseVoiceCommand(heard, channels);
@@ -3418,6 +3424,27 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
     switch (c.kind) {
       case VoiceKind.none:
         toast(context, 'مفهمتش «${c.heard}» — جرّب تاني');
+      case VoiceKind.recall:
+        await _jumpLast();
+      case VoiceKind.choose:
+        await showModalBottomSheet<void>(
+          context: context,
+          backgroundColor: kSurface,
+          showDragHandle: true,
+          builder: (sc) => ListView(shrinkWrap: true, padding: const EdgeInsets.only(bottom: 20), children: [
+            SectionTitle('سمعت «${c.heard}» — اختار القناة', icon: Icons.mic_rounded),
+            for (final ch in c.alts)
+              ListTile(
+                leading: const Icon(Icons.tv_rounded, color: kGold),
+                title: Directionality(textDirection: TextDirection.ltr, child: Align(alignment: Alignment.centerLeft, child: Text(ch.name))),
+                trailing: Text('${ch.index + 1}', style: const TextStyle(color: kMuted)),
+                onTap: () {
+                  Navigator.pop(sc);
+                  _zapTo(ch);
+                },
+              ),
+          ]),
+        );
       case VoiceKind.keys:
         if (c.keys.first == K.power && !await confirm(context, 'أقفل/أفتح الريسيفر؟')) return;
         for (final k in c.keys) {
@@ -3517,34 +3544,63 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
   Future<void> key(int k) async {
     try {
       if (gm == null) throw StateError('مش متصل بالريسيفر');
-      if (k == K.recall) return await _recall();
       await gm!.key(k);
+      if ((k >= 12 && k <= 21) || k == K.ok || k == K.chUp || k == K.chDown || k == K.recall || k == K.fav || k == K.tvRadio) _scheduleRefresh();
     } catch (e) {
       if (mounted) toast(context, '$e');
     }
   }
 
-  /// Recall: بنبعت زرار الريسيفر نفسه (29 زي G-MScreen)، ولو القناة متغيرتش في ثانية ونص
-  /// بنرجع إحنا للقناة اللي قبلها من سجل التطبيق (أمر تغيير القناة 1000 اللي شغال عندك)
-  Future<void> _recall() async {
-    final before = await gm!.playingId() ?? playingId;
-    await gm!.key(K.recall);
-    await Future.delayed(const Duration(milliseconds: 1500));
-    final after = await gm?.playingId();
-    if (after != null && after != before) {
-      AppLog.add('STB', 'RECALL: الريسيفر غيّر القناة لوحده ($before → $after)');
-      await _refreshPlaying();
-      return;
-    }
-    final prev = recallTarget(StbPrefs.recent, before);
+  /// آخر القنوات (v7): الريسيفر عنده قايمة «آخر القنوات» على الشاشة، فزرار RECALL بيبعت 29 وبس.
+  /// وده «ارجع لآخر قناة» من سجل التطبيق (للأمر الصوتي «القناة السابقة»)
+  Future<void> _jumpLast() async {
+    final cur = await gm?.playingId() ?? playingId;
+    final prev = recallTarget(StbPrefs.recent, cur);
     if (prev == null) {
-      AppLog.add('STB', 'RECALL: القناة متغيرتش ومفيش قناة قبلها في سجل التطبيق');
-      if (mounted) toast(context, 'مفيش قناة قبلها لسه — غيّر قناة الأول من التطبيق أو الريموت');
+      AppLog.add('STB', 'آخر قناة: مفيش قناة قبلها في سجل التطبيق');
+      if (mounted) toast(context, 'مفيش قناة قبلها لسه — غيّر قناة الأول');
       return;
     }
-    AppLog.add('STB', 'RECALL: الريسيفر مرجّعش — هرجع للقناة اللي قبلها من سجل التطبيق (${prev.radio ? 1 : 0}:${prev.id} ${prev.name})');
-    final ch = channels.where((c) => c.id == prev.id && c.radio == prev.radio).firstOrNull ?? StbChannel(prev.id, prev.name, prev.radio, 0, const {});
-    await _zapTo(ch);
+    AppLog.add('STB', 'آخر قناة: ${prev.radio ? 1 : 0}:${prev.id} ${prev.name}');
+    await _zapTo(_chOf(prev));
+  }
+
+  StbChannel _chOf(({String id, String name, bool radio}) r) =>
+      channels.where((c) => c.id == r.id && c.radio == r.radio).firstOrNull ?? StbChannel(r.id, r.name, r.radio, 0, const {});
+
+  /// قايمة آخر القنوات جوه التطبيق (ضغطة مطولة على RECALL)
+  void _recentSheet() {
+    final cur = playingId;
+    final list = StbPrefs.recent;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: kSurface,
+      showDragHandle: true,
+      builder: (c) => ListView(shrinkWrap: true, padding: const EdgeInsets.only(bottom: 20), children: [
+        const SectionTitle('آخر القنوات', icon: Icons.history_rounded),
+        if (list.isEmpty)
+          const Padding(padding: EdgeInsets.all(20), child: Text('لسه مفيش قنوات في السجل — القنوات اللي بتفتحها هتظهر هنا', textAlign: TextAlign.center, style: TextStyle(color: kMuted))),
+        for (final r in list)
+          ListTile(
+            dense: true,
+            leading: Icon(r.radio ? Icons.radio_rounded : Icons.tv_rounded, color: r.id == cur ? kGold : kMuted),
+            title: Directionality(textDirection: TextDirection.ltr, child: Align(alignment: Alignment.centerLeft, child: Text(r.name))),
+            trailing: r.id == cur ? const Text('شغالة', style: TextStyle(color: kGold, fontSize: 12)) : null,
+            onTap: () {
+              Navigator.pop(c);
+              _zapTo(_chOf(r));
+            },
+          ),
+      ]),
+    );
+  }
+
+  /// بعد زراير تغيير القناة: نقرا القناة الشغالة ونسجلها في «آخر القنوات» (حتى لو اتغيرت بالريموت الحقيقي)
+  void _scheduleRefresh() {
+    _playTimer?.cancel();
+    _playTimer = Timer(const Duration(milliseconds: 2200), () {
+      if (mounted && connected) _refreshPlaying();
+    });
   }
 
   Future<void> manual() async {
@@ -3648,7 +3704,7 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
                       ),
                   ])
                 : view == 0
-                    ? (touchpad ? _touchpad() : RemoteControl(onKey: key))
+                    ? (touchpad ? _touchpad() : RemoteControl(onKey: key, onRecallLong: _recentSheet))
                     : view == 1
                         ? _channels()
                         : DishPage(gm: gm!, channels: channels, playingId: playingId, onZapped: (id) => setState(() => playingId = id)),
@@ -3680,7 +3736,17 @@ class _ReceiverPageState extends State<ReceiverPage> with AutomaticKeepAliveClie
             ]),
           ),
           if (busy) const Padding(padding: EdgeInsets.all(8), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
-          if (on) IconButton(tooltip: 'أمر صوتي', icon: const Icon(Icons.mic_rounded, color: kGold), onPressed: voice),
+          if (on)
+            TextButton(
+              onPressed: () {
+                setState(() => voiceLang = voiceLang == 'en-US' ? 'ar-EG' : 'en-US');
+                Store.p.setString('stb_voice_lang', voiceLang);
+                toast(context, voiceLang == 'en-US' ? 'الصوت: إنجليزي (للقنوات)' : 'الصوت: عربي (للأوامر)');
+              },
+              style: TextButton.styleFrom(minimumSize: const Size(36, 36), padding: EdgeInsets.zero),
+              child: Text(voiceLang == 'en-US' ? 'EN' : 'ع', style: const TextStyle(color: kGold, fontWeight: FontWeight.w800)),
+            ),
+          if (on) IconButton(tooltip: 'أمر صوتي (تجريبي)', icon: const Icon(Icons.mic_rounded, color: kGold), onPressed: voice),
           if (on && view == 0)
             IconButton(
               tooltip: touchpad ? 'زراير' : 'تاتش باد',
@@ -4204,7 +4270,10 @@ class RemoteKey extends StatefulWidget {
   final double? width;
   final bool repeat;
   final bool circle;
-  const RemoteKey({super.key, this.label, this.icon, required this.onTap, this.color, this.fg, this.size = 54, this.width, this.repeat = false, this.circle = true});
+  final VoidCallback? onLong; // v7: ضغطة مطولة (لو موجودة، الضغطة العادية بتشتغل عند رفع الصباع)
+  final String? sub; // سطر صغير تحت الاسم (مثلاً «آخر القنوات»)
+  final double? fs;
+  const RemoteKey({super.key, this.label, this.icon, required this.onTap, this.color, this.fg, this.size = 54, this.width, this.repeat = false, this.circle = true, this.onLong, this.sub, this.fs});
   @override
   State<RemoteKey> createState() => _RemoteKeyState();
 }
@@ -4247,9 +4316,18 @@ class _RemoteKeyState extends State<RemoteKey> {
     return Padding(
       padding: const EdgeInsets.all(4),
       child: GestureDetector(
-        onTapDown: (_) => _start(),
-        onTapUp: (_) => _end(),
+        onTapDown: (_) => widget.onLong == null ? _start() : setState(() => down = true),
+        onTapUp: (_) {
+          if (widget.onLong != null) _fire();
+          _end();
+        },
         onTapCancel: _end,
+        onLongPress: widget.onLong == null
+            ? null
+            : () {
+                HapticFeedback.mediumImpact();
+                widget.onLong!();
+              },
         child: AnimatedScale(
           scale: down ? 0.90 : 1,
           duration: const Duration(milliseconds: 80),
@@ -4266,7 +4344,10 @@ class _RemoteKeyState extends State<RemoteKey> {
             ),
             child: widget.icon != null
                 ? Icon(widget.icon, color: widget.fg ?? Colors.white, size: widget.size * 0.44)
-                : Text(widget.label ?? '', style: TextStyle(color: widget.fg ?? Colors.white, fontWeight: FontWeight.w700, fontSize: widget.size * 0.26)),
+                : Column(mainAxisSize: MainAxisSize.min, mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Text(widget.label ?? '', style: TextStyle(color: widget.fg ?? Colors.white, fontWeight: FontWeight.w700, fontSize: widget.fs ?? widget.size * 0.26)),
+                    if (widget.sub != null) Text(widget.sub!, style: const TextStyle(color: Colors.white60, fontSize: 8, height: 1)),
+                  ]),
           ),
         ),
       ),
@@ -4341,111 +4422,139 @@ class Rocker extends StatelessWidget {
       );
 }
 
-class RemoteControl extends StatelessWidget {
+/// ريموت الريسيفر (v7): على شكل ريموت Smart QMAX H2M4 الحقيقي، غامق وصغير ويتصغّر لوحده علشان يكفي الشاشة من غير تمرير.
+class RemoteControl extends StatefulWidget {
   final void Function(int key) onKey;
-  const RemoteControl({super.key, required this.onKey});
+  final VoidCallback? onRecallLong;
+  const RemoteControl({super.key, required this.onKey, this.onRecallLong});
+  @override
+  State<RemoteControl> createState() => _RemoteControlState();
+}
 
-  Widget _k(String t, int k, {IconData? icon, Color? color, Color? fg, double size = 50, double? width}) =>
-      RemoteKey(label: t, icon: icon, onTap: () => onKey(k), color: color, fg: fg, size: size, width: width);
+class _RemoteControlState extends State<RemoteControl> {
+  bool more = false;
+
+  void Function(int) get onKey => widget.onKey;
+
+  Widget _k(String t, int k, {IconData? icon, Color? color, Color? fg, double h = 32, double w = 64, double? fs, VoidCallback? onLong, String? sub, bool repeat = false}) =>
+      RemoteKey(label: t, icon: icon, onTap: () => onKey(k), onLong: onLong, color: color, fg: fg, size: h, width: w, fs: fs, sub: sub, repeat: repeat);
 
   Widget _row(List<Widget> c, {MainAxisAlignment a = MainAxisAlignment.spaceEvenly}) => Row(mainAxisAlignment: a, children: c);
 
-  Widget _color(Color c, int k) => RemoteKey(onTap: () => onKey(k), color: c, size: 30, width: 58);
+  /// زرار طويل مقسوم نصين (SUBTITLE/TXT و PAGE)
+  Widget _tall(Widget top, Widget bottom) => Container(
+        decoration: BoxDecoration(color: kSurface2, borderRadius: BorderRadius.circular(22), border: Border.all(color: Colors.white.withValues(alpha: 0.07))),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [top, bottom]),
+      );
 
   @override
   Widget build(BuildContext context) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
-      child: Center(
-        child: Container(
-          constraints: const BoxConstraints(maxWidth: 380),
-          padding: const EdgeInsets.fromLTRB(14, 16, 14, 18),
-          decoration: BoxDecoration(
-            gradient: const LinearGradient(colors: [Color(0xFF1C2028), Color(0xFF121419)], begin: Alignment.topCenter, end: Alignment.bottomCenter),
-            borderRadius: BorderRadius.circular(40),
-            border: Border.all(color: kLine),
-            boxShadow: const [BoxShadow(color: Color(0x99000000), blurRadius: 24, offset: Offset(0, 10))],
-          ),
-          child: Directionality(
-            textDirection: TextDirection.ltr,
-            child: Column(children: [
-              _row([
-                _k('', K.power, icon: Icons.power_settings_new_rounded, color: const Color(0xFF8E2B2B)),
-                _k('TV/R', K.tvRadio, size: 46),
-                _k('', K.mute, icon: Icons.volume_off_rounded),
-              ], a: MainAxisAlignment.spaceBetween),
-              const SizedBox(height: 8),
-              _row([
-                _k('', K.menu, icon: Icons.menu_rounded),
-                _k('EPG', K.epg),
-                _k('', K.info, icon: Icons.info_outline_rounded),
-              ]),
-              const SizedBox(height: 6),
-              DPad(onKey: onKey),
-              const SizedBox(height: 6),
-              _row([
-                _k('', K.exit, icon: Icons.arrow_back_rounded),
-                _k('', K.fav, icon: Icons.star_rounded, fg: kGold),
-                _k('', K.recall, icon: Icons.history_rounded),
-              ]),
-              const SizedBox(height: 10),
-              _row([
-                Rocker(label: 'VOL', up: Icons.add_rounded, down: Icons.remove_rounded, onUp: () => onKey(K.volUp), onDown: () => onKey(K.volDown)),
-                Column(children: [
-                  _k('', K.audio, icon: Icons.graphic_eq_rounded, size: 46),
-                  _k('', K.subtitle, icon: Icons.subtitles_outlined, size: 46),
-                  _k('', K.sat, icon: Icons.satellite_alt_rounded, size: 46),
+    const dark = Colors.transparent;
+    return LayoutBuilder(
+      builder: (context, box) => SizedBox(
+        width: box.maxWidth,
+        height: box.maxHeight,
+        child: FittedBox(
+          fit: BoxFit.contain,
+          child: Container(
+            width: 320,
+            padding: const EdgeInsets.fromLTRB(12, 14, 12, 12),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(colors: [Color(0xFF1C2028), Color(0xFF121419)], begin: Alignment.topCenter, end: Alignment.bottomCenter),
+              borderRadius: BorderRadius.circular(34),
+              border: Border.all(color: kLine),
+              boxShadow: const [BoxShadow(color: Color(0x99000000), blurRadius: 20, offset: Offset(0, 8))],
+            ),
+            child: Directionality(
+              textDirection: TextDirection.ltr,
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                _row([
+                  _k('', K.power, icon: Icons.power_settings_new_rounded, color: const Color(0xFF8E2B2B), w: 56),
+                  _k('', K.mute, icon: Icons.volume_off_rounded, w: 56),
+                ], a: MainAxisAlignment.spaceBetween),
+                _row([
+                  // تشغيل/إيقاف مؤقت: ضغطة = Pause، مطولة = Play (تجريبي)
+                  RemoteKey(icon: Icons.play_arrow_rounded, onTap: () => onKey(K.pause), onLong: () => onKey(K.play), size: 30, width: 60),
+                  // USB: ضغطة = USB، مطولة = Stop (تجريبي)
+                  RemoteKey(label: 'USB/■', onTap: () => onKey(K.usb), onLong: () => onKey(K.stop), size: 30, width: 60, fs: 9),
+                  _k('', K.record, icon: Icons.fiber_manual_record_rounded, fg: kBad, h: 30, w: 60),
+                  _k('INFO', K.info, h: 30, w: 60, fs: 9),
                 ]),
-                Rocker(label: 'CH', up: Icons.keyboard_arrow_up_rounded, down: Icons.keyboard_arrow_down_rounded, onUp: () => onKey(K.chUp), onDown: () => onKey(K.chDown)),
+                _row([
+                  _k('', K.prev, icon: Icons.skip_previous_rounded, color: const Color(0xFFD64545), fg: Colors.white, h: 30, w: 60),
+                  _k('', K.next, icon: Icons.skip_next_rounded, color: const Color(0xFF3FAE5A), fg: Colors.white, h: 30, w: 60),
+                  _k('', K.rew, icon: Icons.fast_rewind_rounded, color: const Color(0xFFE2B33C), fg: Colors.white, h: 30, w: 60),
+                  _k('', K.ff, icon: Icons.fast_forward_rounded, color: const Color(0xFF3F7FD6), fg: Colors.white, h: 30, w: 60),
+                ]),
+                _row([
+                  _k('FAV', K.fav, fg: kGold, h: 28, w: 52, fs: 9),
+                  _k('SAT', K.sat, h: 28, w: 52, fs: 9),
+                ], a: MainAxisAlignment.spaceBetween),
+                DPad(onKey: onKey, size: 156),
+                _row([
+                  _k('MENU', K.menu, h: 28, w: 52, fs: 8),
+                  _k('EXIT', K.exit, h: 28, w: 52, fs: 8),
+                ], a: MainAxisAlignment.spaceBetween),
+                _row([
+                  _tall(
+                    RemoteKey(label: 'SUBTITLE', onTap: () => onKey(K.subtitle), color: dark, size: 30, width: 56, fs: 7),
+                    RemoteKey(label: 'TXT', onTap: () => onKey(K.teletext), color: dark, size: 30, width: 56, fs: 9),
+                  ),
+                  Column(mainAxisSize: MainAxisSize.min, children: [
+                    // RECALL: ضغطة = قايمة «آخر القنوات» على شاشة الريسيفر، مطولة = القايمة جوه التطبيق (تجريبي)
+                    RemoteKey(label: 'RECALL', onTap: () => onKey(K.recall), onLong: widget.onRecallLong, size: 38, width: 74, fs: 9),
+                    _k('AUDIO', K.audio, h: 30, w: 74, fs: 9),
+                  ]),
+                  _tall(
+                    RemoteKey(icon: Icons.add_rounded, onTap: () => onKey(K.pageUp), color: dark, size: 30, width: 50, repeat: true),
+                    RemoteKey(icon: Icons.remove_rounded, onTap: () => onKey(K.pageDown), color: dark, size: 30, width: 50, repeat: true),
+                  ),
+                ]),
+                for (final r in const [
+                  [1, 2, 3],
+                  [4, 5, 6],
+                  [7, 8, 9],
+                ])
+                  _row([for (final n in r) _k('$n', K.digit(n), h: 30, w: 80, fs: 14)]),
+                _row([
+                  _k('EPG', K.epg, h: 30, w: 80, fs: 10),
+                  _k('0', K.digit(0), h: 30, w: 80, fs: 14),
+                  _k('TV/RADIO', K.tvRadio, h: 30, w: 80, fs: 8),
+                ]),
+                GestureDetector(
+                  onTap: () => setState(() => more = !more),
+                  child: Container(
+                    margin: const EdgeInsets.only(top: 6),
+                    height: 24,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(borderRadius: BorderRadius.circular(12), border: Border.all(color: kLine)),
+                    child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      Icon(more ? Icons.keyboard_arrow_up_rounded : Icons.keyboard_arrow_down_rounded, size: 16, color: kMuted),
+                      const Text(' MORE', style: TextStyle(color: kMuted, fontSize: 11)),
+                    ]),
+                  ),
+                ),
+                if (more)
+                  Wrap(alignment: WrapAlignment.center, children: [
+                    _k('VOL−', K.volDown, h: 28, w: 56, fs: 9, repeat: true),
+                    _k('VOL+', K.volUp, h: 28, w: 56, fs: 9, repeat: true),
+                    _k('CH−', K.chDown, h: 28, w: 56, fs: 9),
+                    _k('CH+', K.chUp, h: 28, w: 56, fs: 9),
+                    _k('SLEEP', K.sleep, h: 28, w: 56, fs: 8),
+                    _k('TIMER', K.timer, h: 28, w: 56, fs: 8),
+                    _k('RES', K.resolution, h: 28, w: 56, fs: 9),
+                    _k('F1', K.f1, h: 28, w: 56, fs: 9),
+                    _k('F2', K.f2, h: 28, w: 56, fs: 9),
+                    _k('LIVE', K.pauseLive, h: 28, w: 56, fs: 9),
+                    _k('FIND', K.find, h: 28, w: 56, fs: 9),
+                    _k('HOME', K.home, h: 28, w: 56, fs: 9),
+                    _k('', K.red, color: const Color(0xFFD64545), h: 24, w: 56),
+                    _k('', K.green, color: const Color(0xFF3FAE5A), h: 24, w: 56),
+                    _k('', K.yellow, color: const Color(0xFFE2B33C), h: 24, w: 56),
+                    _k('', K.blue, color: const Color(0xFF3F7FD6), h: 24, w: 56),
+                  ]),
               ]),
-              const SizedBox(height: 12),
-              _row([
-                _color(const Color(0xFFD64545), K.red),
-                _color(const Color(0xFF3FAE5A), K.green),
-                _color(const Color(0xFFE2B33C), K.yellow),
-                _color(const Color(0xFF3F7FD6), K.blue),
-              ]),
-              const SizedBox(height: 10),
-              for (final r in const [
-                [1, 2, 3],
-                [4, 5, 6],
-                [7, 8, 9],
-              ])
-                _row([for (final n in r) _k('$n', K.digit(n), size: 58, width: 84)]),
-              _row([
-                _k('TXT', K.teletext, size: 58, width: 84),
-                _k('0', K.digit(0), size: 58, width: 84),
-                _k('', K.find, icon: Icons.search_rounded, size: 58, width: 84),
-              ]),
-              const SizedBox(height: 10),
-              const Divider(),
-              const SizedBox(height: 6),
-              _row([
-                _k('', K.rew, icon: Icons.fast_rewind_rounded, size: 44),
-                _k('', K.play, icon: Icons.play_arrow_rounded, size: 44),
-                _k('', K.pause, icon: Icons.pause_rounded, size: 44),
-                _k('', K.stop, icon: Icons.stop_rounded, size: 44),
-                _k('', K.ff, icon: Icons.fast_forward_rounded, size: 44),
-              ]),
-              _row([
-                _k('', K.record, icon: Icons.fiber_manual_record_rounded, fg: kBad, size: 44),
-                _k('USB', K.usb, size: 44),
-                _k('P−', K.pageUp, size: 44),
-                _k('P+', K.pageDown, size: 44),
-                _k('', K.sleep, icon: Icons.bedtime_outlined, size: 44),
-              ]),
-              _row([
-                _k('TIMER', K.timer, size: 44),
-                _k('', K.prev, icon: Icons.skip_previous_rounded, size: 44),
-                _k('', K.next, icon: Icons.skip_next_rounded, size: 44),
-              ]),
-              _row([
-                _k('Res', K.resolution, size: 44),
-                _k('F1', K.f1, size: 44),
-                _k('F2', K.f2, size: 44),
-                _k('', K.pauseLive, icon: Icons.pause_circle_outline_rounded, size: 44),
-              ]),
-            ]),
+            ),
           ),
         ),
       ),
@@ -9984,8 +10093,8 @@ class Native4 {
       _call<String>('setAlarm', {'id': id, 'at': at.millisecondsSinceEpoch, 'task': jsonEncode(task), 'exact': exact});
   static Future<void> cancelAlarm(int id) => _call('cancelAlarm', {'id': id});
   static Future<void> remoteNotif(bool on, {String title = 'ريموت الريسيفر'}) => _call('remoteNotif', {'on': on, 'title': title});
-  static Future<List<String>> voice({String prompt = 'قول الأمر'}) async {
-    final r = await _call<List<dynamic>>('voice', {'lang': 'ar-EG', 'prompt': prompt});
+  static Future<List<String>> voice({String prompt = 'قول الأمر', String lang = 'ar-EG'}) async {
+    final r = await _call<List<dynamic>>('voice', {'lang': lang, 'prompt': prompt});
     return r?.map((e) => '$e').toList() ?? [];
   }
 
@@ -10799,65 +10908,118 @@ double channelScore(String spoken, String channelName) {
   return s;
 }
 
-enum VoiceKind { keys, number, channel, none }
+enum VoiceKind { keys, number, channel, choose, recall, none }
 
 class VoiceCmd {
   final VoiceKind kind;
   final List<int> keys;
   final int number;
   final StbChannel? channel;
+  final List<StbChannel> alts;
   final String heard;
-  const VoiceCmd(this.kind, {this.keys = const [], this.number = 0, this.channel, this.heard = ''});
+  const VoiceCmd(this.kind, {this.keys = const [], this.number = 0, this.channel, this.alts = const [], this.heard = ''});
   String get describe => switch (kind) {
         VoiceKind.keys => 'زرار',
         VoiceKind.number => 'قناة رقم $number',
         VoiceKind.channel => channel!.name,
+        VoiceKind.choose => 'اختار من ${alts.length}',
+        VoiceKind.recall => 'آخر قناة',
         VoiceKind.none => 'مفهمتش',
       };
 }
 
 const _openWords = ['افتح', 'افتحلي', 'شغل', 'شغللي', 'حط', 'هات', 'روح', 'روح علي', 'حطلي', 'عايز', 'عاوز', 'قناه'];
 
-/// يفهم الأمر من اقتراحات التعرف على الكلام (أول اقتراح يتفهم بيكسب)
+const Map<String, int> _enNum = {
+  'zero': 0, 'oh': 0, 'o': 0, 'one': 1, 'two': 2, 'to': 2, 'too': 2, 'three': 3, 'four': 4, 'for': 4, 'five': 5, 'six': 6,
+  'seven': 7, 'eight': 8, 'ate': 8, 'nine': 9, 'ten': 10, 'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14,
+  'fifteen': 15, 'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20, 'thirty': 30, 'forty': 40,
+  'fifty': 50, 'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90,
+};
+
+/// "one oh five" → 105 ، "one hundred five" → 105 ، "twenty five" → 25 (بس لو كل الكلمات أرقام)
+int? parseEnNumber(String s) {
+  final toks = s.split(' ').where((w) => w.isNotEmpty && w != 'and').toList();
+  if (toks.isEmpty) return null;
+  if (toks.length == 1 && const {'to', 'too', 'for', 'ate', 'o'}.contains(toks.first)) return null;
+  if (!toks.every((w) => _enNum.containsKey(w) || w == 'hundred')) return null;
+  if (!toks.contains('hundred') && toks.every((w) => _enNum[w]! < 10)) {
+    return int.tryParse(toks.map((w) => '${_enNum[w]}').join());
+  }
+  var total = 0, cur = 0;
+  for (final w in toks) {
+    if (w == 'hundred') {
+      cur = (cur == 0 ? 1 : cur) * 100;
+    } else {
+      cur += _enNum[w]!;
+    }
+  }
+  return total + cur;
+}
+
+final RegExp _enPrefix = RegExp(r'^((open|play|switch to|go to|watch|tune to|put on|show|channel|number|the)\s+)+');
+final RegExp _noiseWords = RegExp(r'\b(hd|sd|fhd|uhd|tv|channel)\b');
+String _stripNoise(String s) => normAr(s).replaceAll(_noiseWords, ' ').replaceAll(RegExp(r'\s+'), ' ').trim();
+
+/// يفهم الأمر من اقتراحات التعرف على الكلام. أوامر الأزرار والأرقام: أول اقتراح يتفهم بيكسب.
+/// القنوات (v7): بنجمع أحسن درجة لكل قناة من كل الاقتراحات؛ لو قناة واحدة واضحة تتفتح، لو في قريبين بنعرض أقرب 3.
 VoiceCmd parseVoiceCommand(List<String> texts, List<StbChannel> channels) {
+  final cand = <StbChannel, double>{};
   for (final raw in texts) {
     final t = normAr(raw);
     if (t.isEmpty) continue;
     bool has(List<String> w) => w.any((x) => RegExp('(^| )${RegExp.escape(x)}( |\$)').hasMatch(t));
-    if (has(['علي الصوت', 'ارفع الصوت', 'على الصوت', 'زود الصوت', 'صوت اعلي', 'volume up'])) return VoiceCmd(VoiceKind.keys, keys: const [K.volUp, K.volUp, K.volUp], heard: raw);
-    if (has(['وطي الصوت', 'واطي الصوت', 'قلل الصوت', 'اخفض الصوت', 'نزل الصوت', 'صوت اوطي', 'volume down'])) return VoiceCmd(VoiceKind.keys, keys: const [K.volDown, K.volDown, K.volDown], heard: raw);
-    if (has(['اكتم', 'كتم', 'اسكت', 'mute', 'اقفل الصوت', 'شيل الصوت'])) return VoiceCmd(VoiceKind.keys, keys: const [K.mute], heard: raw);
-    if (has(['اقفل', 'اطفي', 'قفل', 'power', 'اقفل الريسيفر', 'اطفي الريسيفر', 'افتح الريسيفر'])) return VoiceCmd(VoiceKind.keys, keys: const [K.power], heard: raw);
-    if (has(['اللي بعدها', 'القناه اللي بعدها', 'التاليه', 'بعدها', 'next'])) return VoiceCmd(VoiceKind.keys, keys: const [K.chUp], heard: raw);
-    if (has(['اللي قبلها', 'القناه اللي قبلها', 'السابقه', 'قبلها', 'previous'])) return VoiceCmd(VoiceKind.keys, keys: const [K.chDown], heard: raw);
+    if (has(['علي الصوت', 'ارفع الصوت', 'على الصوت', 'زود الصوت', 'صوت اعلي', 'volume up', 'louder', 'turn it up'])) return VoiceCmd(VoiceKind.keys, keys: const [K.volUp, K.volUp, K.volUp], heard: raw);
+    if (has(['وطي الصوت', 'واطي الصوت', 'قلل الصوت', 'اخفض الصوت', 'نزل الصوت', 'صوت اوطي', 'volume down', 'quieter', 'turn it down'])) return VoiceCmd(VoiceKind.keys, keys: const [K.volDown, K.volDown, K.volDown], heard: raw);
+    if (has(['اكتم', 'كتم', 'اسكت', 'mute', 'unmute', 'اقفل الصوت', 'شيل الصوت'])) return VoiceCmd(VoiceKind.keys, keys: const [K.mute], heard: raw);
+    if (has(['اقفل', 'اطفي', 'قفل', 'power', 'power off', 'turn off', 'turn on', 'shut down', 'اقفل الريسيفر', 'اطفي الريسيفر', 'افتح الريسيفر'])) return VoiceCmd(VoiceKind.keys, keys: const [K.power], heard: raw);
+    if (has(['اللي بعدها', 'القناه اللي بعدها', 'التاليه', 'بعدها', 'next', 'next channel'])) return VoiceCmd(VoiceKind.keys, keys: const [K.chUp], heard: raw);
+    // v7: «السابقة» = آخر قناة اتفرجت عليها (مش الرقم اللي قبلها)
+    if (has(['اللي قبلها', 'القناه اللي قبلها', 'السابقه', 'القناه السابقه', 'قبلها', 'previous', 'previous channel', 'last channel', 'go back'])) return VoiceCmd(VoiceKind.recall, heard: raw);
     if (has(['رجوع', 'خروج', 'ارجع', 'اخرج', 'exit', 'back'])) return VoiceCmd(VoiceKind.keys, keys: const [K.exit], heard: raw);
     if (has(['القائمه', 'القايمه', 'منيو', 'menu'])) return VoiceCmd(VoiceKind.keys, keys: const [K.menu], heard: raw);
-    if (has(['دليل', 'epg'])) return VoiceCmd(VoiceKind.keys, keys: const [K.epg], heard: raw);
-    // "قناة 105" / "رقم 105" / "105"
-    final numOnly = RegExp(r'^(قناه |رقم |القناه رقم |القناه |channel )?([\d]+)$').firstMatch(t);
+    if (has(['دليل', 'epg', 'guide'])) return VoiceCmd(VoiceKind.keys, keys: const [K.epg], heard: raw);
+    // "قناة 105" / "رقم 105" / "105" / "channel 105"
+    final numOnly = RegExp(r'^(قناه |رقم |القناه رقم |القناه |channel |channel number |number )?([\d]+)$').firstMatch(t);
     final words = t.replaceAll(RegExp(r'^(قناه|رقم|القناه رقم|القناه|افتح|شغل)\s*'), '');
     final wn = RegExp(r'\d').hasMatch(words) ? null : parseArNumber(words);
     if (numOnly != null) return VoiceCmd(VoiceKind.number, number: int.parse(numOnly.group(2)!), heard: raw);
     if (wn != null && words.split(' ').every((w) => _numWords.containsKey(w) || _numWords.containsKey(w.startsWith('و') ? w.substring(1) : w))) {
       return VoiceCmd(VoiceKind.number, number: wn, heard: raw);
     }
+    final enWords = t.replaceFirst(_enPrefix, '');
+    final en = parseEnNumber(enWords);
+    if (en != null) return VoiceCmd(VoiceKind.number, number: en, heard: raw);
     // اسم قناة
     var q = t;
     for (final w in _openWords) {
       if (q.startsWith('$w ')) q = q.substring(w.length + 1);
     }
+    q = q.replaceFirst(_enPrefix, '');
     if (q.isEmpty || channels.isEmpty) continue;
-    StbChannel? best;
-    var bestS = 0.0;
+    final qn = _stripNoise(q);
     for (final c in channels) {
       if (c.radio) continue;
-      final s = channelScore(q, c.name);
-      if (s > bestS) {
-        bestS = s;
-        best = c;
+      var s = channelScore(q, c.name);
+      if (qn.isNotEmpty) {
+        final cn = _stripNoise(c.name);
+        if (cn.isNotEmpty) {
+          s = max(s, channelScore(qn, cn));
+          final qs = qn.replaceAll(' ', ''), cs = cn.replaceAll(' ', '');
+          if (qs.length >= 3 && cs.contains(qs) && !RegExp(r'\d').hasMatch(qs)) s = max(s, 0.7 + 0.25 * qs.length / cs.length);
+        }
       }
+      if (s > (cand[c] ?? 0)) cand[c] = s;
     }
-    if (best != null && bestS >= 0.6) return VoiceCmd(VoiceKind.channel, channel: best, heard: raw);
+  }
+  if (cand.isNotEmpty) {
+    final l = cand.entries.where((e) => e.value >= 0.45).toList()..sort((a, b) => b.value.compareTo(a.value));
+    if (l.isNotEmpty) {
+      final top = l.first;
+      final clear = l.length == 1 || top.value - l[1].value >= 0.08 || top.value >= 0.97;
+      if (top.value >= 0.6 && clear) return VoiceCmd(VoiceKind.channel, channel: top.key, heard: texts.first);
+      return VoiceCmd(VoiceKind.choose, alts: [for (final e in l.where((e) => top.value - e.value <= 0.35).take(3)) e.key], heard: texts.first);
+    }
   }
   return VoiceCmd(VoiceKind.none, heard: texts.isEmpty ? '' : texts.first);
 }
@@ -17873,7 +18035,7 @@ class _TotoPageState extends State<TotoPage> {
 /// رسالة خطأ المشغل بالعربي
 String stbPlayerError(String raw) {
   final r = raw.toLowerCase();
-  if (r.contains('timeout') || r.contains('مهلة')) return 'الريسيفر مبعتش صورة في الوقت — جرّب تاني أو قرّب من الراوتر';
+  if (r.contains('timeout') || r.contains('مهلة')) return 'الريسيفر مبعتش صورة بعد ما استنيت 40 ثانية وحاولت مرتين — التفاصيل تحت';
   if (r.contains('decoder') || r.contains('codec') || r.contains('format_unsupported') || r.contains('unrecognizedinputformat')) {
     return 'الموبايل مش بيعرف يشغّل نوع الصورة/الصوت بتاع القناة دي — جرّب «مشغل خارجي» من ⋮ (VLC بيشغّلها)';
   }
@@ -17962,6 +18124,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   VideoPlayerController? vc;
   late int idx = widget.index;
   String? err, url;
+  String detail = ''; // v7: تفاصيل الخطأ الحقيقية (الرابط + رسالة المشغل)
   bool loading = true, overlay = true, full = false, noPicture = false, rotLock = false, listOpen = false;
   double vol = _spGet(() => Store.p.getDouble('player_vol')) ?? 1, bright = -1;
   bool _dimOnly = false;
@@ -18027,14 +18190,16 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     });
   }
 
-  Future<void> _open({bool retry = false}) async {
+  Future<void> _open({bool retry = false, int attempt = 0}) async {
     final gen = ++_gen;
     if (!retry) retries = 0;
     _sameMs = 0;
     _goodMs = 0;
+    VideoPlayerController? c; // v7: برّه الـ try علشان نقفله لو المهلة خلصت
     setState(() {
       loading = true;
       err = null;
+      detail = '';
       noPicture = false;
     });
     _spGet(() => Store.p.setString('stb_last_play', jsonEncode({'id': ch.id, 'n': ch.name, 'r': ch.radio})));
@@ -18048,33 +18213,43 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
       if (u == null) throw StateError('الريسيفر مرجّعش رابط بث للقناة دي');
       url = u;
       AppLog.add('PLAYER', 'فتح ${ch.name} → ${u.split('?').first}');
-      final c = VideoPlayerController.networkUrl(
+      final nc = VideoPlayerController.networkUrl(
         Uri.parse(u),
         formatHint: u.contains('.m3u8') ? VideoFormat.hls : VideoFormat.other,
         httpHeaders: const {'User-Agent': 'A2R Home'},
       );
-      await c.initialize().timeout(const Duration(seconds: 20), onTimeout: () => throw TimeoutException('مهلة'));
+      c = nc;
+      // v7: مهلة 40 ثانية (القمر ممكن ياخد وقت يظبط القناة) + محاولة تانية أوتوماتيك لو خلصت
+      await nc.initialize().timeout(const Duration(seconds: 40), onTimeout: () => throw TimeoutException('مهلة'));
       if (gen != _gen || !mounted) {
-        await c.dispose();
+        await nc.dispose();
         return;
       }
-      await c.setVolume(vol);
-      await c.play();
-      c.addListener(_onTick);
+      await nc.setVolume(vol);
+      await nc.play();
+      nc.addListener(_onTick);
       setState(() {
-        vc = c;
+        vc = nc;
         loading = false;
-        noPicture = c.value.size.width == 0;
+        noPicture = nc.value.size.width == 0;
       });
       if (noPicture) AppLog.add('PLAYER', 'صوت من غير صورة (size=0) — غالبًا الموبايل مفيهوش decoder للصورة');
       _poke();
     } catch (e) {
+      try {
+        await c?.dispose();
+      } catch (_) {}
       if (gen != _gen || !mounted) return;
-      AppLog.add('PLAYER', 'خطأ ${ch.name}: $e');
+      AppLog.add('PLAYER', 'خطأ ${ch.name} (محاولة ${attempt + 1}): $e');
+      if (attempt == 0 && e is TimeoutException) {
+        AppLog.add('PLAYER', 'المهلة خلصت — محاولة تانية أوتوماتيك');
+        return _open(retry: true, attempt: 1);
+      }
       final m = e is StateError ? e.message : stbPlayerError('$e');
       setState(() {
         loading = false;
         err = m;
+        detail = [if (url != null) 'الرابط: ${url!.split('?').first}', 'المحاولات: ${attempt + 1}', 'الخطأ: $e'].join('\n');
       });
     }
   }
@@ -18099,6 +18274,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     if (c.value.hasError) {
       final d = c.value.errorDescription ?? '';
       AppLog.add('PLAYER', 'وقف: $d');
+      detail = [if (url != null) 'الرابط: ${url!.split('?').first}', 'الخطأ: $d'].join('\n');
       _retryLater('البث وقف');
       return;
     }
@@ -18415,7 +18591,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
                     child: Column(mainAxisSize: MainAxisSize.min, children: [
                       const CircularProgressIndicator(color: kGold),
                       const SizedBox(height: 10),
-                      Text(loading ? 'بيفتح ${ch.name}…' : 'بيحمّل…', style: const TextStyle(color: Colors.white70)),
+                      Text(loading ? 'بيفتح ${ch.name}… (الريسيفر بيجهّز القناة، ممكن ياخد لحد 40 ثانية)' : 'بيحمّل…', style: const TextStyle(color: Colors.white70)),
                     ]),
                   ),
                 if (hud.isNotEmpty)
@@ -18435,6 +18611,21 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
                         const Icon(Icons.error_outline_rounded, color: kBad, size: 40),
                         const SizedBox(height: 8),
                         Text(err!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white)),
+                        if (detail.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          Directionality(
+                            textDirection: TextDirection.ltr,
+                            child: SelectableText(detail, textAlign: TextAlign.left, style: const TextStyle(color: Colors.white54, fontSize: 11)),
+                          ),
+                          TextButton.icon(
+                            onPressed: () {
+                              Clipboard.setData(ClipboardData(text: detail));
+                              toast(context, 'اتنسخت التفاصيل');
+                            },
+                            icon: const Icon(Icons.copy_rounded, size: 16),
+                            label: const Text('نسخ التفاصيل'),
+                          ),
+                        ],
                         const SizedBox(height: 12),
                         Wrap(spacing: 8, children: [
                           FilledButton.icon(onPressed: () => _open(), icon: const Icon(Icons.refresh_rounded), label: const Text('جرّب تاني')),
