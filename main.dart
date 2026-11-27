@@ -19676,6 +19676,9 @@ List<int> playerFilter(List<StbChannel> list, String tab, String q, {Set<String>
 /// الاستال: البث "شغال" بس الوقت مش بيتحرك — لازم نعيد الاتصال
 bool playerStalled({required bool playing, required Duration pos, required Duration lastPos, required int sameForMs}) => playing && pos == lastPos && sameForMs >= 10000;
 
+/// اليوزر-إيجنت اللي مشغل G-MScreen بيبعته للريسيفر وهو بيفتح رابط البث (mktvsmart.screen.ijk.c: setOption user_agent)
+const String kGmStreamUA = 'AppleCoreMedia/1.0.0.9A405 (iPad; U; CPU OS 5_0_1 like Mac OS X; zh_cn)';
+
 class StbPlayerPage extends StatefulWidget {
   final GmClient gm;
   final List<StbChannel> list;
@@ -19782,7 +19785,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
       final nc = VideoPlayerController.networkUrl(
         Uri.parse(u),
         formatHint: u.contains('.m3u8') ? VideoFormat.hls : VideoFormat.other,
-        httpHeaders: const {'User-Agent': 'A2R Home'},
+        httpHeaders: const {'User-Agent': kGmStreamUA}, // نفس هوية مشغل G-MScreen (ijk user_agent)
       );
       c = nc;
       // v7: مهلة 40 ثانية (القمر ممكن ياخد وقت يظبط القناة) + محاولة تانية أوتوماتيك لو خلصت
@@ -19825,7 +19828,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   Future<void> _diagStream(String u) async {
     final cl = http.Client();
     try {
-      final req = http.Request('GET', Uri.parse(u))..headers['User-Agent'] = 'A2R Home';
+      final req = http.Request('GET', Uri.parse(u))..headers['User-Agent'] = kGmStreamUA;
       final sw = Stopwatch()..start();
       final resp = await cl.send(req).timeout(const Duration(seconds: 6));
       final h = resp.headers;
