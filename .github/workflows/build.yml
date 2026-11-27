@@ -1421,20 +1421,19 @@ jobs:
       - name: Build release APK
         run: |
           set -o pipefail
-          if ! flutter build apk --release --split-per-abi --target-platform android-arm64,android-arm --build-name=1.0.${{ github.run_number }} --build-number=${{ github.run_number }} --dart-define=APP_VERSION=1.0.${{ github.run_number }} 2>&1 | tee /tmp/build.log; then
+          if ! flutter build apk --release --target-platform android-arm64 --build-name=1.0.${{ github.run_number }} --build-number=${{ github.run_number }} --dart-define=APP_VERSION=1.0.${{ github.run_number }} 2>&1 | tee /tmp/build.log; then
             # الأخطاء بتتلخص في Annotation علشان تتقرا من غير ما تفتح السجل كله
             MSG=$(grep -E '^e: |error:|What went wrong|Execution failed|FAILURE|AAPT|lint|Lint|Could not|Manifest merger' -A3 /tmp/build.log | head -45 | cut -c1-300 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')
             echo "::error title=build-summary::${MSG}"
             exit 1
           fi
-          # حجم أصغر: نسخة arm64 (الأساسية، لكل الموبايلات الحديثة) + نسخة 32 بت اختيارية للموبايلات القديمة
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk A2R-Home.apk
-          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk A2R-Home-32bit.apk
-          ls -l A2R-Home.apk A2R-Home-32bit.apk
+          # حجم أصغر: arm64 بس، من غير split (رقم الإصدار versionCode عادي = رقم الـ build)
+          cp build/app/outputs/flutter-apk/app-release.apk A2R-Home.apk
+          ls -l A2R-Home.apk
           # v7: اتأكد من توقيع الـ APK الفعلي
           AS=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)apksigner
           if [ -x "$AS" ]; then
-            for F in A2R-Home.apk A2R-Home-32bit.apk; do
+            for F in A2R-Home.apk; do
               GOT=$("$AS" verify --print-certs "$F" | grep -m1 'SHA-256 digest' | awk '{print $NF}')
               echo "$F cert SHA-256: $GOT"
               WANT=$(echo "${A2R_CERT_FP:-}" | tr -d ':' | tr 'A-F' 'a-f')
@@ -1452,7 +1451,6 @@ jobs:
           name: A2R-Home-1.0.${{ github.run_number }}
           path: |
             A2R-Home.apk
-            A2R-Home-32bit.apk
 
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -1461,4 +1459,3 @@ jobs:
           name: A2R Home v1.0.${{ github.run_number }}
           files: |
             A2R-Home.apk
-            A2R-Home-32bit.apk
