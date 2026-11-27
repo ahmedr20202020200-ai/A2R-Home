@@ -15,6 +15,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
+import 'package:media_kit/media_kit.dart' as mk; // المشغّل الجديد للقنوات (libmpv/ffmpeg)
+import 'package:media_kit_video/media_kit_video.dart' as mkv;
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:qr/qr.dart';
@@ -17272,6 +17274,15 @@ class _StbGroupsPageState extends State<StbGroupsPage> {
           title: const Text('ارجع اتصل بالريسيفر لوحدك لما أرجع للتطبيق'),
           onChanged: (v) => setState(() => StbPrefs.autoReconnect = v),
         ),
+        SwitchListTile(
+          value: stbEngineKind() == 'mpv',
+          title: const Text('مشغّل القنوات: الجديد'),
+          subtitle: Text(stbEngineKind() == 'mpv' ? 'الجديد (بيفك صورة أي قناة بنفسه)' : 'القديم (مشغّل الموبايل)', style: const TextStyle(fontSize: 12, color: kMuted)),
+          onChanged: (v) async {
+            await Store.p.setString('stb_engine', v ? 'mpv' : 'exo');
+            setState(() {});
+          },
+        ),
         const Padding(
           padding: EdgeInsets.symmetric(horizontal: 12),
           child: Text('المجموعات دي على الموبايل بس (مش بتغيّر حاجة في الريسيفر). اسحب علشان ترتب، ودوس على المجموعة علشان ترتب قنواتها.', style: TextStyle(fontSize: 12, color: kMuted)),
@@ -19679,6 +19690,282 @@ bool playerStalled({required bool playing, required Duration pos, required Durat
 /// اليوزر-إيجنت اللي مشغل G-MScreen بيبعته للريسيفر وهو بيفتح رابط البث (mktvsmart.screen.ijk.c: setOption user_agent)
 const String kGmStreamUA = 'AppleCoreMedia/1.0.0.9A405 (iPad; U; CPU OS 5_0_1 like Mac OS X; zh_cn)';
 
+// ---------------- محرك تشغيل القنوات: الجديد (mpv/ffmpeg بيفك الصورة بنفسه) أو القديم (مشغل الموبايل) ----------------
+/// المشغّل اللي بيشغّل قنوات الريسيفر: 'mpv' = الجديد (الافتراضي) • 'exo' = القديم
+String stbEngineKind() => _spGet(() => Store.p.getString('stb_engine')) == 'exo' ? 'exo' : 'mpv';
+
+/// تراك صوت (لغة) بشكل واحد للمشغلين
+class ChAudio {
+  final String id;
+  final String? label, language, codec;
+  final int? channels;
+  final bool selected;
+  const ChAudio(this.id, {this.label, this.language, this.codec, this.channels, this.selected = false});
+}
+
+/// واجهة واحدة للمشغلين علشان صفحة القنوات متتغيرش
+abstract class ChEngine extends ChangeNotifier {
+  String get kind; // 'mpv' / 'exo'
+  bool get isInitialized;
+  bool get isPlaying;
+  bool get isBuffering;
+  Size get size;
+  double get aspectRatio;
+  Duration get position;
+  bool get hasError;
+  String? get errorDescription;
+  bool get audioTracksSupported;
+  Future<void> initialize(Duration timeout);
+  Future<void> setVolume(double v); // 0..1
+  Future<void> play();
+  Future<void> pause();
+  Future<List<ChAudio>> audioTracks();
+  Future<void> selectAudio(String id);
+  Widget view(); // بيملا المساحة اللي يتحط فيها
+  Future<void> close();
+
+  static ChEngine create(String kind, String url) => kind == 'exo' ? ExoChEngine(url) : MpvChEngine(url);
+}
+
+/// القديم: video_player (ExoPlayer) — بيعتمد على decoder الموبايل
+class ExoChEngine extends ChEngine {
+  final VideoPlayerController c;
+  ExoChEngine(String url)
+      : c = VideoPlayerController.networkUrl(
+          Uri.parse(url),
+          formatHint: url.contains('.m3u8') ? VideoFormat.hls : VideoFormat.other,
+          httpHeaders: const {'User-Agent': kGmStreamUA}, // نفس هوية مشغل G-MScreen (ijk user_agent)
+        );
+  @override
+  String get kind => 'exo';
+  @override
+  bool get isInitialized => c.value.isInitialized;
+  @override
+  bool get isPlaying => c.value.isPlaying;
+  @override
+  bool get isBuffering => c.value.isBuffering;
+  @override
+  Size get size => c.value.size;
+  @override
+  double get aspectRatio => c.value.aspectRatio;
+  @override
+  Duration get position => c.value.position;
+  @override
+  bool get hasError => c.value.hasError;
+  @override
+  String? get errorDescription => c.value.errorDescription;
+  @override
+  bool get audioTracksSupported => c.isAudioTrackSupportAvailable();
+  @override
+  Future<void> initialize(Duration timeout) async {
+    await c.initialize().timeout(timeout, onTimeout: () => throw TimeoutException('مهلة'));
+    c.addListener(notifyListeners);
+  }
+
+  @override
+  Future<void> setVolume(double v) => c.setVolume(v);
+  @override
+  Future<void> play() => c.play();
+  @override
+  Future<void> pause() => c.pause();
+  @override
+  Future<List<ChAudio>> audioTracks() async => [
+        for (final t in await c.getAudioTracks()) ChAudio(t.id, label: t.label, language: t.language, codec: t.codec, channels: t.channelCount, selected: t.isSelected),
+      ];
+  @override
+  Future<void> selectAudio(String id) => c.selectAudioTrack(id);
+  @override
+  Widget view() => VideoPlayer(c);
+  bool _closed = false;
+  @override
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    c.removeListener(notifyListeners);
+    await c.dispose();
+  }
+}
+
+/// الجديد: media_kit (libmpv + ffmpeg) — بيفك MPEG-2 وأي صورة بالسوفت وير لو الموبايل معندوش decoder (زي ijkplayer بتاع G-MScreen)
+class MpvChEngine extends ChEngine {
+  static bool _libReady = false;
+  final String url;
+  mk.Player? _p;
+  mkv.VideoController? _vc;
+  final _subs = <StreamSubscription>[];
+  bool _init = false, _closed = false;
+  final _ready = Completer<void>();
+  bool startFailed = false; // المكتبة/المشغّل نفسه مقدرش يبدأ (مش مشكلة بث) → الصفحة ترجع للقديم
+  String? _err;
+  int _w = 0, _h = 0;
+  MpvChEngine(this.url);
+
+  @override
+  String get kind => 'mpv';
+  @override
+  bool get isInitialized => _init;
+  @override
+  bool get isPlaying => _p?.state.playing ?? false;
+  @override
+  bool get isBuffering => _p?.state.buffering ?? false;
+  @override
+  Size get size => Size(_w.toDouble(), _h.toDouble());
+  @override
+  double get aspectRatio => _w > 0 && _h > 0 ? _w / _h : 0;
+  @override
+  Duration get position => _p?.state.position ?? Duration.zero;
+  @override
+  bool get hasError => _init && _err != null;
+  @override
+  String? get errorDescription => _err;
+  @override
+  bool get audioTracksSupported => true;
+
+  @override
+  Future<void> initialize(Duration timeout) async {
+    _ready.future.ignore(); // الخطأ بيوصل للي مستني — من غير «خطأ مش متعالج» لو اتقفل بدري
+    final mk.Player p;
+    try {
+      if (!_libReady) {
+        mk.MediaKit.ensureInitialized(); // بيحمّل libmpv مرة واحدة
+        _libReady = true;
+      }
+      p = mk.Player(configuration: const mk.PlayerConfiguration(title: 'A2R Home', bufferSize: 16 * 1024 * 1024, logLevel: mk.MPVLogLevel.warn));
+      _p = p;
+      final vc = mkv.VideoController(p); // hwdec=auto-safe: لو الموبايل مش بيفك الصورة بالهاردوير → ffmpeg سوفت وير لوحده
+      _vc = vc;
+      await vc.platform.future.timeout(const Duration(seconds: 10)); // لو خرج الصورة نفسه مقدرش يتعمل → نعرف هنا
+      final np = p.platform;
+      if (np is mk.NativePlayer) {
+        // نفس إعدادات مشغل G-MScreen (ijk): user_agent + reconnect + مهلة الشبكة
+        await np.setProperty('user-agent', kGmStreamUA);
+        await np.setProperty('network-timeout', '15');
+        await np.setProperty('stream-lavf-o', 'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5');
+      }
+    } catch (e) {
+      if (_closed) rethrow; // اتقفل وهو بيفتح (غيّرت القناة) — مش عطل في المشغّل
+      startFailed = true;
+      AppLog.add('PLAYER', 'mpv مقدرش يبدأ: $e');
+      rethrow;
+    }
+    final ready = _ready;
+    Timer? audioOnly;
+    void done() {
+      if (!ready.isCompleted) ready.complete();
+    }
+
+    _subs.add(p.stream.width.listen((v) {
+      _w = v ?? 0;
+      if (_w > 0 && _h > 0) done();
+      notifyListeners();
+    }));
+    _subs.add(p.stream.height.listen((v) {
+      _h = v ?? 0;
+      if (_w > 0 && _h > 0) done();
+      notifyListeners();
+    }));
+    _subs.add(p.stream.position.listen((v) {
+      // صوت شغال ولسه مفيش صورة: نستنى 6 ثواني كمان قبل ما نقول «من غير صورة»
+      if (v > Duration.zero && audioOnly == null && !ready.isCompleted) audioOnly = Timer(const Duration(seconds: 6), done);
+      notifyListeners();
+    }));
+    _subs.add(p.stream.playing.listen((_) => notifyListeners()));
+    _subs.add(p.stream.buffering.listen((_) => notifyListeners()));
+    // أخطاء mpv: أخطاء الشبكة/الفتح بتوقف (ونعيد زي القديم) • أخطاء فك فريم (vd/ad) بتتسجل بس — عادي تحصل في بث الريسيفر
+    void fatal(String e) {
+      AppLog.add('PLAYER', 'mpv: $e');
+      if (!ready.isCompleted) {
+        ready.completeError(StateError('mpv: $e'));
+      } else if (_init && !_closed) {
+        _err = e;
+        notifyListeners();
+      }
+    }
+
+    _subs.add(p.stream.completed.listen((c) {
+      if (c && _init && !_closed) {
+        _err ??= 'البث خلص من الريسيفر';
+        notifyListeners();
+      }
+    }));
+    _subs.add(p.stream.log.listen((l) {
+      if (l.level != 'error' && l.level != 'fatal') return;
+      final t = l.text.trim();
+      if (l.prefix == 'file' || l.prefix == 'stream' || l.prefix == 'cplayer' || (l.prefix == 'ffmpeg' && t.startsWith('tcp:')) || l.level == 'fatal') {
+        fatal('${l.prefix}: $t');
+      } else {
+        AppLog.add('PLAYER', 'mpv ${l.prefix}: $t');
+      }
+    }));
+    await p.open(mk.Media(url, httpHeaders: const {'User-Agent': kGmStreamUA}), play: true);
+    try {
+      await ready.future.timeout(timeout, onTimeout: () => throw TimeoutException('مهلة'));
+    } finally {
+      audioOnly?.cancel();
+    }
+    _err = null;
+    _init = true;
+    final v = p.state.track.video;
+    AppLog.add('PLAYER', 'mpv شغال: صورة ${_w}x$_h${v.codec == null ? '' : ' • ${v.codec}'}${v.decoder == null ? '' : ' • ${v.decoder}'}');
+  }
+
+  @override
+  Future<void> setVolume(double v) async => _p?.setVolume((v * 100).clamp(0, 100).toDouble());
+  @override
+  Future<void> play() async => _p?.play();
+  @override
+  Future<void> pause() async => _p?.pause();
+  @override
+  Future<List<ChAudio>> audioTracks() async {
+    final p = _p;
+    if (p == null) return const [];
+    final sel = p.state.track.audio.id;
+    return [
+      for (final t in p.state.tracks.audio)
+        if (t.id != 'auto' && t.id != 'no') ChAudio(t.id, label: t.title, language: t.language, codec: t.codec, channels: t.channelscount ?? t.audiochannels, selected: t.id == sel),
+    ];
+  }
+
+  @override
+  Future<void> selectAudio(String id) async {
+    final p = _p;
+    if (p == null) return;
+    for (final t in p.state.tracks.audio) {
+      if (t.id == id) await p.setAudioTrack(t);
+    }
+  }
+
+  @override
+  Widget view() {
+    final vc = _vc;
+    if (vc == null) return const SizedBox.shrink();
+    // fill: الصفحة نفسها بتظبط الشكل (ملائم/ملء/16:9/4:3) زي المشغل القديم
+    return mkv.Video(
+      controller: vc,
+      controls: mkv.NoVideoControls,
+      fit: BoxFit.fill,
+      fill: Colors.black,
+      pauseUponEnteringBackgroundMode: false, // صورة جوه صورة تفضل شغالة
+      resumeUponEnteringForegroundMode: false,
+    );
+  }
+
+  @override
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    if (!_ready.isCompleted) _ready.completeError(StateError('اتقفل'));
+    for (final s in _subs) {
+      await s.cancel();
+    }
+    _subs.clear();
+    final p = _p;
+    _p = null;
+    _vc = null;
+    await p?.dispose();
+  }
+}
+
 class StbPlayerPage extends StatefulWidget {
   final GmClient gm;
   final List<StbChannel> list;
@@ -19690,7 +19977,9 @@ class StbPlayerPage extends StatefulWidget {
 }
 
 class _StbPlayerPageState extends State<StbPlayerPage> {
-  VideoPlayerController? vc;
+  ChEngine? vc;
+  ChEngine? _pending; // المشغّل اللي لسه بيفتح (علشان لو غيّرت القناة بسرعة نقفله وميفضلش صوته شغال)
+  String engine = stbEngineKind(); // 'mpv' الجديد • 'exo' القديم
   late int idx = widget.index;
   String? err, url;
   String detail = ''; // v7: تفاصيل الخطأ الحقيقية (الرابط + رسالة المشغل)
@@ -19729,7 +20018,8 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     final c = vc;
     vc = null;
     c?.removeListener(_onTick);
-    c?.dispose();
+    c?.close();
+    _pending?.close();
     if (!widget.demo) widget.gm.stopStream().catchError((_) {});
     if (bright >= 0) PlayerNative.brightness(-1);
     if (full || rotLock) {
@@ -19747,7 +20037,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     _hide?.cancel();
     if (!overlay) setState(() => overlay = true);
     _hide = Timer(const Duration(seconds: 4), () {
-      if (mounted && vc?.value.isPlaying == true && !listOpen) setState(() => overlay = false);
+      if (mounted && vc?.isPlaying == true && !listOpen) setState(() => overlay = false);
     });
   }
 
@@ -19764,7 +20054,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     if (!retry) retries = 0;
     _sameMs = 0;
     _goodMs = 0;
-    VideoPlayerController? c; // v7: برّه الـ try علشان نقفله لو المهلة خلصت
+    ChEngine? c; // v7: برّه الـ try علشان نقفله لو المهلة خلصت
     setState(() {
       loading = true;
       err = null;
@@ -19775,23 +20065,24 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     final old = vc;
     vc = null;
     old?.removeListener(_onTick);
-    await old?.dispose();
+    await old?.close();
+    final pend = _pending;
+    _pending = null;
+    await pend?.close();
     try {
       final u = await widget.gm.streamUrl(ch);
       if (gen != _gen || !mounted) return;
       if (u == null) throw StateError('الريسيفر مرجّعش رابط بث للقناة دي');
       url = u;
-      AppLog.add('PLAYER', 'فتح ${ch.name} → ${u.split('?').first}');
-      final nc = VideoPlayerController.networkUrl(
-        Uri.parse(u),
-        formatHint: u.contains('.m3u8') ? VideoFormat.hls : VideoFormat.other,
-        httpHeaders: const {'User-Agent': kGmStreamUA}, // نفس هوية مشغل G-MScreen (ijk user_agent)
-      );
+      AppLog.add('PLAYER', 'فتح ${ch.name} → ${u.split('?').first} • المشغّل: ${engine == 'mpv' ? 'الجديد' : 'القديم'}');
+      final nc = ChEngine.create(engine, u);
       c = nc;
+      _pending = nc;
       // v7: مهلة 40 ثانية (القمر ممكن ياخد وقت يظبط القناة) + محاولة تانية أوتوماتيك لو خلصت
-      await nc.initialize().timeout(const Duration(seconds: 40), onTimeout: () => throw TimeoutException('مهلة'));
+      await nc.initialize(const Duration(seconds: 40));
+      if (identical(_pending, nc)) _pending = null;
       if (gen != _gen || !mounted) {
-        await nc.dispose();
+        await nc.close();
         return;
       }
       await nc.setVolume(vol);
@@ -19800,16 +20091,24 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
       setState(() {
         vc = nc;
         loading = false;
-        noPicture = nc.value.size.width == 0;
+        noPicture = nc.size.width == 0;
       });
-      if (noPicture) AppLog.add('PLAYER', 'صوت من غير صورة (size=0) — غالبًا الموبايل مفيهوش decoder للصورة');
+      if (noPicture) AppLog.add('PLAYER', 'صوت من غير صورة (size=0) — المشغّل ${engine == 'mpv' ? 'الجديد' : 'القديم'}');
       _poke();
     } catch (e) {
+      if (identical(_pending, c)) _pending = null;
+      final startFailed = c is MpvChEngine && c.startFailed;
       try {
-        await c?.dispose();
+        await c?.close();
       } catch (_) {}
       if (gen != _gen || !mounted) return;
       AppLog.add('PLAYER', 'خطأ ${ch.name} (محاولة ${attempt + 1}): $e');
+      if (startFailed) {
+        // المشغّل الجديد مقدرش يبدأ خالص على الموبايل ده → نرجع للقديم للمرة دي من غير ما نغيّر الاختيار
+        AppLog.add('PLAYER', 'المشغّل الجديد مقدرش يبدأ — هجرب القديم');
+        engine = 'exo';
+        return _open(retry: true, attempt: attempt);
+      }
       if (attempt == 0 && e is TimeoutException && url != null) await _diagStream(url!);
       if (attempt == 0 && e is TimeoutException) {
         AppLog.add('PLAYER', 'المهلة خلصت — محاولة تانية أوتوماتيك');
@@ -19871,8 +20170,9 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   void _onTick() {
     final c = vc;
     if (c == null || !mounted) return;
-    if (c.value.hasError) {
-      final d = c.value.errorDescription ?? '';
+    if (noPicture && c.size.width > 0) setState(() => noPicture = false); // الصورة وصلت متأخر
+    if (c.hasError) {
+      final d = c.errorDescription ?? '';
       AppLog.add('PLAYER', 'وقف: $d');
       detail = [if (url != null) 'الرابط: ${url!.split('?').first}', 'الخطأ: $d'].join('\n');
       _retryLater('البث وقف');
@@ -19885,7 +20185,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   void _watchdog() {
     final c = vc;
     if (c == null || !mounted || loading || err != null) return;
-    final pos = c.value.position, prev = _lastPos;
+    final pos = c.position, prev = _lastPos;
     if (pos == prev) {
       _sameMs += 2000;
     } else {
@@ -19894,7 +20194,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
       if (_goodMs >= 30000) retries = 0; // اشتغل كويس 30 ثانية → نرجّع العداد
     }
     _lastPos = pos;
-    if (playerStalled(playing: c.value.isPlaying, pos: pos, lastPos: prev, sameForMs: _sameMs)) {
+    if (playerStalled(playing: c.isPlaying, pos: pos, lastPos: prev, sameForMs: _sameMs)) {
       AppLog.add('PLAYER', 'البث علّق ${_sameMs ~/ 1000} ثانية — بعيد');
       _sameMs = 0;
       _retryLater('البث علّق');
@@ -19952,7 +20252,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   }
 
   Future<void> _pip() async {
-    final s = vc?.value.size ?? Size.zero;
+    final s = vc?.size ?? Size.zero;
     final ok = await PlayerNative.pip(s.width > 0 ? s.width.round() : 16, s.height > 0 ? s.height.round() : 9);
     if (!ok && mounted) toast(context, 'الموبايل ده مش بيدعم صورة جوه صورة (محتاج أندرويد 8+)');
   }
@@ -19972,11 +20272,11 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   Future<void> _audioTracks() async {
     final c = vc;
     if (c == null) return;
-    if (!c.isAudioTrackSupportAvailable()) {
+    if (!c.audioTracksSupported) {
       toast(context, 'المشغل مش بيدعم اختيار الصوت على الموبايل ده');
       return;
     }
-    final tracks = await c.getAudioTracks();
+    final tracks = await c.audioTracks();
     if (!mounted) return;
     if (tracks.length < 2) {
       toast(context, tracks.isEmpty ? 'القناة مش باعتة معلومات الصوت' : 'القناة دي فيها صوت واحد بس');
@@ -19991,15 +20291,15 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
           const ListTile(title: Text('الصوت / اللغة', style: TextStyle(fontWeight: FontWeight.w700))),
           for (var i = 0; i < tracks.length; i++)
             ListTile(
-              leading: Icon(tracks[i].isSelected ? Icons.radio_button_checked_rounded : Icons.radio_button_off_rounded, color: kGold),
+              leading: Icon(tracks[i].selected ? Icons.radio_button_checked_rounded : Icons.radio_button_off_rounded, color: kGold),
               title: Text([tracks[i].label, tracks[i].language].whereType<String>().where((x) => x.isNotEmpty).join(' • ').ifEmpty('صوت ${i + 1}')),
-              subtitle: tracks[i].channelCount == null ? null : Text('${tracks[i].channelCount} قنوات صوت${tracks[i].codec == null ? '' : ' • ${tracks[i].codec}'}'),
+              subtitle: tracks[i].channels == null ? null : Text('${tracks[i].channels} قنوات صوت${tracks[i].codec == null ? '' : ' • ${tracks[i].codec}'}'),
               onTap: () => Navigator.pop(s, tracks[i].id),
             ),
         ]),
       ),
     );
-    if (id != null) await c.selectAudioTrack(id);
+    if (id != null) await c.selectAudio(id);
   }
 
   Future<void> _setBright(double v) async {
@@ -20039,12 +20339,12 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
     _dragStartX = null;
   }
 
-  Widget _video(VideoPlayerController c, Size box) {
-    final ar = c.value.aspectRatio == 0 ? 16 / 9 : c.value.aspectRatio;
-    Widget v = VideoPlayer(c);
+  Widget _video(ChEngine c, Size box) {
+    final ar = c.aspectRatio == 0 ? 16 / 9 : c.aspectRatio;
+    Widget v = c.view();
     switch (aspect) {
       case 1:
-        v = SizedBox.expand(child: FittedBox(fit: BoxFit.cover, clipBehavior: Clip.hardEdge, child: SizedBox(width: c.value.size.width > 0 ? c.value.size.width : 1600, height: c.value.size.height > 0 ? c.value.size.height : 900, child: v)));
+        v = SizedBox.expand(child: FittedBox(fit: BoxFit.cover, clipBehavior: Clip.hardEdge, child: SizedBox(width: c.size.width > 0 ? c.size.width : 1600, height: c.size.height > 0 ? c.size.height : 900, child: v)));
       case 2:
         v = AspectRatio(aspectRatio: 16 / 9, child: v);
       case 3:
@@ -20136,8 +20436,8 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
   @override
   Widget build(BuildContext context) {
     final c = vc;
-    final playing = c?.value.isPlaying == true;
-    final buffering = c != null && c.value.isBuffering && !loading && err == null;
+    final playing = c?.isPlaying == true;
+    final buffering = c != null && c.isBuffering && !loading && err == null;
     final pip = kPip.value;
     return PopScope(
       canPop: !full && !listOpen,
@@ -20169,12 +20469,17 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
               child: Stack(children: [
                 Positioned.fill(
                   child: Center(
-                    child: c != null && c.value.isInitialized && !noPicture
+                    child: c != null && c.isInitialized && !noPicture
                         ? _video(c, Size(w, h))
                         : (noPicture
-                            ? const Padding(
-                                padding: EdgeInsets.all(24),
-                                child: Text('الصوت شغال بس الموبايل مش بيعرف يعرض صورة القناة دي — جرّب «مشغل خارجي» من ⋮', textAlign: TextAlign.center, style: TextStyle(color: kMuted)),
+                            ? Padding(
+                                padding: const EdgeInsets.all(24),
+                                child: Text(
+                                    engine == 'exo'
+                                        ? 'الصوت شغال بس الموبايل مش بيعرف يعرض صورة القناة دي — جرّب «المشغّل الجديد» من ⋮'
+                                        : 'الصوت شغال بس القناة مش باعتة صورة — جرّب «مشغل خارجي» من ⋮',
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(color: kMuted)),
                               )
                             : widget.demo
                                 ? Container(
@@ -20257,6 +20562,12 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
                           icon: const Icon(Icons.more_vert_rounded, color: Colors.white),
                           onSelected: (v) async {
                             if (v == 'ext') await _external();
+                            if (v == 'engine') {
+                              engine = engine == 'mpv' ? 'exo' : 'mpv';
+                              await Store.p.setString('stb_engine', engine);
+                              _showHud(engine == 'mpv' ? 'المشغّل الجديد' : 'المشغّل القديم');
+                              _open();
+                            }
                             if (v == 'audio') await _audioTracks();
                             if (v == 'num') await _numberEntry();
                             if (v == 'zoom') {
@@ -20277,6 +20588,7 @@ class _StbPlayerPageState extends State<StbPlayerPage> {
                             const PopupMenuItem(value: 'audio', child: Text('الصوت / اللغة')),
                             const PopupMenuItem(value: 'num', child: Text('اكتب رقم القناة')),
                             const PopupMenuItem(value: 'tv', child: Text('شغّلها على التلفزيون كمان')),
+                            PopupMenuItem(value: 'engine', child: Text(engine == 'mpv' ? 'المشغّل: الجديد ✓ (دوس للقديم)' : 'المشغّل: القديم ✓ (دوس للجديد)')),
                             const PopupMenuItem(value: 'ext', child: Text('مشغل خارجي (VLC...)')),
                             const PopupMenuItem(value: 'copy', child: Text('انسخ رابط البث')),
                           ],
